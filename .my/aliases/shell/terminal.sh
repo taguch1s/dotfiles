@@ -1,47 +1,51 @@
 #!/bin/bash
 
-# check terminal
-case "$TERM" in
-xterm* | rxvt*)
-  PS1="\[\e]0;${debian_chroot:+($debian_chroot)}\u@\h: \w\a\]$PS1"
-  ;;
-*) ;;
-esac
-
-# terminal coler by $TERM
-case "$TERM" in
-xterm-color | *-256color) color_prompt=yes ;;
-esac
-
-# Prompt color settings
-if [ "$color_prompt" = yes ]; then
-  ### Termial Prompt Custom Color Settings    ↓↓↓↓↓↓                           ↓↓↓↓↓↓
-  PS1='${debian_chroot:+($debian_chroot)}\[\033[38;5;165m\]\u@\h\[\033[00m\]:\[\033[38;5;208m\]\w\[\033[00m\]\$ '
-  PS2='\[\033[01;34m\]> \[\033[00m\]'
-  # PS1='${debian_chroot:+($debian_chroot)}\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ' # default
-else
-  PS1='${debian_chroot:+($debian_chroot)}\u@\h:\w\$ '
-fi
-unset color_prompt force_color_prompt
-
-# bash auto complete
-alias alert='notify-send --urgency=low -i "$([ $? = 0 ] && echo terminal || echo error)" "$(history|tail -n1|sed -e '\''s/^\s*[0-9]\+\s*//;s/[;&|]\s*alert$//'\'')"'
-if [ -f ~/.bash_aliases ]; then
-  # shellcheck disable=SC1090
-  . ~/.bash_aliases
-fi
-# shellcheck disable=SC3044
-if ! shopt -oq posix; then
-  if [ -f /usr/share/bash-completion/bash_completion ]; then
-    # shellcheck disable=SC1091
-    . /usr/share/bash-completion/bash_completion
-  elif [ -f /etc/bash_completion ]; then
-    # shellcheck disable=SC1091
-    . /etc/bash_completion
-  fi
+# If not running under zsh, do nothing (avoids bash errors)
+if [ -z "$ZSH_VERSION" ]; then
+  return 0 2>/dev/null || :
 fi
 
-# terminal color
-# shellcheck disable=SC2046
-eval $(dircolors -b ~/.colorrc)
-alias ls='ls --color=auto'
+# 環境変数
+export LANG=ja_JP.UTF-8
+export LSCOLORS=gxfxcxdxbxegedabagacad
+
+# ヒストリの設定
+HISTFILE=~/.zsh_history
+HISTSIZE=30000
+SAVEHIST=30000
+# 直前のコマンドの重複を削除
+setopt hist_ignore_dups
+# 同じコマンドをヒストリに残さない
+setopt hist_ignore_all_dups
+# 同時に起動したzshの間でヒストリを共有
+setopt share_history
+
+# 補完機能を有効にする
+autoload -Uz compinit
+compinit -u
+if [ -e /usr/local/share/zsh-completions ]; then
+  fpath=(/usr/local/share/zsh-completions $fpath)
+fi
+# 補完で小文字でも大文字にマッチさせる
+zstyle ':completion:*' matcher-list 'm:{a-z}={A-Z}'
+# 補完候補を詰めて表示
+setopt list_packed
+# 補完候補一覧をカラー表示
+zstyle ':completion:*' list-colors ''
+
+# コマンドのスペルを訂正
+setopt correct
+# ビープ音を鳴らさない
+setopt no_beep
+
+# prompt
+autoload -Uz vcs_info
+setopt prompt_subst
+zstyle ':vcs_info:git:*' check-for-changes true
+zstyle ':vcs_info:git:*' stagedstr "%F{magenta}!"
+zstyle ':vcs_info:git:*' unstagedstr "%F{yellow}+"
+zstyle ':vcs_info:*' formats "%F{cyan}%c%u[%b]%f"
+zstyle ':vcs_info:*' actionformats '[%b|%a]'
+precmd() { vcs_info }
+PROMPT='%T %~ %F{magenta}$%f '
+RPROMPT='${vcs_info_msg_0_}'
