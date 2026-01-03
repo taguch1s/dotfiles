@@ -1,0 +1,43 @@
+VMNAME=myvm
+
+.PHONY: list
+list:
+	multipass list
+
+.PHONY: set
+set:
+	multipass set local.bridged-network=en0
+
+.PHONY: create
+create:
+	multipass launch noble --cpus 8 --disk 100G --memory 16G --name $(VMNAME) --cloud-init cloud-config.yaml
+
+.PHONY: info
+info:
+	multipass info $(VMNAME)
+
+.PHONY: login
+login:
+	multipass exec $(VMNAME) /bin/bash
+
+.PHONY: start
+start:
+	multipass start $(VMNAME)
+
+.PHONY: stop
+stop:
+	multipass stop $(VMNAME)
+
+.PHONY: purge
+purge:
+	multipass delete $(VMNAME)
+	multipass purge
+
+.PHONY: testcreate
+testcreate:
+	multipass launch noble --cpus 2 --disk 20G --memory 4G --name testvm --cloud-init cloud-config.yaml
+
+.PHONY: testpurge
+testpurge:
+	multipass delete testvm
+	multipass purge
