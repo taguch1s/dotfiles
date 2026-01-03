@@ -1,0 +1,12 @@
+[core]
+  pager = delta
+	excludesfile = ~/.gitignore_global
+[interactive]
+  diffFilter = delta --color-only
+[delta]
+  diff-so-fancy=true
+  keep-plus-minus-markers=true
+  minus-emph-style="bold 94 89"
+  plus-emph-style="bold 29 29"
+  hunk-header-style="omit"
+  line-numbers=true

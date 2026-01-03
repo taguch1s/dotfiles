@@ -1,0 +1,13 @@
+*~
+.vscode
+.DS_Store
+.env
+.venv
+.terraform
+.mise.local.toml
+
+# For build
+node_modules
+volumes
+target
+*.jar
