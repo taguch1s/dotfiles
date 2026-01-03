@@ -2,10 +2,10 @@
 
 # git
 alias g='git'
-alias st='status -s'
-alias co='checkout'
-alias fe='fetch'
-alias br='branch'
+alias -g st='status -s'
+alias -g co='checkout'
+alias -g fe='fetch'
+alias -g br='branch'
 alias branchclean="git fetch --prune && git branch -v | grep \\[gone] | awk '{print $1}' | xargs git branch -d"
 alias gitpush="git add -A && git commit -m 'fix' && git push"
 
