@@ -38,6 +38,16 @@ expect_failure bash -c 'cd "$1" && "$2" invalid_branch' -- "$primary" "$launcher
 created="$fixture/worktrees/feature-no-issue-first"
 [[ "$(git -C "$created" branch --show-current)" == feature/no-issue/first ]]
 expect_failure bash -c 'cd "$1" && "$2" feature/no-issue/first' -- "$primary" "$launcher"
+foreign="$fixture/worktrees/chore-no-issue-foreign"
+mkdir -p "$foreign"
+git -C "$foreign" init -q
+git -C "$foreign" config user.email test@example.invalid
+git -C "$foreign" config user.name test
+printf 'foreign\n' >"$foreign/README.md"
+git -C "$foreign" add README.md
+git -C "$foreign" commit -m foreign >/dev/null
+git -C "$foreign" branch -m chore/no-issue/foreign
+expect_failure bash -c 'cd "$1" && "$2" --start chore/no-issue/foreign' -- "$primary" "$launcher"
 
 printf 'dirty\n' >>"$primary/README.md"
 expect_failure bash -c 'cd "$1" && "$2" chore/no-issue/blocked' -- "$primary" "$launcher"

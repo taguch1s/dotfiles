@@ -27,6 +27,12 @@ if [[ -e "$worktree" ]]; then
 else
   git -C "$root" worktree add "$worktree" -b "$branch" "${2:-$PRIMARY_BRANCH}"
 fi
+worktree_git_dir="$(git -C "$worktree" rev-parse --path-format=absolute --git-dir)"
+worktree_common_dir="$(git -C "$worktree" rev-parse --path-format=absolute --git-common-dir)"
+if [[ "$worktree_git_dir" == "$worktree_common_dir" || "$worktree_common_dir" != "$common_git_dir" ]]; then
+  echo "Target is not a linked worktree of this repository: $worktree" >&2
+  exit 1
+fi
 flock -u 8
 [[ -z "${CLEANUP_SCRIPT:-}" ]] || "$root/$CLEANUP_SCRIPT" --exclude "$worktree"
 [[ -z "${SETUP_SCRIPT:-}" ]] || "$worktree/$SETUP_SCRIPT"
