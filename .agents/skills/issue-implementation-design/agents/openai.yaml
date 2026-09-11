@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue Implementation Design"
+  short_description: "既存Issueを実装前設計のDraftへ変換する"
+  default_prompt: "Use $issue-implementation-design to draft an implementation design grounded in this issue and repository."

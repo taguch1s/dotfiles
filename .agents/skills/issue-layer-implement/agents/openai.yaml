@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue Layer Implement"
+  short_description: "monorepo境界に沿ってIssueを層別実装する"
+  default_prompt: "Use $issue-layer-implement to split and implement this issue along repository responsibility boundaries."

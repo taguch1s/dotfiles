@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue Design Cycle"
+  short_description: "親Issueからレビュー済み実装設計を作る"
+  default_prompt: "Use $issue-design-cycle to create and review an implementation design grounded in the parent issue."
