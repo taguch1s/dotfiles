@@ -35,7 +35,7 @@ if [[ "$worktree_git_dir" == "$worktree_common_dir" || "$worktree_common_dir" !=
 fi
 flock -u 8
 [[ -z "${CLEANUP_SCRIPT:-}" ]] || "$root/$CLEANUP_SCRIPT" --exclude "$worktree"
-[[ -z "${SETUP_SCRIPT:-}" ]] || "$worktree/$SETUP_SCRIPT"
+[[ -z "${SETUP_SCRIPT:-}" ]] || (cd "$worktree" && "$worktree/$SETUP_SCRIPT")
 if [[ "$start" == true ]]; then
   exec 9>"$worktrees_root/.codex-locks/$slug.session.lock"
   flock -n 9 || { echo "A Codex session is already using this worktree" >&2; exit 1; }

@@ -4,6 +4,7 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 launcher="$repository_root/.local/bin/codex-worktree"
 fixture="$(mktemp -d)"
+export SETUP_RECORD="$fixture/setup-record"
 trap 'rm -rf "$fixture"' EXIT
 
 remote="$fixture/remote.git"
@@ -28,8 +29,10 @@ expect_failure() {
 
 expect_failure bash -c 'cd "$1" && "$2" feature/no-issue/missing-policy' -- "$primary" "$launcher"
 mkdir -p "$primary/.agents"
-printf "%s\n" "PRIMARY_BRANCH=main" "WORKTREES_RELATIVE=../worktrees" "BRANCH_PATTERN='^(feature|chore)/no-issue/[a-z0-9-]+$'" "REQUIRE_CLEAN_PRIMARY=true" >"$primary/.agents/codex-worktree.conf"
-git -C "$primary" add .agents/codex-worktree.conf
+printf '%s\n' '#!/usr/bin/env bash' 'pwd > "$SETUP_RECORD"' >"$primary/.agents/setup.sh"
+chmod +x "$primary/.agents/setup.sh"
+printf "%s\n" "PRIMARY_BRANCH=main" "WORKTREES_RELATIVE=../worktrees" "BRANCH_PATTERN='^(feature|chore)/no-issue/[a-z0-9-]+$'" "REQUIRE_CLEAN_PRIMARY=true" "SETUP_SCRIPT=.agents/setup.sh" >"$primary/.agents/codex-worktree.conf"
+git -C "$primary" add .agents/codex-worktree.conf .agents/setup.sh
 git -C "$primary" commit -m policy >/dev/null
 git -C "$primary" push >/dev/null
 
@@ -37,6 +40,7 @@ expect_failure bash -c 'cd "$1" && "$2" invalid_branch' -- "$primary" "$launcher
 (cd "$primary" && "$launcher" feature/no-issue/first)
 created="$fixture/worktrees/feature-no-issue-first"
 [[ "$(git -C "$created" branch --show-current)" == feature/no-issue/first ]]
+[[ "$(<"$SETUP_RECORD")" == "$created" ]]
 expect_failure bash -c 'cd "$1" && "$2" feature/no-issue/first' -- "$primary" "$launcher"
 foreign="$fixture/worktrees/chore-no-issue-foreign"
 mkdir -p "$foreign"
