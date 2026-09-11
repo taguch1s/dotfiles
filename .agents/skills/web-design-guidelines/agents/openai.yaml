@@ -1,0 +1,4 @@
+interface:
+  display_name: "Web Design Guidelines"
+  short_description: "最新UIガイドラインでWeb実装を監査する"
+  default_prompt: "Use $web-design-guidelines to audit this UI against the latest Web Interface Guidelines."

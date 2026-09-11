@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implementation Cycle"
+  short_description: "設計済み実装をUnit別レビューで完了へ収束させる"
+  default_prompt: "Use $implementation-cycle to implement this plan as reviewable units with explicit gates."

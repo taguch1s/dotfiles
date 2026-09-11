@@ -63,8 +63,7 @@
 !/.codex/README.md
 !/.agents/
 !/.agents/skills/
-!/.agents/skills/shared-codex-workflow/
-!/.agents/skills/shared-codex-workflow/SKILL.md
+!/.agents/skills/**
 !/tests/
 !/tests/**
 !/dotfiles.toml

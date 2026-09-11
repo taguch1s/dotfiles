@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adversarial Review"
+  short_description: "成果物を反証し、根拠のある指摘だけを残す"
+  default_prompt: "Use $adversarial-review to verify this artifact against its requirements and repository facts."

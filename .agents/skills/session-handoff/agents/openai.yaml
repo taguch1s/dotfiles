@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session Handoff"
+  short_description: "別セッションが再開できるhandoffを作る"
+  default_prompt: "Use $session-handoff to preserve the current task state for a later Codex session."

@@ -47,6 +47,78 @@ target = ".agents/skills/shared-codex-workflow"
 mode = "link"
 
 [[config]]
+name = "Adversarial review skill"
+source = ".agents/skills/adversarial-review"
+target = ".agents/skills/adversarial-review"
+mode = "link"
+
+[[config]]
+name = "Codex conversation audit skill"
+source = ".agents/skills/codex-conversation-audit"
+target = ".agents/skills/codex-conversation-audit"
+mode = "link"
+
+[[config]]
+name = "Git commit skill"
+source = ".agents/skills/git-commit"
+target = ".agents/skills/git-commit"
+mode = "link"
+
+[[config]]
+name = "Implementation cycle skill"
+source = ".agents/skills/implementation-cycle"
+target = ".agents/skills/implementation-cycle"
+mode = "link"
+
+[[config]]
+name = "Issue design cycle skill"
+source = ".agents/skills/issue-design-cycle"
+target = ".agents/skills/issue-design-cycle"
+mode = "link"
+
+[[config]]
+name = "Issue design loop skill"
+source = ".agents/skills/issue-design-loop"
+target = ".agents/skills/issue-design-loop"
+mode = "link"
+
+[[config]]
+name = "Implementation design skill"
+source = ".agents/skills/issue-implementation-design"
+target = ".agents/skills/issue-implementation-design"
+mode = "link"
+
+[[config]]
+name = "Layer implementation skill"
+source = ".agents/skills/issue-layer-implement"
+target = ".agents/skills/issue-layer-implement"
+mode = "link"
+
+[[config]]
+name = "TDD implementation skill"
+source = ".agents/skills/issue-tdd-implement"
+target = ".agents/skills/issue-tdd-implement"
+mode = "link"
+
+[[config]]
+name = "PR description skill"
+source = ".agents/skills/pr-description"
+target = ".agents/skills/pr-description"
+mode = "link"
+
+[[config]]
+name = "Session handoff skill"
+source = ".agents/skills/session-handoff"
+target = ".agents/skills/session-handoff"
+mode = "link"
+
+[[config]]
+name = "Web design guidelines skill"
+source = ".agents/skills/web-design-guidelines"
+target = ".agents/skills/web-design-guidelines"
+mode = "link"
+
+[[config]]
 name = "Codex authentication"
 target = ".codex/auth.json"
 mode = "ignore"

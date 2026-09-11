@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue TDD Implement"
+  short_description: "Accepted設計からtest先行で実装する"
+  default_prompt: "Use $issue-tdd-implement to plan tests first and implement with Red Green Refactor."

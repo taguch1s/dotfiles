@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Description"
+  short_description: "レビュー判断に必要なPR本文を整える"
+  default_prompt: "Use $pr-description to draft or update a human-readable pull request description."

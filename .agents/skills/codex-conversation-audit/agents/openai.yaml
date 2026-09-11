@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Conversation Audit"
+  short_description: "Codex会話を匿名集計して協働ルールを改善する"
+  default_prompt: "Use $codex-conversation-audit to audit local Codex conversations and propose evidence-based workflow improvements."

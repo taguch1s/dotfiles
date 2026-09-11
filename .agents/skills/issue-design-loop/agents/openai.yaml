@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue Design Loop"
+  short_description: "粗い要求を実装可能なIssueへ設計する"
+  default_prompt: "Use $issue-design-loop to turn this request into an implementation-ready issue."
