@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Render the focused Codex pane's live session details for Herdr's tab bar."""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import tomllib
+from datetime import datetime
+from pathlib import Path
+
+
+CODEX_HOME = Path.home() / ".codex"
+MODEL_PATTERN = re.compile(r'"model"\s*:\s*"([^"]+)"')
+
+
+def snapshot() -> dict:
+    result = subprocess.run(
+        [str(Path.home() / ".local/bin/herdr"), "api", "snapshot"],
+        capture_output=True, check=False, text=True, timeout=0.7,
+    )
+    if result.returncode:
+        return {}
+    try:
+        return json.loads(result.stdout)["result"]["snapshot"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return {}
+
+
+def focused_codex_session(data: dict) -> str | None:
+    pane_id = data.get("focused_pane_id")
+    for pane in data.get("panes", []):
+        if pane.get("pane_id") == pane_id and pane.get("agent") == "codex":
+            return (pane.get("agent_session") or {}).get("value")
+    return None
+
+
+def task_summary(pane: dict) -> str | None:
+    title = str(pane.get("terminal_title_stripped") or "").strip()
+    if not title:
+        return None
+    # Codex titles conventionally append the workspace after " | ".
+    summary = title.rsplit(" | ", 1)[0].strip()
+    return summary[:48] if summary else None
+
+
+def sync_codex_tab_labels(data: dict) -> None:
+    """Keep every Codex tab named after the task advertised by Codex itself."""
+    labels = {tab.get("tab_id"): str(tab.get("label") or "") for tab in data.get("tabs", [])}
+    herdr = str(Path.home() / ".local/bin/herdr")
+    for pane in data.get("panes", []):
+        if pane.get("agent") != "codex":
+            continue
+        tab_id, summary = pane.get("tab_id"), task_summary(pane)
+        if not tab_id or not summary or labels.get(tab_id) == summary:
+            continue
+        subprocess.run(
+            [herdr, "tab", "rename", str(tab_id), summary],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False, timeout=0.5,
+        )
+
+
+def transcript_for(session_id: str) -> Path | None:
+    matches = list((CODEX_HOME / "sessions").glob(f"*/*/*/*{session_id}.jsonl"))
+    return max(matches, key=lambda item: item.stat().st_mtime) if matches else None
+
+
+def latest_usage(path: Path) -> dict:
+    # JSONL is append-only. Reading backwards avoids loading long transcripts.
+    with path.open("rb") as source:
+        source.seek(0, 2)
+        position = source.tell()
+        remaining = b""
+        while position:
+            step = min(position, 65536)
+            position -= step
+            source.seek(position)
+            lines = (source.read(step) + remaining).split(b"\n")
+            remaining = lines[0]
+            for raw in reversed(lines[1:]):
+                try:
+                    event = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                payload = event.get("payload", {})
+                if event.get("type") == "event_msg" and payload.get("type") == "token_count":
+                    return payload
+    return {}
+
+
+def session_model(path: Path) -> str:
+    try:
+        first_line = path.open(encoding="utf-8").readline()
+    except OSError:
+        return "Codex"
+    match = MODEL_PATTERN.search(first_line)
+    return match.group(1) if match else "Codex"
+
+
+def configured_effort() -> str:
+    try:
+        with (CODEX_HOME / "config.toml").open("rb") as source:
+            value = tomllib.load(source).get("model_reasoning_effort")
+    except (OSError, tomllib.TOMLDecodeError):
+        value = None
+    return str(value) if value else "—"
+
+
+def context_label(info: dict) -> str:
+    latest = (info.get("last_token_usage") or {}).get("input_tokens")
+    limit = info.get("model_context_window")
+    if not isinstance(limit, int):
+        return "ctx:—"
+    if not isinstance(latest, int):
+        return f"ctx:—/{limit // 1000}k"
+    return f"ctx:{latest // 1000}k/{limit // 1000}k ({round(latest / limit * 100)}%)"
+
+
+def window_label(limit: dict | None, expected_minutes: int, title: str) -> str:
+    if not limit or limit.get("window_minutes") != expected_minutes:
+        return f"{title}:—"
+    used, reset = limit.get("used_percent"), limit.get("resets_at")
+    if not isinstance(used, (int, float)):
+        return f"{title}:—"
+    output = f"{title}:{used:g}%"
+    if isinstance(reset, (int, float)):
+        output += " " + datetime.fromtimestamp(reset).strftime("%m/%d %H:%M")
+    return output
+
+
+def main() -> None:
+    data = snapshot()
+    sync_codex_tab_labels(data)
+    session_id = focused_codex_session(data)
+    if not session_id:
+        print("Codex: セッションなし")
+        return
+    path = transcript_for(session_id)
+    if not path:
+        print("Codex: 利用状況を待機中")
+        return
+    usage = latest_usage(path)
+    rate_limits = usage.get("rate_limits") or {}
+    primary, secondary = rate_limits.get("primary"), rate_limits.get("secondary")
+    five_hour = window_label(primary, 300, "5h")
+    weekly = window_label(primary, 10080, "週")
+    if five_hour.endswith("—"):
+        five_hour = window_label(secondary, 300, "5h")
+    if weekly.endswith("—"):
+        weekly = window_label(secondary, 10080, "週")
+    print(
+        f"{session_model(path)} | effort:{configured_effort()} | "
+        f"{context_label(usage.get('info') or {})} | {five_hour} | {weekly}"
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        print("Codex: 状態を取得できません")

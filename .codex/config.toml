@@ -1,0 +1,8 @@
+personality = "pragmatic"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "medium"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[features]
+hooks = true

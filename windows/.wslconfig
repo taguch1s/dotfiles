@@ -1,0 +1,8 @@
+[wsl2]
+# Docker・VS Code Remote・Codex を同時に動かすため、既定より拡張する。
+memory=10GB
+swap=4GB
+
+[experimental]
+# 未使用のファイルキャッシュを段階的に Windows へ返却する。
+autoMemoryReclaim=gradual

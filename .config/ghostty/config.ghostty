@@ -1,0 +1,4 @@
+# WSLg's client-side GTK titlebar can fail to render its minimize, maximize,
+# and close glyphs. Use the compositor/Windows titlebar instead.
+gtk-titlebar = false
+window-decoration = auto
