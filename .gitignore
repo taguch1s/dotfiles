@@ -52,6 +52,17 @@
 !/.xsessionrc
 !/.config/
 !/.config/**
+!/.local/
+!/.local/bin/
+!/.local/bin/herdr-codex-status
+!/.codex/
+!/.codex/config.toml
+!/.codex/README.md
+!/wsl/
+!/wsl/**
+!/windows/
+!/windows/**
+!/Makefile
 
 # ================================
 #  Added settings

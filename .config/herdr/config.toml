@@ -1,0 +1,19 @@
+onboarding = false
+
+# Codex のように独自カーソルを描画する端末UIでも、日本語/CJK IME の変換位置を保つ。
+[experimental]
+reveal_hidden_cursor_for_cjk_ime = true
+cjk_ime_agents = ["codex"]
+cjk_ime_cursor_shape = "steady_block"
+
+[ui]
+# 選択中 Codex セッションのモデル・effort・コンテキスト・利用枠を表示する。
+# `5h:—` は利用量ゼロではなく、アカウントから5時間枠が返されなかったことを表す。
+tab_bar_right = [
+  { type = "command", command = "herdr-codex-status", interval_seconds = 5, timeout_seconds = 1 },
+]
+tab_bar_right_separator = "  "
+
+[ui.sidebar.agents.rows_by_agent]
+# エージェント名に加え、Codex の現在タスクをサイドバーに表示する。
+codex = [["state_icon", "terminal_title_stripped"], ["agent"]]
