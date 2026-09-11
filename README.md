@@ -69,6 +69,8 @@ Herdr、Ghostty、独自スクリプトはシンボリックリンクで配置�
 make bootstrap  # 未導入の gh/Herdr/Codex を導入し、設定リンクと Herdr↔Codex 連携を行う
 make wsl        # /etc/wsl.conf と Windows 側 ~/.wslconfig を書き込むため、意図的に分離
 make doctor     # コマンド、リンク、ステータススクリプトを検証
+make diff       # コピー管理の Codex 設定とローカル設定の差分を表示
+make check      # PR・コミット前の検査（bootstrap 後は commit 時にも自動実行）
 ```
 
 Ghostty が Ubuntu の標準リポジトリから導入できるのは十分に新しいバージョンだけです。
@@ -80,3 +82,14 @@ GHOSTTY_INSTALL=community-deb make bootstrap
 ```
 
 新規セットアップ後は、`gh auth login` と `codex login` を個別に実行して認証してください。
+
+### 設定を追加・変更する運用
+
+`dotfiles.toml` が設定管理の一覧です。人が編集する設定は原則として `mode = "link"` にします。
+一度 `make link` を実行すれば、`~/.config/...` を直接編集しても実体はこのリポジトリ内なので、
+以後の変更は `git status` で確認できます。修正ごとに `make link` を実行する必要はありません。
+
+アプリが端末固有の状態を書き足す設定は `mode = "copy-if-missing"` とし、`make diff` で確認します。
+認証情報・トークンは `mode = "ignore"`、sudo や Windows を必要とする設定は `mode = "manual"` として
+明示的に分離します。新しい設定は、秘密情報を除外したうえで `dotfiles.toml` に追加してから `make link` と
+`make check` を実行してください。
