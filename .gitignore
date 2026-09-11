@@ -16,6 +16,7 @@
 # .bin
 !/.bin/
 !/.bin/**
+/.bin/__pycache__/
 !/.bin.local
 /.bin/dotsrepl*
 
@@ -56,8 +57,15 @@
 !/.local/bin/
 !/.local/bin/herdr-codex-status
 !/.codex/
+!/.codex/AGENTS.md
 !/.codex/config.toml
 !/.codex/README.md
+!/.agents/
+!/.agents/skills/
+!/.agents/skills/shared-codex-workflow/
+!/.agents/skills/shared-codex-workflow/SKILL.md
+!/tests/
+!/tests/**
 !/dotfiles.toml
 !/.githooks/
 !/.githooks/**

@@ -60,8 +60,9 @@ $ mise prune
 認証情報、セッション状態、キャッシュ、ログ、生成された連携ファイルは含めません。
 
 Herdr、Ghostty、独自スクリプトはシンボリックリンクで配置します。Codex は通常利用時に
-マシン固有のフック状態を `~/.codex/config.toml` へ追加するため、既存設定がない場合だけ
-ポータブルな既定値をコピーします。
+マシン固有のフック状態を `~/.codex/config.toml` へ追加するため、設定全体は上書きしません。
+既存設定がない場合はポータブルな既定値をコピーし、既存設定には管理対象 feature だけを
+安全に追加します。競合する feature 値は上書きせず停止します。
 
 ```bash
 ./.bin/bootstrap-agent-terminal.sh # 必要なら make を導入してから bootstrap を実行
@@ -89,7 +90,8 @@ GHOSTTY_INSTALL=community-deb make bootstrap
 一度 `make link` を実行すれば、`~/.config/...` を直接編集しても実体はこのリポジトリ内なので、
 以後の変更は `git status` で確認できます。修正ごとに `make link` を実行する必要はありません。
 
-アプリが端末固有の状態を書き足す設定は `mode = "copy-if-missing"` とし、`make diff` で確認します。
+アプリが端末固有の状態を書き足す設定は `mode = "copy-if-missing"` または管理対象キーだけを
+同期する `mode = "merge-toml-features"` とし、`make diff` で確認します。
 認証情報・トークンは `mode = "ignore"`、sudo や Windows を必要とする設定は `mode = "manual"` として
 明示的に分離します。新しい設定は、秘密情報を除外したうえで `dotfiles.toml` に追加してから `make link` と
 `make check` を実行してください。
