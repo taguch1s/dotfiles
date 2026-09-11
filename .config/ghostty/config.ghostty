@@ -1,4 +1,4 @@
-# WSLg's client-side GTK titlebar can fail to render its minimize, maximize,
-# and close glyphs. Use the compositor/Windows titlebar instead.
+# WSLg のクライアント側 GTK タイトルバーでは、最小化・最大化・閉じる記号が
+# 描画されない場合があるため、コンポジタ/Windows 側のタイトルバーを使う。
 gtk-titlebar = false
 window-decoration = auto

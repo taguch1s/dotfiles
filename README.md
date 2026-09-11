@@ -1,14 +1,14 @@
 # dotfiles
 環境設定用のファイル群
 
-## Procedure
+## 導入手順
 
-refs: https://github.com/melanmeg/dotfiles/blob/7b105ea84a3bb9165d836375bb34b4858fbb5502/README.md
+参考: https://github.com/melanmeg/dotfiles/blob/7b105ea84a3bb9165d836375bb34b4858fbb5502/README.md
 
-- Ubuntu 24.04 AMD x64
+- 対象環境: Ubuntu 24.04 AMD x64
 
 ```bash
-git clone https://github.com/melanmeg/dotfiles.git
+git clone https://github.com/taguch1s/dotfiles.git
 ./dotfiles/.bin/dotfiles --backup --gitconfig-shared
 ```
 
@@ -18,7 +18,7 @@ git config --global user.name "Your Name"
 git config --global credential.helper store
 ```
 
-- Install: https://github.com/melanmeg/dotsrepl
+- dotsrepl の導入: https://github.com/melanmeg/dotsrepl
 
 ```bash
 $ dotsrepl -h
@@ -50,32 +50,33 @@ $ mise cache p
 $ mise prune
 ```
 
-## font
+## フォント
 - 0xProto: https://github.com/0xType/0xProto/blob/main/fonts/0xProto-Regular.ttf
 - source-han-code-jp: https://github.com/adobe-fonts/source-han-code-jp/releases/download/2.012R/SourceHanCodeJP.ttc
 
-## Agent terminal / WSL
+## エージェント用端末 / WSL
 
-Portable Herdr, Ghostty, Codex, and WSL settings live in this repository. They
-exclude credentials, session state, caches, logs, and generated integration files.
-Herdr/Ghostty/custom scripts are symlinked. Codex defaults are copied only when
-no `~/.codex/config.toml` exists, because Codex adds machine-local hook state to
-that file during normal use.
+このリポジトリでは、移植可能な Herdr・Ghostty・Codex・WSL の設定を管理します。
+認証情報、セッション状態、キャッシュ、ログ、生成された連携ファイルは含めません。
+
+Herdr、Ghostty、独自スクリプトはシンボリックリンクで配置します。Codex は通常利用時に
+マシン固有のフック状態を `~/.codex/config.toml` へ追加するため、既存設定がない場合だけ
+ポータブルな既定値をコピーします。
 
 ```bash
-./.bin/bootstrap-agent-terminal.sh # installs make if needed, then runs bootstrap
-# Once make is available:
-make bootstrap  # install gh/Herdr/Codex where absent, link configs, install Herdr↔Codex integration
-make wsl        # intentionally separate: writes /etc/wsl.conf and Windows ~/.wslconfig
-make doctor     # verify commands, links, and the status script
+./.bin/bootstrap-agent-terminal.sh # 必要なら make を導入してから bootstrap を実行
+# make 導入後は以下だけで実行できます。
+make bootstrap  # 未導入の gh/Herdr/Codex を導入し、設定リンクと Herdr↔Codex 連携を行う
+make wsl        # /etc/wsl.conf と Windows 側 ~/.wslconfig を書き込むため、意図的に分離
+make doctor     # コマンド、リンク、ステータススクリプトを検証
 ```
 
-Ghostty is available through Ubuntu's default repository only on sufficiently new
-Ubuntu versions. On Ubuntu 24.04, the bootstrap reports the supported options
-without silently installing a community package. To opt in to that package:
+Ghostty が Ubuntu の標準リポジトリから導入できるのは十分に新しいバージョンだけです。
+Ubuntu 24.04 では、bootstrap はコミュニティパッケージを暗黙には導入せず、対応方法だけを
+表示します。そのパッケージを利用する場合は、明示的に次を指定してください。
 
 ```bash
 GHOSTTY_INSTALL=community-deb make bootstrap
 ```
 
-After a fresh setup, authenticate separately with `gh auth login` and `codex login`.
+新規セットアップ後は、`gh auth login` と `codex login` を個別に実行して認証してください。

@@ -17,7 +17,7 @@ ensure_apt_package python3
 
 if ! command -v codex >/dev/null 2>&1; then
   if ! command -v npm >/dev/null 2>&1; then
-    echo 'Codex requires npm. Install Node.js/mise first, then rerun this command.' >&2
+    echo 'Codex には npm が必要です。Node.js または mise を導入してから、このコマンドを再実行してください。' >&2
     exit 1
   fi
   npm install --global @openai/codex
@@ -32,9 +32,9 @@ if ! command -v ghostty >/dev/null 2>&1; then
     ensure_apt_package ghostty
   else
     cat <<'EOF'
-Ghostty is not in this Ubuntu release's default apt repository.
-Install it through your preferred supported package source, then rerun make doctor.
-For the community Ubuntu/Debian package, explicitly opt in with:
+Ghostty は、この Ubuntu バージョンの標準 apt リポジトリにはありません。
+対応するパッケージ配布元から導入してから、make doctor を再実行してください。
+Ubuntu/Debian 向けコミュニティパッケージを使う場合は、明示的に次を指定してください。
   GHOSTTY_INSTALL=community-deb make bootstrap
 EOF
     if [ "${GHOSTTY_INSTALL:-}" = "community-deb" ]; then

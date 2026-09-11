@@ -1,20 +1,19 @@
 onboarding = false
 
-# Keep a native cursor anchor visible for Japanese/CJK IME composition in
-# terminal UIs that draw their own cursor (such as Codex).
+# Codex のように独自カーソルを描画する端末UIでも、日本語/CJK IME の変換位置を保つ。
 [experimental]
 reveal_hidden_cursor_for_cjk_ime = true
 cjk_ime_agents = ["codex"]
 cjk_ime_cursor_shape = "steady_block"
 
 [ui]
-# The focused Codex session's model, effort, context size, and plan windows.
-# `5h:—` means the account did not return a five-hour window, not zero use.
+# 選択中 Codex セッションのモデル・effort・コンテキスト・利用枠を表示する。
+# `5h:—` は利用量ゼロではなく、アカウントから5時間枠が返されなかったことを表す。
 tab_bar_right = [
   { type = "command", command = "herdr-codex-status", interval_seconds = 5, timeout_seconds = 1 },
 ]
 tab_bar_right_separator = "  "
 
 [ui.sidebar.agents.rows_by_agent]
-# Keep the agent identity while exposing Codex's current task title in the sidebar.
+# エージェント名に加え、Codex の現在タスクをサイドバーに表示する。
 codex = [["state_icon", "terminal_title_stripped"], ["agent"]]

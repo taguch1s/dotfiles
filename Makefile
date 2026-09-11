@@ -1,26 +1,26 @@
 .DEFAULT_GOAL := help
 .PHONY: bootstrap link codex-config integration wsl doctor help
 
-bootstrap: ## Install terminal/agent tools and link portable configuration.
+bootstrap: ## 端末・エージェント用ツールを導入し、移植可能な設定をリンクする。
 	./.bin/install-agent-terminal.sh
 	$(MAKE) link
 	$(MAKE) codex-config
 	$(MAKE) integration
 
-link: ## Link the portable configuration into the current home directory.
+link: ## 移植可能な設定を現在のホームディレクトリへリンクする。
 	./.bin/link-agent-terminal-configs.sh
 
-codex-config: ## Install portable Codex defaults only when no local config exists.
+codex-config: ## ローカル設定がない場合のみ、移植可能な Codex 既定値を導入する。
 	./.bin/install-codex-config.sh
 
-integration: ## Install Herdr's generated Codex integration files.
+integration: ## Herdr が生成する Codex 連携ファイルを導入する。
 	./.bin/install-codex-herdr-integration.sh
 
-wsl: ## Install WSL-side and Windows-side WSL configuration.
+wsl: ## WSL 側と Windows 側の WSL 設定を導入する。
 	./.bin/install-wsl-config.sh
 
-doctor: ## Verify commands, links, and the status-line script.
+doctor: ## コマンド、リンク、ステータスラインスクリプトを検証する。
 	./.bin/doctor-agent-terminal.sh
 
-help: ## Show available targets.
+help: ## 利用可能なターゲットを表示する。
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "%-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)

@@ -11,7 +11,7 @@ if command -v cmd.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; the
     cp "$target" "$target.dotfiles-backup-$(date +%Y%m%d%H%M%S)"
   fi
   install -Dm644 "$root/windows/.wslconfig" "$target"
-  printf 'Installed %s\n' "$target"
+  printf '%s を導入しました。\n' "$target"
 else
-  printf 'Installed /etc/wsl.conf. Copy windows/.wslconfig to your Windows user profile manually.\n'
+  printf '/etc/wsl.conf を導入しました。windows/.wslconfig は Windows のユーザープロファイルへ手動でコピーしてください。\n'
 fi
