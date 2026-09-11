@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+start=false
+[[ "${1:-}" == "--start" ]] && { start=true; shift; }
+[[ $# -ge 1 && $# -le 2 ]] || { echo "Usage: codex-worktree [--start] <branch> [base-ref]" >&2; exit 2; }
+branch="$1"
+common_git_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+root="$(dirname "$common_git_dir")"
+policy="$root/.agents/codex-worktree.conf"
+[[ -f "$policy" ]] || { echo "Missing worktree policy: $policy" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$policy"
+[[ "$branch" =~ $BRANCH_PATTERN ]] || { echo "Invalid branch: $branch" >&2; exit 2; }
+[[ "$(git -C "$root" branch --show-current)" == "$PRIMARY_BRANCH" ]] || { echo "Primary checkout must be on $PRIMARY_BRANCH" >&2; exit 1; }
+if [[ "$REQUIRE_CLEAN_PRIMARY" == true && -n "$(git -C "$root" status --porcelain)" ]]; then echo "Primary checkout must be clean" >&2; exit 1; fi
+mkdir -p "$root/$WORKTREES_RELATIVE"
+worktrees_root="$(cd "$root/$WORKTREES_RELATIVE" && pwd -P)"
+slug="$(printf '%s' "$branch" | tr / -)"
+worktree="$worktrees_root/$slug"
+mkdir -p "$worktrees_root/.codex-locks"
+exec 8>"$worktrees_root/.codex-locks/create.lock"; flock 8
+git -C "$root" fetch --prune origin
+git -C "$root" pull --ff-only origin "$PRIMARY_BRANCH"
+if [[ -e "$worktree" ]]; then
+  [[ "$start" == true && "$(git -C "$worktree" branch --show-current)" == "$branch" ]] || { echo "Existing worktree does not match" >&2; exit 1; }
+else
+  git -C "$root" worktree add "$worktree" -b "$branch" "${2:-$PRIMARY_BRANCH}"
+fi
+worktree_git_dir="$(git -C "$worktree" rev-parse --path-format=absolute --git-dir)"
+worktree_common_dir="$(git -C "$worktree" rev-parse --path-format=absolute --git-common-dir)"
+if [[ "$worktree_git_dir" == "$worktree_common_dir" || "$worktree_common_dir" != "$common_git_dir" ]]; then
+  echo "Target is not a linked worktree of this repository: $worktree" >&2
+  exit 1
+fi
+flock -u 8
+[[ -z "${CLEANUP_SCRIPT:-}" ]] || "$root/$CLEANUP_SCRIPT" --exclude "$worktree"
+[[ -z "${SETUP_SCRIPT:-}" ]] || (cd "$worktree" && "$worktree/$SETUP_SCRIPT")
+if [[ "$start" == true ]]; then
+  exec 9>"$worktrees_root/.codex-locks/$slug.session.lock"
+  flock -n 9 || { echo "A Codex session is already using this worktree" >&2; exit 1; }
+  exec codex -C "$worktree"
+fi
+echo "Ready worktree: $worktree"

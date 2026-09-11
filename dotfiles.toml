@@ -21,10 +21,30 @@ mode = "link"
 executable = true
 
 [[config]]
+name = "Codex worktree launcher"
+source = ".local/bin/codex-worktree"
+target = ".local/bin/codex-worktree"
+mode = "link"
+executable = true
+
+[[config]]
 name = "Codex"
 source = ".codex/config.toml"
 target = ".codex/config.toml"
-mode = "copy-if-missing"
+mode = "merge-toml-features"
+features = ["hooks", "memories"]
+
+[[config]]
+name = "Codex global instructions"
+source = ".codex/AGENTS.md"
+target = ".codex/AGENTS.md"
+mode = "link"
+
+[[config]]
+name = "Shared Codex workflow skill"
+source = ".agents/skills/shared-codex-workflow"
+target = ".agents/skills/shared-codex-workflow"
+mode = "link"
 
 [[config]]
 name = "Codex authentication"
