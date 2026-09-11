@@ -1,0 +1,47 @@
+# このファイルが、各設定の管理方法の唯一の一覧です。
+# target はホームディレクトリからの相対パスで指定します。
+
+[[config]]
+name = "Herdr"
+source = ".config/herdr/config.toml"
+target = ".config/herdr/config.toml"
+mode = "link"
+
+[[config]]
+name = "Ghostty"
+source = ".config/ghostty/config.ghostty"
+target = ".config/ghostty/config.ghostty"
+mode = "link"
+
+[[config]]
+name = "Herdr Codex status"
+source = ".local/bin/herdr-codex-status"
+target = ".local/bin/herdr-codex-status"
+mode = "link"
+executable = true
+
+[[config]]
+name = "Codex"
+source = ".codex/config.toml"
+target = ".codex/config.toml"
+mode = "copy-if-missing"
+
+[[config]]
+name = "Codex authentication"
+target = ".codex/auth.json"
+mode = "ignore"
+reason = "認証情報"
+
+[[config]]
+name = "WSL (Linux)"
+source = "wsl/etc/wsl.conf"
+target = "/etc/wsl.conf"
+mode = "manual"
+reason = "sudo が必要"
+
+[[config]]
+name = "WSL (Windows)"
+source = "windows/.wslconfig"
+target = "%UserProfile%\\.wslconfig"
+mode = "manual"
+reason = "Windows 側へ書き込む"
