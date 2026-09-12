@@ -54,6 +54,12 @@ target = ".agents/skills/shared-codex-workflow"
 mode = "link"
 
 [[config]]
+name = "Issue起点開発ワークフロー Skill"
+source = ".agents/skills/issue-development-workflow"
+target = ".agents/skills/issue-development-workflow"
+mode = "link"
+
+[[config]]
 name = "Adversarial review skill"
 source = ".agents/skills/adversarial-review"
 target = ".agents/skills/adversarial-review"
