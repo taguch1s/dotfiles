@@ -7,7 +7,11 @@
 
 ## Herdr のタスク運用
 
-- Herdr 管理下で新しい top-level task を始めるときは、`herdr-codex-orchestrate "<task>"` を実行する。このランチャーは新規 tab を作り、左に main orchestrator、右に delegate を配置する。独立した delegate を並列実行する場合は `--delegates N` を指定し、右列だけを縦に分割する。
+- 「Issue を進める」「実装する」は新規 tab 作成の許可ではない。Herdr 管理下の main session で task がすでに始まっている場合は、その session を継続し、`herdr-codex-orchestrate` を実行しない。
+- 新規 top-level task 用 tab を作る前に、`test "${HERDR_ENV:-}" = 1`、`herdr workspace list`、`herdr tab list --workspace "$HERDR_WORKSPACE_ID"`、`herdr pane current --current` を実行し、現在の pane、既存の同一 task、作成済み delegate を確認する。既存 session の所有者・目的を判別できない場合は読み取りだけに留め、new tab を作らない。
+- ユーザーが「新しい tab で始める」「新規 top-level task を作る」と明示した場合だけ、`herdr-codex-orchestrate --new-top-level "<task>"` を実行する。このランチャーは新規 tab を作り、左に main orchestrator、右に delegate を配置する。独立した delegate を並列実行する場合は `--delegates N` を指定し、右列だけを縦に分割する。
+- delegate / subagent は `herdr-codex-orchestrate` を実行しない。作成済み main session が割り当てた範囲だけを扱い、自身や他の delegate 用の tab / pane / agent を追加しない。
+- 「session が多い」「減らして」のような観測は、tab、pane、workspace、agent、server を終了する許可ではない。`herdr tab close`、`herdr pane close`、`herdr agent send-keys ... ctrl+c`、`herdr server stop` は、ユーザーが対象 ID または終了対象を明示した場合だけ実行する。重複が疑われるときは ID、cwd、状態を報告して指示を待つ。
 - main orchestrator は要件整理、タスク分割、delegate への割り当て、統合判断、最終検証、ユーザー報告だけを担当する。production code や設定の編集は delegate に委譲し、結果を独立に確認してから採用する。
 - delegate は明確に割り当てられた範囲だけを扱い、変更・検証・ブロッカーを main orchestrator に返す。並列編集では別 worktree または非重複ファイルを使う。
 

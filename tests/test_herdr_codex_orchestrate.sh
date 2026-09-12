@@ -47,9 +47,10 @@ HERDR_ENV=1 \
 HERDR_WORKSPACE_ID=w1 \
 MOCK_HERDR_LOG="$mock_log" \
 MOCK_HERDR_STATE="$mock_state" \
-"$launcher" --delegates 2 --cwd "$fixture" 'inspect and implement' >"$fixture/output"
+"$launcher" --new-top-level --delegates 2 --cwd "$fixture" 'inspect and implement' >"$fixture/output"
 
 rg -F 'tab create --workspace w1 --cwd ' "$mock_log" >/dev/null
+rg -F 'HERDR_CODEX_ORCHESTRATED=1' "$mock_log" >/dev/null
 rg -F 'pane split w1:p9 --direction right ' "$mock_log" >/dev/null
 rg -F 'pane split w1:p10 --direction down ' "$mock_log" >/dev/null
 rg -F 'agent start delegate-' "$mock_log" >/dev/null
@@ -58,6 +59,27 @@ rg -F -- '--kind codex --pane w1:p11' "$mock_log" >/dev/null
 rg -F -- '--kind codex --pane w1:p9' "$mock_log" >/dev/null
 [[ "$(rg -c '^agent prompt ' "$mock_log")" == 3 ]]
 rg -F 'Created w1:t9: main=orchestrator-' "$fixture/output" >/dev/null
+
+if PATH="$mock_bin:$PATH" \
+  HERDR_ENV=1 \
+  HERDR_WORKSPACE_ID=w1 \
+  MOCK_HERDR_LOG="$mock_log" \
+  MOCK_HERDR_STATE="$mock_state" \
+  "$launcher" --cwd "$fixture" 'must require an explicit new-top-level opt-in' >/dev/null 2>&1; then
+  echo 'launcher created a tab without an explicit new-top-level opt-in' >&2
+  exit 1
+fi
+
+if PATH="$mock_bin:$PATH" \
+  HERDR_ENV=1 \
+  HERDR_CODEX_ORCHESTRATED=1 \
+  HERDR_WORKSPACE_ID=w1 \
+  MOCK_HERDR_LOG="$mock_log" \
+  MOCK_HERDR_STATE="$mock_state" \
+  "$launcher" --new-top-level --cwd "$fixture" 'nested launcher must fail' >/dev/null 2>&1; then
+  echo 'launcher accepted a nested orchestration session' >&2
+  exit 1
+fi
 
 if PATH="$mock_bin:$PATH" HERDR_WORKSPACE_ID=w1 "$launcher" 'must fail' >/dev/null 2>&1; then
   echo 'launcher accepted execution outside Herdr' >&2
