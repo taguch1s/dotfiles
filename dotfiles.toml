@@ -21,6 +21,13 @@ mode = "link"
 executable = true
 
 [[config]]
+name = "Herdr Codex orchestration launcher"
+source = ".local/bin/herdr-codex-orchestrate"
+target = ".local/bin/herdr-codex-orchestrate"
+mode = "link"
+executable = true
+
+[[config]]
 name = "Codex worktree launcher"
 source = ".local/bin/codex-worktree"
 target = ".local/bin/codex-worktree"
