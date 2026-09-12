@@ -56,6 +56,7 @@
 !/.local/
 !/.local/bin/
 !/.local/bin/herdr-codex-status
+!/.local/bin/herdr-codex-orchestrate
 !/.local/bin/codex-worktree
 !/.codex/
 !/.codex/AGENTS.md
@@ -66,6 +67,7 @@
 !/.agents/skills/**
 !/tests/
 !/tests/**
+/tests/__pycache__/
 !/dotfiles.toml
 !/.githooks/
 !/.githooks/**

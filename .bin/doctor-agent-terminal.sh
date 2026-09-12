@@ -19,4 +19,5 @@ check_command codex
 check_command ghostty
 python3 "$root/.bin/manage-dotfiles-configs.py" doctor || failures=1
 python3 -m py_compile "$root/.local/bin/herdr-codex-status"
+bash -n "$root/.local/bin/herdr-codex-orchestrate"
 exit "$failures"

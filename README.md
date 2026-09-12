@@ -82,7 +82,7 @@ Ubuntu 24.04 では、bootstrap はコミュニティパッケージを暗黙に
 GHOSTTY_INSTALL=community-deb make bootstrap
 ```
 
-新規セットアップ後は、`gh auth login` と `codex login` を個別に実行して認証してください。
+新規セットアップ後は、`gh auth login` と `codex login` を個別に実行してください。
 
 ### 設定を追加・変更する運用
 
@@ -95,3 +95,22 @@ GHOSTTY_INSTALL=community-deb make bootstrap
 認証情報・トークンは `mode = "ignore"`、sudo や Windows を必要とする設定は `mode = "manual"` として
 明示的に分離します。新しい設定は、秘密情報を除外したうえで `dotfiles.toml` に追加してから `make link` と
 `make check` を実行してください。
+
+### Codex の Herdr オーケストレーション
+
+新しい作業は Herdr 内で次のように始めます。新規タブの左半分にオーケストレーター、右半分に
+delegate が表示されます。独立した delegate を複数走らせる場合は `--delegates` を指定すると、
+右側だけを縦に分割します。
+
+```bash
+herdr-codex-orchestrate "依頼内容"
+herdr-codex-orchestrate --delegates 3 "並列に調査と実装を進める依頼"
+```
+
+このランチャーは Herdr 管理下の pane でのみ動作し、`codex` と `herdr` が利用可能であることを
+確認してから tab と agent を作成します。Codex のグローバル `AGENTS.md` は、main を
+orchestrator 専任にし、delegate の結果を検証して統合するよう指示します。
+
+Codex memories は既に有効です。ただし失敗の自動保存は期待せず、再発しうる教訓だけを原因・予防策・
+適用条件つきで memory に保存します。repository 固有の恒久ルールは `AGENTS.md` または追跡文書を
+正本にします。

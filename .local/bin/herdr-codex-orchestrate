@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Start a Codex task as a Herdr orchestration workspace.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: herdr-codex-orchestrate [--delegates COUNT] [--cwd PATH] TASK
+
+Create and focus a new Herdr tab. The main Codex session occupies the left
+half; delegate sessions occupy the right half. COUNT delegates are stacked
+vertically in the right column (default: 1).
+EOF
+}
+
+die() {
+  printf 'herdr-codex-orchestrate: %s\n' "$*" >&2
+  exit 1
+}
+
+json_field() {
+  local json="$1"
+  local field="$2"
+  python3 -c '
+import json
+import sys
+
+value = json.loads(sys.argv[1])
+for key in sys.argv[2].split("."):
+    value = value[key]
+print(value)
+' "$json" "$field"
+}
+
+delegates=1
+cwd="$PWD"
+
+while (($#)); do
+  case "$1" in
+    --delegates)
+      (($# >= 2)) || die '--delegates requires a positive integer'
+      delegates="$2"
+      shift 2
+      ;;
+    --cwd)
+      (($# >= 2)) || die '--cwd requires a directory'
+      cwd="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+(($# == 1)) || {
+  usage >&2
+  exit 1
+}
+task="$1"
+
+[[ "${HERDR_ENV:-}" == 1 ]] || die 'run this command inside a Herdr-managed pane'
+command -v herdr >/dev/null 2>&1 || die 'herdr is not on PATH'
+command -v codex >/dev/null 2>&1 || die 'codex is not on PATH'
+[[ -n "${HERDR_WORKSPACE_ID:-}" ]] || die 'Herdr workspace context is unavailable'
+[[ -d "$cwd" ]] || die "cwd is not a directory: $cwd"
+[[ "$delegates" =~ ^[1-9][0-9]*$ ]] || die '--delegates must be a positive integer'
+
+tab_response="$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$cwd" --label "$task" --focus)"
+tab_id="$(json_field "$tab_response" result.tab.tab_id)"
+main_pane="$(json_field "$tab_response" result.root_pane.pane_id)"
+
+delegate_panes=()
+split_from="$main_pane"
+for ((index = 1; index <= delegates; index++)); do
+  if ((index == 1)); then
+    direction=right
+  else
+    direction=down
+  fi
+  split_response="$(herdr pane split "$split_from" --direction "$direction" --cwd "$cwd" --no-focus)"
+  split_from="$(json_field "$split_response" result.pane.pane_id)"
+  delegate_panes+=("$split_from")
+done
+
+run_id="$(date +%s)-$$"
+main_name="orchestrator-$run_id"
+delegate_names=()
+for ((index = 1; index <= delegates; index++)); do
+  delegate_name="delegate-$run_id-$index"
+  delegate_names+=("$delegate_name")
+  herdr agent start "$delegate_name" --kind codex --pane "${delegate_panes[index - 1]}" >/dev/null
+done
+herdr agent start "$main_name" --kind codex --pane "$main_pane" >/dev/null
+
+delegate_list="$(IFS=', '; printf '%s' "${delegate_names[*]}")"
+for ((index = 0; index < delegates; index++)); do
+  herdr agent prompt "${delegate_names[index]}" "You are a delegate in Herdr tab $tab_id. Do not begin unrelated work. Wait for a concrete, bounded assignment from $main_name. When assigned, work only within that scope and report evidence, changed files, verification, and blockers to $main_name." >/dev/null
+done
+
+herdr agent prompt "$main_name" "You are the main orchestration session for this task: $task
+
+You own requirements, decomposition, integration decisions, final verification, and the user-facing report. Remain an orchestrator: do not edit production or configuration files yourself. Delegate bounded work to the ready Codex agents with herdr agent prompt <name> <assignment>, and independently review their results before accepting them.
+
+Ready delegate agents: $delegate_list
+
+The tab is intentionally laid out with you on the left and delegates on the right. If additional independent work must run in parallel, create further panes by splitting a right-column delegate pane down, then start a uniquely named Codex agent in the new pane. Keep the main pane on the left and preserve the user's focus unless they ask to change it." >/dev/null
+
+printf 'Created %s: main=%s, delegates=%s\n' "$tab_id" "$main_name" "$delegate_list"
