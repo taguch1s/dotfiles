@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import tomllib
@@ -12,6 +13,9 @@ from pathlib import Path
 
 
 CODEX_HOME = Path.home() / ".codex"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "herdr-codex-status"
+CPU_CACHE = CACHE_DIR / "cpu.json"
+DEFAULT_LEASE_LIMIT = 3
 MODEL_PATTERN = re.compile(r'"model"\s*:\s*"([^"]+)"')
 
 
@@ -130,16 +134,116 @@ def window_label(limit: dict | None, expected_minutes: int, title: str) -> str:
     return output
 
 
-def main() -> None:
+def cpu_counters() -> tuple[int, int] | None:
+    """Return aggregate and idle jiffies from Linux' constant-size /proc/stat."""
+    try:
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("cpu "):
+                values = [int(value) for value in line.split()[1:]]
+                if len(values) < 4:
+                    return None
+                return sum(values), values[3] + (values[4] if len(values) > 4 else 0)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def previous_cpu_counters() -> tuple[int, int] | None:
+    try:
+        data = json.loads(CPU_CACHE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        total, idle = data.get("total"), data.get("idle")
+        if isinstance(total, int) and isinstance(idle, int):
+            return total, idle
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+def save_cpu_counters(counters: tuple[int, int]) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        CPU_CACHE.write_text(json.dumps({"total": counters[0], "idle": counters[1]}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def cpu_label() -> str:
+    current = cpu_counters()
+    if not current:
+        return "cpu:—"
+    previous = previous_cpu_counters()
+    save_cpu_counters(current)
+    if not previous or current[0] <= previous[0]:
+        return "cpu:—"
+    busy = 100 * (1 - (current[1] - previous[1]) / (current[0] - previous[0]))
+    return f"cpu:{max(0, min(100, round(busy)))}%"
+
+
+def memory_label() -> str:
+    try:
+        values = {}
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            key, value, *_ = line.replace(":", "").split()
+            values[key] = int(value)
+        total, available = values.get("MemTotal"), values.get("MemAvailable")
+        if not total or available is None:
+            return "mem:—"
+        used = total - available
+        return f"mem:{used / 1048576:.1f}/{total / 1048576:.1f}G ({round(used / total * 100)}%)"
+    except (OSError, ValueError):
+        return "mem:—"
+
+
+def lease_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("HERDR_CODEX_LEASE_LIMIT", DEFAULT_LEASE_LIMIT)))
+    except ValueError:
+        return DEFAULT_LEASE_LIMIT
+
+
+def lease_label(data: dict) -> str:
+    """Count live unique Codex sessions; a lease is an observability proxy, not a quota API."""
+    sessions = set()
+    working_sessions = set()
+    agents = data.get("agents", [])
+    if not isinstance(agents, list):
+        return f"agents:— (稼働:—) | lease:—/{lease_limit()}"
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        if agent.get("agent") != "codex" or agent.get("agent_status") == "unknown":
+            continue
+        agent_session = agent.get("agent_session")
+        if not isinstance(agent_session, dict):
+            continue
+        session_id = agent_session.get("value")
+        if session_id:
+            session_id = str(session_id)
+            sessions.add(session_id)
+            if agent.get("agent_status") == "working":
+                working_sessions.add(session_id)
+    limit = lease_limit()
+    warning = " ⚠" if len(sessions) >= limit else ""
+    return f"agents:{len(sessions)} (稼働:{len(working_sessions)}) | lease:{len(sessions)}/{limit}{warning}"
+
+
+def resource_label(data: dict) -> str:
+    return f"host {cpu_label()} {memory_label()} | {lease_label(data)}"
+
+
+def _main() -> None:
     data = snapshot()
     sync_codex_tab_labels(data)
+    resources = resource_label(data)
     session_id = focused_codex_session(data)
     if not session_id:
-        print("Codex: セッションなし")
+        print(f"Codex: セッションなし | {resources}")
         return
     path = transcript_for(session_id)
     if not path:
-        print("Codex: 利用状況を待機中")
+        print(f"Codex: 利用状況を待機中 | {resources}")
         return
     usage = latest_usage(path)
     rate_limits = usage.get("rate_limits") or {}
@@ -152,12 +256,16 @@ def main() -> None:
         weekly = window_label(secondary, 10080, "週")
     print(
         f"{session_model(path)} | effort:{configured_effort()} | "
-        f"{context_label(usage.get('info') or {})} | {five_hour} | {weekly}"
+        f"{context_label(usage.get('info') or {})} | {five_hour} | {weekly} | {resources}"
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
     try:
-        main()
-    except (OSError, subprocess.SubprocessError, TimeoutError):
+        _main()
+    except (AttributeError, KeyError, OSError, subprocess.SubprocessError, TimeoutError, TypeError, ValueError):
         print("Codex: 状態を取得できません")
+
+
+if __name__ == "__main__":
+    main()
