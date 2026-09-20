@@ -32,6 +32,7 @@ def handoff(recovery=None):
         "final_review": review("full", "workflow-review-final"),
         "remote_sync": {"status": "pending", "pending_actions": ["post later"]},
         "delivery": {"intent": "none", "state": "not_requested", "pr_url": None, "read_back_evidence": [], "pause_reason": None},
+        "continuation": "manual",
     }
     if recovery is not None:
         payload["session_recovery"] = recovery
@@ -234,6 +235,7 @@ class WorkflowProgressValidatorTest(unittest.TestCase):
                 "read_back_evidence": [{"locator": "workflow-delivery-pr-U1", "summary": "PR URL and read-back confirmed"}],
                 "pause_reason": None,
             }
+            payload["continuation"] = "auto"
 
         result = self.run_validator(rewrite_payload(handoff(), mutate))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -242,6 +244,7 @@ class WorkflowProgressValidatorTest(unittest.TestCase):
         def mutate(payload):
             payload["current_unit"]["next_action"] = ""
             payload["delivery"] = {"intent": "pr", "state": "pr_read_back_pass", "pr_url": "", "read_back_evidence": [], "pause_reason": None}
+            payload["continuation"] = "auto"
 
         result = self.run_validator(rewrite_payload(handoff(), mutate))
         self.assertEqual(result.returncode, 1)
@@ -250,6 +253,7 @@ class WorkflowProgressValidatorTest(unittest.TestCase):
     def test_pr_delivery_in_progress_before_pr_creation_is_valid(self):
         def mutate(payload):
             payload["delivery"] = {"intent": "pr", "state": "in_progress", "pr_url": None, "read_back_evidence": [], "pause_reason": None}
+            payload["continuation"] = "auto"
 
         result = self.run_validator(rewrite_payload(handoff(), mutate))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -258,6 +262,7 @@ class WorkflowProgressValidatorTest(unittest.TestCase):
         def mutate(payload):
             payload["current_unit"]["next_action"] = ""
             payload["delivery"] = {"intent": "pr", "state": "blocked", "pr_url": None, "read_back_evidence": [], "pause_reason": None}
+            payload["continuation"] = "auto"
 
         result = self.run_validator(rewrite_payload(handoff(), mutate))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -271,10 +276,24 @@ class WorkflowProgressValidatorTest(unittest.TestCase):
                 "read_back_evidence": [{"locator": "workflow-delivery-pr-U1", "summary": "read-back"}],
                 "pause_reason": None,
             }
+            payload["continuation"] = "auto"
 
         result = self.run_validator(rewrite_payload(handoff(), mutate))
         self.assertEqual(result.returncode, 1)
         self.assertIn("terminal delivery must not retain next_action", result.stderr)
+
+    def test_missing_continuation_is_a_schema_error(self):
+        result = self.run_validator(rewrite_payload(handoff(), lambda payload: payload.pop("continuation")))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("continuation is invalid", result.stderr)
+
+    def test_pr_delivery_requires_auto_continuation(self):
+        def mutate(payload):
+            payload["delivery"] = {"intent": "pr", "state": "in_progress", "pr_url": None, "read_back_evidence": [], "pause_reason": None}
+
+        result = self.run_validator(rewrite_payload(handoff(), mutate))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("PR delivery requires continuation=auto", result.stderr)
 
     def test_manual_gate_candidate_with_blank_blocked_locator_is_retain(self):
         recovery = {

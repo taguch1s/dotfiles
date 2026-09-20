@@ -22,4 +22,6 @@ When the tracked launcher starts a Herdr task, `--delegates N` is the strict con
 
 When a delegate returns a bounded Unit, the parent executes its recorded safe next action, reassigns the same fixed delegate, or conditionally reclaims the pane. A delivery intent (`none|commit|pr`) is handoff evidence, not permission to add a review, pane, tab, or agent.
 
+At the repository handoff threshold, an auto continuation is only a PR-delivery recovery path when recorded `continuation=auto` has no external manual/human gate, unresolved specification decision, or safety blocker. It first verifies a distinct nonempty successor main session by Herdr read-back; it neither grants external authority nor turns an intermediate delegate report into `done`.
+
 Repository policy decides branch naming, dependency setup, cleanup, and checks.

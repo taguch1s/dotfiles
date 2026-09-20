@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Gate mapped Issue branches on same-handoff workflow-progress evidence.
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+config="$root/.githooks/workflow-progress.toml"
+validator="$root/.agents/skills/issue-development-workflow/scripts/check-workflow-progress.py"
+handoff_dir="$(git rev-parse --path-format=absolute --git-path codex-handoffs)"
+
+[[ -f "$config" ]] || { echo 'NG workflow-progress: mapping config is missing' >&2; exit 1; }
+[[ -f "$validator" ]] || { echo 'NG workflow-progress: validator is missing' >&2; exit 1; }
+
+lookup_mapping() {
+  python3 - "$config" "$1" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+
+config, branch = Path(sys.argv[1]), sys.argv[2]
+try:
+    data = tomllib.loads(config.read_text())
+except (OSError, tomllib.TOMLDecodeError) as exc:
+    raise SystemExit(f"invalid workflow-progress mapping: {exc}")
+
+records = []
+for kind, required in (("issue_branch", "handoff"), ("out_of_scope_branch", "reason")):
+    value = data.get(kind, [])
+    if not isinstance(value, list):
+        raise SystemExit(f"invalid workflow-progress mapping: {kind} must be an array")
+    for item in value:
+        if not isinstance(item, dict) or not isinstance(item.get("branch"), str) or not item["branch"]:
+            raise SystemExit(f"invalid workflow-progress mapping: {kind}.branch is required")
+        if not isinstance(item.get(required), str) or not item[required].strip():
+            raise SystemExit(f"invalid workflow-progress mapping: {kind}.{required} is required")
+        if kind == "issue_branch":
+            handoff = item["handoff"]
+            if Path(handoff).name != handoff or not handoff.endswith(".md"):
+                raise SystemExit("invalid workflow-progress mapping: handoff must be a .md basename")
+        if item["branch"] == branch:
+            records.append((kind, item[required]))
+
+if len(records) > 1:
+    raise SystemExit("invalid workflow-progress mapping: duplicate exact branch mapping")
+if records:
+    print(f"{records[0][0]}\t{records[0][1]}")
+PY
+}
+
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+  [[ "$local_ref" == refs/heads/* ]] || continue
+  branch="${local_ref#refs/heads/}"
+  if [[ "$branch" =~ ^(feature|fix|chore)/no-issue/.+ ]]; then
+    printf 'OK workflow-progress: explicit no-Issue branch %s\n' "$branch" >&2
+    continue
+  fi
+
+  mapping="$(lookup_mapping "$branch")" || { echo "NG workflow-progress: $mapping" >&2; exit 1; }
+  if [[ -z "$mapping" ]]; then
+    if [[ "$branch" =~ ^(feature|fix|chore)/issue-[1-9][0-9]*- ]]; then
+      echo "NG workflow-progress: mapping is required for Issue branch $branch" >&2
+    else
+      echo "NG workflow-progress: branch is unclassified: $branch" >&2
+    fi
+    exit 1
+  fi
+
+  kind="${mapping%%$'\t'*}"
+  value="${mapping#*$'\t'}"
+  if [[ "$kind" == out_of_scope_branch ]]; then
+    printf 'OK workflow-progress: explicit out-of-scope branch %s (%s)\n' "$branch" "$value" >&2
+    continue
+  fi
+  [[ "$kind" == issue_branch ]] || { echo 'NG workflow-progress: invalid mapping kind' >&2; exit 1; }
+  handoff="$handoff_dir/$value"
+  python3 "$validator" --handoff "$handoff" --branch "$branch" --head "$local_sha"
+done

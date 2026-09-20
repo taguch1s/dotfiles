@@ -50,7 +50,7 @@ Issue 起点の Full / Compact workflow は `$session-handoff` が定める同�
 - 各 delivery-required Unit が accepted になる前に `light` review を記録する。`outcome=pass` の review は reviewed HEAD と、`workflow-review-unit-<Unit ID>` の同一-handoff locator を持つ。`degraded` には理由を残す。
 - delivery 前には変更全体に対する fresh `full` review を実行し、delivery HEAD と `workflow-review-final` locator を記録する。final review は degraded にしない。
 - Unit / final evidence locator は一意で、marker の Unit、kind、reviewed HEAD、直後の見出しが JSON review と一致しなければ evidence として扱わない。
-- session start、各 Unit の commit/review 後、長時間処理前、push/PR 前には同じ handoff を更新する。70k token 閾値と continuation の規約は `$session-handoff` を優先し、ここで変更しない。
+- session start、各 Unit の commit/review 後、長時間処理前、push/PR 前には同じ handoff を更新する。100k token 閾値と continuation の規約は `$session-handoff` を優先し、ここで変更しない。
 
 導入済み repository の通常の `pre-push` は、tracked `.githooks/workflow-progress.toml` の exact `issue_branch` mapping から `git rev-parse --git-path codex-handoffs` 配下の一つの handoff を選び、local validator に渡す。pre-push を選ぶのは、review evidence が remote delivery の直前の delivery HEAD と一致しなければならず、pre-commit はそれより早く最終 HEAD を決定的に gate できないためである。`feature|fix|chore/no-issue/*` は明示的な no-Issue path、その他は exact の理由付き `out_of_scope_branch` だけが non-adoption になる。`feature|fix|chore/issue-<positive-number>-*` で mapping がない場合、および未知 branch は fail closed であり、環境変数や handoff の総当たりで選ばない。validator / hook の実装・導入は対応 Unit が完了するまでこの Skill だけでは行わない。
 
@@ -64,7 +64,7 @@ push 後の AI review marker と短い要約の Issue/PR 投稿は `remote_sync`
 
 進捗のない `wait` / status polling を反復しない。delegate は commit、check、review結果、blocker、または安全な next action が変わった時だけ報告する。completion gate は review 回数を増やすためではなく、PR 提出可能かを判定する最終 check へ収束させる。
 
-delivery intent は同じ `workflow-progress/v1` handoff に `none|commit|pr` として記録する。`pr` の PR 作成前は `in_progress` で有効であり、local review gate を妨げない。terminal は `pr_read_back_pass|blocked|paused` だけで、terminal に `next_action` を残さない。`pr_read_back_pass` は PR URL と同一 handoff の read-back evidence marker を必須とし、`paused` はユーザー指示だけで記録する。
+delivery intent は同じ `workflow-progress/v1` handoff に `none|commit|pr` と `continuation=manual|auto` として記録する。`pr` の実運用は `continuation=auto` で、PR 作成前は `in_progress` が有効であり local review gate を妨げない。terminal は `pr_read_back_pass|blocked|paused` だけで、terminal に `next_action` を残さない。`pr_read_back_pass` は PR URL と同一 handoff の read-back evidence marker を必須とし、`paused` はユーザー指示だけで記録する。100k token 到達時は新 Unit を始めず atomic operation と handoff 更新だけを完結する。auto continuation の発火は `$session-handoff` の gate・Herdr read-back・権限非拡張・ユーザーの pane/tab/agent 禁止をすべて満たす場合だけである。
 
 親は delegate の報告後、記録された safe next action を実行するか、同じ fixed delegate を次 Unit へ再割当てるか、条件確認後に reclaim する。delivery intent は review / pane / tab / agent を追加する規約ではない。
 

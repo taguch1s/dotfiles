@@ -210,6 +210,9 @@ def main() -> int:
             raise SchemaError("git identity is invalid")
         validate_review(data.get("final_review"))
         delivery = validate_delivery(data.get("delivery"))
+        continuation = data.get("continuation")
+        if continuation not in ("manual", "auto"):
+            raise SchemaError("continuation is invalid")
     except (json.JSONDecodeError, SchemaError) as exc:
         error(str(exc))
 
@@ -240,6 +243,8 @@ def main() -> int:
         gate("final review must be fresh")
     if final.get("reviewed_head") != head or not review_marker(items, final, unit=None):
         gate("final review evidence locator is invalid or unrelated")
+    if delivery["intent"] == "pr" and continuation != "auto":
+        gate("PR delivery requires continuation=auto")
     validate_delivery_gate(delivery, current, items)
     try:
         recovery = validate_recovery(data.get("session_recovery"), items)

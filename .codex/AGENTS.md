@@ -17,6 +17,7 @@
 - `--delegates N` はその tab の strict concurrency / pane cap である。main / delegate は追加 pane、tab、agent、reviewer を作らない。容量不足は既存 delegate の逐次再利用か、親が別 top-level task を提案して扱う。
 - delegate は1つの bounded Unit 後に変更・検証・handoff/証跡・blocker・safe next action を返す。親は受理して同じ delegate を次 Unit へ再割当てるか、不要なら明示的に pane を回収する。`done` / `idle` は `reclaimable` であり、回収済みではない。
 - 全 Unit 後の tab 回収は、Issue / PR、agent stop、worktree clean、handoff 送信、downstream pane 不要を親が実測してから判断する。未merge PR、dirty worktree、未送信 handoff、実行中 Unit は回収しない。Herdr に無条件 auto-close を導入しない。
+- `input_tokens >= 100_000` では新 Unit を始めず、atomic operation と handoff 更新だけを完結する。`delivery.intent=pr` の `continuation=auto` は、external manual/human gate・未解決仕様判断・安全 blocker がなく、Herdr preflight と別 session ID の read-back が通る場合だけ continuation を許す。これは外部権限を増やさず、ユーザーが pane/tab/agent 禁止を指定した task では起動しない。
 
 ## コンテキスト上限前の handoff
 
