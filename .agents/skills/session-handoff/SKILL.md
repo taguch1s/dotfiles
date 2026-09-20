@@ -30,6 +30,42 @@ git diff --stat
 
 保存先は `git rev-parse --git-path codex-handoffs` 配下の `<task-slug>.md` とする。tracked `docs/` や session ごとの新規ファイルは使わず、1 file 50 KiB 未満を目安に同じ handoff を更新する。
 
+## workflow-progress/v1
+
+Issue 起点の作業では、同じ handoff に `workflow-progress/v1` の JSON block をちょうど一つ置く。これは handoff を正本へ昇格させず、現在の Unit、local review evidence、次の安全な action、remote sync の pending を再開時に判別できるようにする進捗証跡である。
+
+````markdown
+<!-- workflow-progress/v1:start -->
+```json
+{
+  "version": "workflow-progress/v1",
+  "issue": {"repository": "OWNER/REPO", "number": 123, "url": "https://github.com/OWNER/REPO/issues/123"},
+  "git": {"branch": "feature/issue-123-example", "head": "<40-lowercase-hex-sha>"},
+  "current_unit": {"id": "U1", "status": "in_progress", "next_action": "…"},
+  "units": [{"id": "U1", "status": "in_progress", "required_for_delivery": true, "review": {"kind": "light", "outcome": "pending", "independence": "fresh", "degraded_reason": null, "reviewed_head": null, "evidence": []}}],
+  "final_review": {"kind": "full", "outcome": "pending", "independence": "fresh", "reviewed_head": null, "evidence": []},
+  "remote_sync": {"status": "pending", "pending_actions": ["…"]}
+}
+```
+<!-- workflow-progress/v1:end -->
+````
+
+Required invariants are a nonempty unique `units` array; exactly one Unit whose `id` equals `current_unit.id` and whose status equals `current_unit.status`; and at least one Unit with `required_for_delivery=true`. `status` is `planned|in_progress|blocked|accepted`; review `outcome` is `pass|fail|pending`; `independence` is `fresh|degraded`; `remote_sync.status` is `pending|posted|not_applicable`. A degraded review records a nonblank `degraded_reason`.
+
+Each passing required Unit review has `kind=light`, `outcome=pass`, `reviewed_head` equal to the reviewed Git HEAD, and exactly one evidence item. Each passing final review has `kind=full`, `outcome=pass`, `independence=fresh`, `reviewed_head` equal to delivery HEAD, and exactly one evidence item. Evidence is a same-handoff locator, not a URL or arbitrary file path:
+
+````markdown
+<!-- workflow-review-section/v1 id="workflow-review-unit-U1" unit="U1" kind="light" reviewed_head="<40-lowercase-hex-sha>" -->
+### Review evidence: Unit U1
+
+<!-- workflow-review-section/v1 id="workflow-review-final" kind="full" reviewed_head="<40-lowercase-hex-sha>" -->
+### Review evidence: Final delivery
+````
+
+The Unit evidence item is `{"locator":"workflow-review-unit-U1","summary":"…"}`; its unique marker must name that Unit, `kind=light`, matching head, and be immediately followed by `### Review evidence: Unit U1`. The final item uses only `workflow-review-final`, with no `unit`, `kind=full`, matching head, and immediately followed by `### Review evidence: Final delivery`. Invalid, duplicated, unrelated, wrong-kind, wrong-Unit, or wrong-head locators are not review evidence.
+
+Update this one handoff at session start, after every Unit commit/review, before long-running work, and before push/PR. Keep `remote_sync.status=pending` with an explicit next action until an authorized post-push Issue/PR marker and concise summary have been posted; remote sync never becomes a local-gate prerequisite.
+
 ```markdown
 # Handoff: <task title>
 
@@ -43,7 +79,6 @@ git diff --stat
 ## Confirmed decisions / rejected proposals
 ## Worktree / branch / current diff
 ## Current unit and exact next action
-## Fresh-continuation verification
 ## Open questions / blockers / residual risks
 ## Next-session prompt
 ```
