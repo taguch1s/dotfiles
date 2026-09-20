@@ -23,11 +23,12 @@
 
 - これはプラットフォームの自動 compact 閾値を変更する設定ではなく、作業を安全に引き継ぐための運用上の閾値である。
 - Unit 完了の直前、長時間の test / build / 調査 / 外部操作を始める直前、および commit・push・PR 操作の直前に、Herdr status が示す最新の `input_tokens` を確認する。
-- 最新の `input_tokens >= 70_000` なら handoff を開始する。値を取得できない、欠けている、数値でない場合は閾値未満とみなし、推測で handoff・session 切替をしない。
+- 最新の `input_tokens >= 100_000` なら handoff を開始する。値を取得できない、欠けている、数値でない場合は閾値未満とみなし、推測で handoff・session 切替をしない。
 - 閾値到達後は新しい作業 Unit を開始しない。進行中の test・commit・push などの atomic operation は安全に完結させ、完結できない場合は実行状態と結果を handoff に記録する。
-- handoff は `session-handoff` skill の指定形式で Git 管理外に保存する。最終報告を返すことや現在の session を終了することは、session 切替ではない。70k handoff を「継続済み」と報告できるのは、handoff の再開 prompt を渡した別の Codex session が実際に起動し、その新しい session ID を確認した後だけである。
-- ユーザーが当該 task で 70k 到達時の fresh continuation（新規 top-level tab）を明示的に許可している場合は、handoff 保存後、既存の Herdr preflight を再実行してから `herdr-codex-orchestrate --new-top-level --cwd "$PWD" "<handoff の Next-session prompt>"` で continuation を起動する。返却された tab ID / main agent 名を記録し、`herdr tab get <tab-id>` と Herdr status の main agent `agent_session.value` を再取得して、起動元とは異なる非空の session ID を照合する。確認できるまで旧 session を終了せず、continuation を報告しない。
-- fresh continuation の明示許可がない場合、この規約は tab / pane の新規作成・終了や session 切替を自動許可しない。handoff と再開 prompt を保存・提示して現在の session を終了し、次の起動はユーザーの指示を待つ。Herdr の UI 操作には上記の既存規約を引き続き適用する。
+- handoff は `session-handoff` skill の指定形式で Git 管理外に保存する。最終報告を返すことや現在の session を終了することは、session 切替ではない。
+- `delivery.intent=pr` かつ `continuation=auto` の場合だけ、external manual/human gate、未解決の仕様判断、安全 blocker がないことを確認して fresh continuation を許す。これは外部権限を増やさず、ユーザーが pane/tab/agent の作成を禁止した task では起動しない。
+- auto continuation は handoff 保存後に既存の Herdr preflight を再実行し、必要な継承環境は維持したまま `HERDR_CODEX_ORCHESTRATED` だけを neutralize して、`env -u HERDR_CODEX_ORCHESTRATED herdr-codex-orchestrate --new-top-level --cwd "$PWD" "<handoff の Next-session prompt>"` を起動する。返却された tab ID / main agent 名を記録し、`herdr tab get <tab-id>` と Herdr status の main agent `agent_session.value` を再取得して、起動元とは異なる非空の session ID を照合する。確認できるまで旧 session を終了・回収せず、continuation を報告しない。
+- auto continuation の条件を満たさない場合は、handoff と再開 prompt を保存・提示して現在の session を終了し、次の起動はユーザーの指示を待つ。Herdr の UI 操作には上記の既存規約を引き続き適用する。
 
 ## 再発防止メモリ
 
