@@ -56,6 +56,18 @@ Issue 起点の Full / Compact workflow は `$session-handoff` が定める同�
 
 push 後の AI review marker と短い要約の Issue/PR 投稿は `remote_sync` の後続 action であり、local gate の前提ではない。未投稿なら `pending` と次の action を handoff に残す。`--no-verify` と GitHub UI merge は local hook では防げず、CI / branch protection は本 workflow の non-goal である。
 
+## Review budget と orchestration 効率
+
+通常の中リスク Issue は、意味のある変更境界での initial fresh review と、再現可能な Blocking をすべて一括修正した同一 HEAD への final fresh review の最大2回を原則とする。新しい再現可能な Blocking がない限り、fixture 追加や小修正ごとに fresh review を追加しない。同一 review で得た Blocking は一括修正して1 Unitとして再検証する。
+
+低リスク Unit は focused self-check を既定にする。fresh reviewer は DB 契約、外部設定、公開契約、認可、永続データなど意味のある境界に限定する。launcher が与えた delegate / pane 予算は上限であり、子 session は nested pane / tab を追加しない。例外は親 orchestrator が明示承認して記録した場合だけである。
+
+進捗のない `wait` / status polling を反復しない。delegate は commit、check、review結果、blocker、または安全な next action が変わった時だけ報告する。completion gate は review 回数を増やすためではなく、PR 提出可能かを判定する最終 check へ収束させる。
+
+delivery intent は同じ `workflow-progress/v1` handoff に `none|commit|pr` として記録する。`pr` の PR 作成前は `in_progress` で有効であり、local review gate を妨げない。terminal は `pr_read_back_pass|blocked|paused` だけで、terminal に `next_action` を残さない。`pr_read_back_pass` は PR URL と同一 handoff の read-back evidence marker を必須とし、`paused` はユーザー指示だけで記録する。
+
+親は delegate の報告後、記録された safe next action を実行するか、同じ fixed delegate を次 Unit へ再割当てるか、条件確認後に reclaim する。delivery intent は review / pane / tab / agent を追加する規約ではない。
+
 ### Review の分類と Judge
 
 reviewer の finding を次のいずれかへ必ず分類する。

@@ -14,6 +14,9 @@
 - 「session が多い」「減らして」のような観測は、tab、pane、workspace、agent、server を終了する許可ではない。`herdr tab close`、`herdr pane close`、`herdr agent send-keys ... ctrl+c`、`herdr server stop` は、ユーザーが対象 ID または終了対象を明示した場合だけ実行する。重複が疑われるときは ID、cwd、状態を報告して指示を待つ。
 - main orchestrator は要件整理、タスク分割、delegate への割り当て、統合判断、最終検証、ユーザー報告だけを担当する。production code や設定の編集は delegate に委譲し、結果を独立に確認してから採用する。
 - delegate は明確に割り当てられた範囲だけを扱い、変更・検証・ブロッカーを main orchestrator に返す。並列編集では別 worktree または非重複ファイルを使う。
+- `--delegates N` はその tab の strict concurrency / pane cap である。main / delegate は追加 pane、tab、agent、reviewer を作らない。容量不足は既存 delegate の逐次再利用か、親が別 top-level task を提案して扱う。
+- delegate は1つの bounded Unit 後に変更・検証・handoff/証跡・blocker・safe next action を返す。親は受理して同じ delegate を次 Unit へ再割当てるか、不要なら明示的に pane を回収する。`done` / `idle` は `reclaimable` であり、回収済みではない。
+- 全 Unit 後の tab 回収は、Issue / PR、agent stop、worktree clean、handoff 送信、downstream pane 不要を親が実測してから判断する。未merge PR、dirty worktree、未送信 handoff、実行中 Unit は回収しない。Herdr に無条件 auto-close を導入しない。
 
 ## コンテキスト上限前の handoff
 

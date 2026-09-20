@@ -44,15 +44,18 @@ Issue 起点の作業では、同じ handoff に `workflow-progress/v1` の JSON
   "current_unit": {"id": "U1", "status": "in_progress", "next_action": "…"},
   "units": [{"id": "U1", "status": "in_progress", "required_for_delivery": true, "review": {"kind": "light", "outcome": "pending", "independence": "fresh", "degraded_reason": null, "reviewed_head": null, "evidence": []}}],
   "final_review": {"kind": "full", "outcome": "pending", "independence": "fresh", "reviewed_head": null, "evidence": []},
-  "remote_sync": {"status": "pending", "pending_actions": ["…"]}
+  "remote_sync": {"status": "pending", "pending_actions": ["…"]},
+  "delivery": {"intent": "none", "state": "not_requested", "pr_url": null, "read_back_evidence": [], "pause_reason": null}
 }
 ```
 <!-- workflow-progress/v1:end -->
 ````
 
-Required invariants are a nonempty unique `units` array; exactly one Unit whose `id` equals `current_unit.id` and whose status equals `current_unit.status`; and at least one Unit with `required_for_delivery=true`. `status` is `planned|in_progress|blocked|accepted`; review `outcome` is `pass|fail|pending`; `independence` is `fresh|degraded`; `remote_sync.status` is `pending|posted|not_applicable`. A degraded review records a nonblank `degraded_reason`.
+Required invariants are a nonempty unique `units` array; exactly one Unit whose `id` equals `current_unit.id` and whose status equals `current_unit.status`; and at least one Unit with `required_for_delivery=true`. `status` is `planned|in_progress|blocked|accepted`; review `outcome` is `pass|fail|pending`; `independence` is `fresh|degraded`; `remote_sync.status` is `pending|posted|not_applicable`; and `delivery.intent` is `none|commit|pr` with `delivery.state` in `not_requested|in_progress|pr_read_back_pass|blocked|paused`. A degraded review records a nonblank `degraded_reason`.
 
 Each passing required Unit review has `kind=light`, `outcome=pass`, `reviewed_head` equal to the reviewed Git HEAD, and exactly one evidence item. Each passing final review has `kind=full`, `outcome=pass`, `independence=fresh`, `reviewed_head` equal to delivery HEAD, and exactly one evidence item. Evidence is a same-handoff locator, not a URL or arbitrary file path:
+
+For `delivery.intent=pr`, pre-PR `state=in_progress` is valid so the local review gate can run before creation. Terminal states are exactly `pr_read_back_pass|blocked|paused`, and every terminal state requires an empty `current_unit.next_action`. Only `pr_read_back_pass` requires a nonempty `pr_url` and exactly one `read_back_evidence` item resolving to a same-handoff `kind=delivery` marker immediately followed by `### PR read-back evidence: …`; `paused` requires `pause_reason=user_instruction`. These delivery fields record evidence and do not authorize a new review, pane, tab, or agent.
 
 ````markdown
 <!-- workflow-review-section/v1 id="workflow-review-unit-U1" unit="U1" kind="light" reviewed_head="<40-lowercase-hex-sha>" -->

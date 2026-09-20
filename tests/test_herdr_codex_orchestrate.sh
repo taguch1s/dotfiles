@@ -17,6 +17,10 @@ set -euo pipefail
 printf '%q ' "$@" >>"$MOCK_HERDR_LOG"
 printf '\n' >>"$MOCK_HERDR_LOG"
 
+if [[ "$1 $2" == "agent prompt" ]]; then
+  printf '%s\n---\n' "$4" >>"$MOCK_HERDR_PROMPTS"
+fi
+
 case "$1 $2" in
   'tab create')
     printf '%s\n' '{"result":{"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}'
@@ -47,6 +51,7 @@ HERDR_ENV=1 \
 HERDR_WORKSPACE_ID=w1 \
 MOCK_HERDR_LOG="$mock_log" \
 MOCK_HERDR_STATE="$mock_state" \
+MOCK_HERDR_PROMPTS="$fixture/prompts" \
 "$launcher" --new-top-level --delegates 2 --cwd "$fixture" 'inspect and implement' >"$fixture/output"
 
 rg -F 'tab create --workspace w1 --cwd ' "$mock_log" >/dev/null
@@ -59,6 +64,15 @@ rg -F -- '--kind codex --pane w1:p11' "$mock_log" >/dev/null
 rg -F -- '--kind codex --pane w1:p9' "$mock_log" >/dev/null
 [[ "$(rg -c '^agent prompt ' "$mock_log")" == 3 ]]
 rg -F 'Created w1:t9: main=orchestrator-' "$fixture/output" >/dev/null
+rg -F -- '--delegates 2 is this tab' "$fixture/prompts" >/dev/null
+rg -F 'Do not create additional panes, tabs, agents, or reviewers.' "$fixture/prompts" >/dev/null
+rg -F 'fixed-slot delegate' "$fixture/prompts" >/dev/null
+rg -F 'reclaimable, not recovered' "$fixture/prompts" >/dev/null
+rg -F 'never close a pane or tab unconditionally or automatically' "$fixture/prompts" >/dev/null
+if rg -F 'If additional independent work must run in parallel' "$fixture/prompts" >/dev/null; then
+  echo 'launcher still authorizes nested delegate allocation' >&2
+  exit 1
+fi
 
 if PATH="$mock_bin:$PATH" \
   HERDR_ENV=1 \

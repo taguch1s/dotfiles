@@ -8,8 +8,9 @@ Usage: herdr-codex-orchestrate --new-top-level [--delegates COUNT] [--cwd PATH] 
 
 Create and focus a new Herdr tab. The main Codex session occupies the left
 half; delegate sessions occupy the right half. COUNT delegates are stacked
-vertically in the right column (default: 1). --new-top-level is required so
-an existing session cannot create a tab by accident.
+vertically in the right column (default: 1). COUNT is this tab's strict
+delegate concurrency and pane cap. --new-top-level is required so an existing
+session cannot create a tab by accident.
 EOF
 }
 
