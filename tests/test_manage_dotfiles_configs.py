@@ -1,6 +1,8 @@
 import importlib.util
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -101,6 +103,46 @@ class ManageDotfilesConfigsTest(unittest.TestCase):
         self.assertTrue(existing.is_dir())
         self.assertTrue((target_root / "shared-codex-workflow").is_symlink())
         self.assertEqual((target_root / "shared-codex-workflow").resolve(), source)
+
+    def test_static_doctor_checks_sources_without_requiring_home_links(self):
+        source = self.root / ".agents" / "skills" / "example"
+        source.mkdir(parents=True)
+        target = self.root / "home" / ".agents" / "skills" / "example"
+        config = {"name": "Example", "mode": "link", "source": ".agents/skills/example", "target": str(target)}
+        original_configs = MANAGER.configs
+        MANAGER.configs = lambda: [config]
+        output = io.StringIO()
+        try:
+            with redirect_stdout(output):
+                self.assertEqual(MANAGER.doctor(static=True), 0)
+        finally:
+            MANAGER.configs = original_configs
+
+        self.assertIn("OK    管理対象", output.getvalue())
+
+    def test_auto_doctor_uses_full_link_validation_for_an_installed_checkout(self):
+        source_a = self.root / ".agents" / "skills" / "a"
+        source_b = self.root / ".agents" / "skills" / "b"
+        source_a.mkdir(parents=True)
+        source_b.mkdir(parents=True)
+        target_a = self.root / "home" / ".agents" / "skills" / "a"
+        target_b = self.root / "home" / ".agents" / "skills" / "b"
+        target_a.parent.mkdir(parents=True)
+        target_a.symlink_to(source_a)
+        configs = [
+            {"name": "A", "mode": "link", "source": ".agents/skills/a", "target": str(target_a)},
+            {"name": "B", "mode": "link", "source": ".agents/skills/b", "target": str(target_b)},
+        ]
+        original_configs = MANAGER.configs
+        MANAGER.configs = lambda: configs
+        output = io.StringIO()
+        try:
+            with redirect_stdout(output):
+                self.assertEqual(MANAGER.doctor(auto=True), 1)
+        finally:
+            MANAGER.configs = original_configs
+
+        self.assertIn("NG    リンク", output.getvalue())
 
 
 if __name__ == "__main__":

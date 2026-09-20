@@ -154,14 +154,35 @@ def sync() -> int:
     return int(not succeeded)
 
 
-def doctor() -> int:
+def has_installed_link() -> bool:
+    for config in configs():
+        if config["mode"] != "link":
+            continue
+        source, target = source_path(config), target_path(config)
+        if target.is_symlink() and target.resolve() == source.resolve():
+            return True
+    return False
+
+
+def doctor(*, static: bool = False, auto: bool = False) -> int:
+    if static and auto:
+        raise ValueError("--static と --auto は同時に指定できません")
+
+    check_links = not static and (not auto or has_installed_link())
+    if not check_links:
+        print("情報  worktree-safe static doctor: home link は installed checkout だけで検証します")
+
     failures = 0
     for config in configs():
         mode, target = str(config["mode"]), target_path(config)
         if mode == "link":
             source = source_path(config)
-            ok = target.is_symlink() and target.resolve() == source.resolve()
-            print(f"{'OK' if ok else 'NG'}    リンク: {config['target']}")
+            if check_links:
+                ok = target.is_symlink() and target.resolve() == source.resolve()
+                print(f"{'OK' if ok else 'NG'}    リンク: {config['target']}")
+            else:
+                ok = source.exists()
+                print(f"{'OK' if ok else 'NG'}    管理対象: {config['source']}")
             failures += not ok
         elif mode == "copy-if-missing":
             ok = target.is_file()
@@ -209,7 +230,14 @@ def diff() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("link", "install", "sync", "doctor", "diff"))
-    return globals()[parser.parse_args().command]()
+    parser.add_argument("--static", action="store_true", help="home link を変更せず source だけを検証する")
+    parser.add_argument("--auto", action="store_true", help="installed checkout は full、linked worktree は static で検証する")
+    args = parser.parse_args()
+    if (args.static or args.auto) and args.command != "doctor":
+        parser.error("--static と --auto は doctor だけで使用できます")
+    if args.command == "doctor":
+        return doctor(static=args.static, auto=args.auto)
+    return globals()[args.command]()
 
 
 if __name__ == "__main__":

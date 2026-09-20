@@ -8,8 +8,9 @@ Usage: herdr-codex-orchestrate --new-top-level [--delegates COUNT] [--cwd PATH] 
 
 Create and focus a new Herdr tab. The main Codex session occupies the left
 half; delegate sessions occupy the right half. COUNT delegates are stacked
-vertically in the right column (default: 1). --new-top-level is required so
-an existing session cannot create a tab by accident.
+vertically in the right column (default: 1). COUNT is this tab's strict
+delegate concurrency and pane cap. --new-top-level is required so an existing
+session cannot create a tab by accident.
 EOF
 }
 
@@ -113,7 +114,7 @@ herdr agent start "$main_name" --kind codex --pane "$main_pane" >/dev/null
 
 delegate_list="$(IFS=', '; printf '%s' "${delegate_names[*]}")"
 for ((index = 0; index < delegates; index++)); do
-  herdr agent prompt "${delegate_names[index]}" "You are a delegate in Herdr tab $tab_id. Do not begin unrelated work. Wait for a concrete, bounded assignment from $main_name. When assigned, work only within that scope and report evidence, changed files, verification, and blockers to $main_name." >/dev/null
+  herdr agent prompt "${delegate_names[index]}" "You are a fixed-slot delegate in Herdr tab $tab_id. Do not begin unrelated work or create panes, tabs, agents, or reviewers. Wait for one concrete, bounded Unit from $main_name. Complete only that Unit, then report changed files, verification, handoff/evidence, blockers, and safe next action to $main_name. Report done/idle as reclaimable, not recovered; do not self-assign another Unit or recover/close a pane." >/dev/null
 done
 
 herdr agent prompt "$main_name" "You are the main orchestration session for this task: $task
@@ -122,6 +123,10 @@ You own requirements, decomposition, integration decisions, final verification, 
 
 Ready delegate agents: $delegate_list
 
-The tab is intentionally laid out with you on the left and delegates on the right. If additional independent work must run in parallel, create further panes by splitting a right-column delegate pane down, then start a uniquely named Codex agent in the new pane. Keep the main pane on the left and preserve the user's focus unless they ask to change it." >/dev/null
+--delegates $delegates is this tab's strict delegate concurrency and pane cap. Do not create additional panes, tabs, agents, or reviewers. Reuse an accepted fixed-slot delegate sequentially for the next bounded Unit, or propose a separate top-level task to the user when capacity is insufficient.
+
+After each bounded Unit report, explicitly accept or reject it, execute its recorded safe next action, or reassign that same delegate. If you do not reassign that same delegate, explicitly reclaim its pane with herdr pane close <pane-id> only after its evidence/handoff is preserved. done/idle means reclaimable, not recovered.
+
+After all Units, read back Issue/PR state, agent stop state, worktree cleanliness, handoff delivery, and downstream pane need. Only then may you decide to run herdr tab close <tab-id>; never close a pane or tab unconditionally or automatically. Keep the main pane on the left and preserve the user's focus unless they ask to change it." >/dev/null
 
 printf 'Created %s: main=%s, delegates=%s\n' "$tab_id" "$main_name" "$delegate_list"

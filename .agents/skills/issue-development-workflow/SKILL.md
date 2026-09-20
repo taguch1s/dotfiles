@@ -38,9 +38,35 @@ git remote -v
 
 1. Goal、Done、Non-goals、対象 Unit、focused check を Issue / planning artifact に対応付ける。
 2. `$issue-tdd-implement` と必要な `$issue-layer-implement` に従って、最小の変更を実装し focused check を実行する。
-3. `$adversarial-review` に、Goal / Done、Unit scope、diff、実行 command と結果を渡して review する。中リスク以上は fresh reviewer を使う。低リスクで利用できない場合だけ `Independence: degraded` と理由を記録する。
-4. 下記の分類で Judge する。Blocking がなければ、追加調査、再review、Stop and Ask を挟まず Unit を受け入れる。
-5. 通常の commit 単体は `$git-commit` の明示許可がある場合だけ一責務の commit にする。PR 作成が明示依頼されている場合は `$git-commit` と `$pr-description` を使い、必要な commit、push、PR 作成、read-back までを完了させる。
+3. `$adversarial-review` に、Goal / Done、Unit scope、diff、実行 command と結果を渡して light review する。中リスク以上は fresh reviewer を使う。低リスクで利用できない場合だけ `Independence: degraded` と理由を記録する。
+4. `$session-handoff` の同じ handoff を更新し、`workflow-progress/v1` に accepted Unit の `kind=light` review、reviewed HEAD、independence、evidence locator、current Unit、next safe action を記録する。passing evidence は同一 handoff の `workflow-review-section/v1` marker と直後の Unit heading に結び、任意の URL・ファイルパス・prose を evidence にしない。
+5. 下記の分類で Judge する。Blocking がなければ、追加調査、再review、Stop and Ask を挟まず Unit を受け入れる。
+6. 通常の commit 単体は `$git-commit` の明示許可がある場合だけ一責務の commit にする。PR 作成が明示依頼されている場合は `$git-commit` と `$pr-description` を使い、必要な commit、push、PR 作成、read-back までを完了させる。
+
+## workflow-progress/v1 と local review gate
+
+Issue 起点の Full / Compact workflow は `$session-handoff` が定める同一 handoff の `workflow-progress/v1` を更新する。Unit review と delivery review を混同しない。
+
+- 各 delivery-required Unit が accepted になる前に `light` review を記録する。`outcome=pass` の review は reviewed HEAD と、`workflow-review-unit-<Unit ID>` の同一-handoff locator を持つ。`degraded` には理由を残す。
+- delivery 前には変更全体に対する fresh `full` review を実行し、delivery HEAD と `workflow-review-final` locator を記録する。final review は degraded にしない。
+- Unit / final evidence locator は一意で、marker の Unit、kind、reviewed HEAD、直後の見出しが JSON review と一致しなければ evidence として扱わない。
+- session start、各 Unit の commit/review 後、長時間処理前、push/PR 前には同じ handoff を更新する。100k token 閾値と continuation の規約は `$session-handoff` を優先し、ここで変更しない。
+
+導入済み repository の通常の `pre-push` は、tracked `.githooks/workflow-progress.toml` の exact `issue_branch` mapping から `git rev-parse --git-path codex-handoffs` 配下の一つの handoff を選び、local validator に渡す。pre-push を選ぶのは、review evidence が remote delivery の直前の delivery HEAD と一致しなければならず、pre-commit はそれより早く最終 HEAD を決定的に gate できないためである。`feature|fix|chore/no-issue/*` は明示的な no-Issue path、その他は exact の理由付き `out_of_scope_branch` だけが non-adoption になる。`feature|fix|chore/issue-<positive-number>-*` で mapping がない場合、および未知 branch は fail closed であり、環境変数や handoff の総当たりで選ばない。validator / hook の実装・導入は対応 Unit が完了するまでこの Skill だけでは行わない。
+
+push 後の AI review marker と短い要約の Issue/PR 投稿は `remote_sync` の後続 action であり、local gate の前提ではない。未投稿なら `pending` と次の action を handoff に残す。`--no-verify` と GitHub UI merge は local hook では防げず、CI / branch protection は本 workflow の non-goal である。
+
+## Review budget と orchestration 効率
+
+通常の中リスク Issue は、意味のある変更境界での initial fresh review と、再現可能な Blocking をすべて一括修正した同一 HEAD への final fresh review の最大2回を原則とする。新しい再現可能な Blocking がない限り、fixture 追加や小修正ごとに fresh review を追加しない。同一 review で得た Blocking は一括修正して1 Unitとして再検証する。
+
+低リスク Unit は focused self-check を既定にする。fresh reviewer は DB 契約、外部設定、公開契約、認可、永続データなど意味のある境界に限定する。launcher が与えた delegate / pane 予算は上限であり、子 session は nested pane / tab を追加しない。例外は親 orchestrator が明示承認して記録した場合だけである。
+
+進捗のない `wait` / status polling を反復しない。delegate は commit、check、review結果、blocker、または安全な next action が変わった時だけ報告する。completion gate は review 回数を増やすためではなく、PR 提出可能かを判定する最終 check へ収束させる。
+
+delivery intent は同じ `workflow-progress/v1` handoff に `none|commit|pr` と `continuation=manual|auto` として記録する。`pr` の実運用は `continuation=auto` で、PR 作成前は `in_progress` が有効であり local review gate を妨げない。terminal は `pr_read_back_pass|blocked|paused` だけで、terminal に `next_action` を残さない。`pr_read_back_pass` は PR URL と同一 handoff の read-back evidence marker を必須とし、`paused` はユーザー指示だけで記録する。100k token 到達時は新 Unit を始めず atomic operation と handoff 更新だけを完結する。auto continuation の発火は `$session-handoff` の gate・Herdr read-back・権限非拡張・ユーザーの pane/tab/agent 禁止をすべて満たす場合だけである。
+
+親は delegate の報告後、記録された safe next action を実行するか、同じ fixed delegate を次 Unit へ再割当てるか、条件確認後に reclaim する。delivery intent は review / pane / tab / agent を追加する規約ではない。
 
 ### Review の分類と Judge
 

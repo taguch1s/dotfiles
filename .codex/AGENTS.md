@@ -14,16 +14,21 @@
 - 「session が多い」「減らして」のような観測は、tab、pane、workspace、agent、server を終了する許可ではない。`herdr tab close`、`herdr pane close`、`herdr agent send-keys ... ctrl+c`、`herdr server stop` は、ユーザーが対象 ID または終了対象を明示した場合だけ実行する。重複が疑われるときは ID、cwd、状態を報告して指示を待つ。
 - main orchestrator は要件整理、タスク分割、delegate への割り当て、統合判断、最終検証、ユーザー報告だけを担当する。production code や設定の編集は delegate に委譲し、結果を独立に確認してから採用する。
 - delegate は明確に割り当てられた範囲だけを扱い、変更・検証・ブロッカーを main orchestrator に返す。並列編集では別 worktree または非重複ファイルを使う。
+- `--delegates N` はその tab の strict concurrency / pane cap である。main / delegate は追加 pane、tab、agent、reviewer を作らない。容量不足は既存 delegate の逐次再利用か、親が別 top-level task を提案して扱う。
+- delegate は1つの bounded Unit 後に変更・検証・handoff/証跡・blocker・safe next action を返す。親は受理して同じ delegate を次 Unit へ再割当てるか、不要なら明示的に pane を回収する。`done` / `idle` は `reclaimable` であり、回収済みではない。
+- 全 Unit 後の tab 回収は、Issue / PR、agent stop、worktree clean、handoff 送信、downstream pane 不要を親が実測してから判断する。未merge PR、dirty worktree、未送信 handoff、実行中 Unit は回収しない。Herdr に無条件 auto-close を導入しない。
+- `input_tokens >= 100_000` では新 Unit を始めず、atomic operation と handoff 更新だけを完結する。`delivery.intent=pr` の `continuation=auto` は、external manual/human gate・未解決仕様判断・安全 blocker がなく、Herdr preflight と別 session ID の read-back が通る場合だけ continuation を許す。これは外部権限を増やさず、ユーザーが pane/tab/agent 禁止を指定した task では起動しない。
 
 ## コンテキスト上限前の handoff
 
 - これはプラットフォームの自動 compact 閾値を変更する設定ではなく、作業を安全に引き継ぐための運用上の閾値である。
 - Unit 完了の直前、長時間の test / build / 調査 / 外部操作を始める直前、および commit・push・PR 操作の直前に、Herdr status が示す最新の `input_tokens` を確認する。
-- 最新の `input_tokens >= 70_000` なら handoff を開始する。値を取得できない、欠けている、数値でない場合は閾値未満とみなし、推測で handoff・session 切替をしない。
+- 最新の `input_tokens >= 100_000` なら handoff を開始する。値を取得できない、欠けている、数値でない場合は閾値未満とみなし、推測で handoff・session 切替をしない。
 - 閾値到達後は新しい作業 Unit を開始しない。進行中の test・commit・push などの atomic operation は安全に完結させ、完結できない場合は実行状態と結果を handoff に記録する。
-- handoff は `session-handoff` skill の指定形式で Git 管理外に保存する。最終報告を返すことや現在の session を終了することは、session 切替ではない。70k handoff を「継続済み」と報告できるのは、handoff の再開 prompt を渡した別の Codex session が実際に起動し、その新しい session ID を確認した後だけである。
-- ユーザーが当該 task で 70k 到達時の fresh continuation（新規 top-level tab）を明示的に許可している場合は、handoff 保存後、既存の Herdr preflight を再実行してから `herdr-codex-orchestrate --new-top-level --cwd "$PWD" "<handoff の Next-session prompt>"` で continuation を起動する。返却された tab ID / main agent 名を記録し、`herdr tab get <tab-id>` と Herdr status の main agent `agent_session.value` を再取得して、起動元とは異なる非空の session ID を照合する。確認できるまで旧 session を終了せず、continuation を報告しない。
-- fresh continuation の明示許可がない場合、この規約は tab / pane の新規作成・終了や session 切替を自動許可しない。handoff と再開 prompt を保存・提示して現在の session を終了し、次の起動はユーザーの指示を待つ。Herdr の UI 操作には上記の既存規約を引き続き適用する。
+- handoff は `session-handoff` skill の指定形式で Git 管理外に保存する。最終報告を返すことや現在の session を終了することは、session 切替ではない。
+- `delivery.intent=pr` かつ `continuation=auto` の場合だけ、external manual/human gate、未解決の仕様判断、安全 blocker がないことを確認して fresh continuation を許す。これは外部権限を増やさず、ユーザーが pane/tab/agent の作成を禁止した task では起動しない。
+- auto continuation は handoff 保存後に既存の Herdr preflight を再実行し、必要な継承環境は維持したまま `HERDR_CODEX_ORCHESTRATED` だけを neutralize して、`env -u HERDR_CODEX_ORCHESTRATED herdr-codex-orchestrate --new-top-level --cwd "$PWD" "<handoff の Next-session prompt>"` を起動する。返却された tab ID / main agent 名を記録し、`herdr tab get <tab-id>` と Herdr status の main agent `agent_session.value` を再取得して、起動元とは異なる非空の session ID を照合する。確認できるまで旧 session を終了・回収せず、continuation を報告しない。
+- auto continuation の条件を満たさない場合は、handoff と再開 prompt を保存・提示して現在の session を終了し、次の起動はユーザーの指示を待つ。Herdr の UI 操作には上記の既存規約を引き続き適用する。
 
 ## 再発防止メモリ
 
