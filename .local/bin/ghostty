@@ -1,0 +1,10 @@
+#!/bin/sh
+# Start the non-Snap Ghostty package with the Fcitx5 GTK input-method module on WSLg.
+export GTK_IM_MODULE=fcitx
+export QT_IM_MODULE=fcitx
+export XMODIFIERS=@im=fcitx
+export SDL_IM_MODULE=fcitx
+
+# Do not let the Snap executable later in PATH supply resources to /usr/bin/ghostty.
+export GHOSTTY_RESOURCES_DIR=/usr/share/ghostty
+exec /usr/bin/ghostty "$@"

@@ -5,6 +5,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 "$root/.bin/doctor-agent-terminal.sh" --worktree-safe
 bash "$root/tests/test_herdr_codex_orchestrate.sh"
+PYTHONDONTWRITEBYTECODE=1 python3 "$root/.bin/test-herdr-codex-status.py"
 git -C "$root" diff --check
 
 # 既知の認証情報形式を管理対象ファイルから検出する。検出時はコミットを止める。

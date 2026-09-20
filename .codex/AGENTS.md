@@ -18,6 +18,9 @@
 - delegate は1つの bounded Unit 後に変更・検証・handoff/証跡・blocker・safe next action を返す。親は受理して同じ delegate を次 Unit へ再割当てるか、不要なら明示的に pane を回収する。`done` / `idle` は `reclaimable` であり、回収済みではない。
 - 全 Unit 後の tab 回収は、Issue / PR、agent stop、worktree clean、handoff 送信、downstream pane 不要を親が実測してから判断する。未merge PR、dirty worktree、未送信 handoff、実行中 Unit は回収しない。Herdr に無条件 auto-close を導入しない。
 - `input_tokens >= 100_000` では新 Unit を始めず、atomic operation と handoff 更新だけを完結する。`delivery.intent=pr` の `continuation=auto` は、external manual/human gate・未解決仕様判断・安全 blocker がなく、Herdr preflight と別 session ID の read-back が通る場合だけ continuation を許す。これは外部権限を増やさず、ユーザーが pane/tab/agent 禁止を指定した task では起動しない。
+- 子 session が `blocked`、`done`、または依存待ちになっても成果が未達なら、親 orchestrator は停止報告だけで終えない。agent / process / Git / Issue / PR を実測して原因を分類し、ユーザー所有の変更を保全したまま解消できる worktree・依存・認証・手順の回復策を選び、新しい子 session または同じ session の再開を指示する。削除、stash、tab / pane / agent の終了は従来どおり明示許可がある場合だけ行う。
+- merge 済み Issue を後続 Unit の実証で回収する場合は、reopen と同じ操作で親 Issue と対象子 Issue の双方に状態遷移を記録する。既存 PR / merge の有効性、再開理由、追加 Unit の所有境界、下流を待機させる理由、再開・完了条件を明記し、単なる `blocked` や未説明の open 状態に見せない。親が方針を決定できる根拠がある場合は即決して子へ返し、人の判断が必要な場合だけ選択肢・推奨・影響を上げる。
+- 子 Issue の PR merge・worktree clean・担当 agent の terminal / idle をすべて実測でき、親または下流 Unit がその pane をもう必要としない場合、親 orchestrator は完了 Unit の tab を回収する。Issue が close 済みなら通常完了として回収する。Issue が external manual / human gate だけを残して open の場合も、BLOCKED 理由、再開条件、最新 PR、必要な証跡が Issue コメントに記録済みなら、現 session を回収し、次の実行は fresh session とする。回収前に対象 tab ID、Issue / PR、worktree、agent 状態を照合し、実行中の Unit・dirty worktree・未送信 handoff を閉じない。現在の task で `完了済み session を片付ける` と明示された場合は、この条件を満たす全ての子 tab を対象にする。
 
 ## コンテキスト上限前の handoff
 
