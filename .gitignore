@@ -55,6 +55,7 @@
 !/.config/**
 !/.local/
 !/.local/bin/
+!/.local/bin/ghostty
 !/.local/bin/herdr-codex-status
 !/.local/bin/herdr-codex-orchestrate
 !/.local/bin/codex-worktree

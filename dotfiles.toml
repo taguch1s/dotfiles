@@ -14,6 +14,13 @@ target = ".config/ghostty/config.ghostty"
 mode = "link"
 
 [[config]]
+name = "Ghostty launcher"
+source = ".local/bin/ghostty"
+target = ".local/bin/ghostty"
+mode = "link"
+executable = true
+
+[[config]]
 name = "Herdr Codex status"
 source = ".local/bin/herdr-codex-status"
 target = ".local/bin/herdr-codex-status"
