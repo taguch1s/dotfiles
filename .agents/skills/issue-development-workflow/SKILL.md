@@ -52,7 +52,7 @@ Issue 起点の Full / Compact workflow は `$session-handoff` が定める同�
 - Unit / final evidence locator は一意で、marker の Unit、kind、reviewed HEAD、直後の見出しが JSON review と一致しなければ evidence として扱わない。
 - session start、各 Unit の commit/review 後、長時間処理前、push/PR 前には同じ handoff を更新する。70k token 閾値と continuation の規約は `$session-handoff` を優先し、ここで変更しない。
 
-導入済み repository の通常の `pre-push` は、tracked `.githooks/workflow-progress.toml` の exact `issue_branch` mapping から `git rev-parse --git-path codex-handoffs` 配下の一つの handoff を選び、local validator に渡す。`feature|fix|chore/no-issue/*` は明示的な no-Issue path、その他は exact の理由付き `out_of_scope_branch` だけが non-adoption になる。`feature|fix|chore/issue-<positive-number>-*` で mapping がない場合、および未知 branch は fail closed であり、環境変数や handoff の総当たりで選ばない。validator / hook の実装・導入は対応 Unit が完了するまでこの Skill だけでは行わない。
+導入済み repository の通常の `pre-push` は、tracked `.githooks/workflow-progress.toml` の exact `issue_branch` mapping から `git rev-parse --git-path codex-handoffs` 配下の一つの handoff を選び、local validator に渡す。pre-push を選ぶのは、review evidence が remote delivery の直前の delivery HEAD と一致しなければならず、pre-commit はそれより早く最終 HEAD を決定的に gate できないためである。`feature|fix|chore/no-issue/*` は明示的な no-Issue path、その他は exact の理由付き `out_of_scope_branch` だけが non-adoption になる。`feature|fix|chore/issue-<positive-number>-*` で mapping がない場合、および未知 branch は fail closed であり、環境変数や handoff の総当たりで選ばない。validator / hook の実装・導入は対応 Unit が完了するまでこの Skill だけでは行わない。
 
 push 後の AI review marker と短い要約の Issue/PR 投稿は `remote_sync` の後続 action であり、local gate の前提ではない。未投稿なら `pending` と次の action を handoff に残す。`--no-verify` と GitHub UI merge は local hook では防げず、CI / branch protection は本 workflow の non-goal である。
 
