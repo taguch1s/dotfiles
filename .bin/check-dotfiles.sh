@@ -3,7 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-"$root/.bin/doctor-agent-terminal.sh"
+"$root/.bin/doctor-agent-terminal.sh" --worktree-safe
 bash "$root/tests/test_herdr_codex_orchestrate.sh"
 git -C "$root" diff --check
 

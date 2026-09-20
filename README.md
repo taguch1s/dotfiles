@@ -74,6 +74,8 @@ make diff       # コピー管理の Codex 設定とローカル設定の差分�
 make check      # PR・コミット前の検査（bootstrap 後は commit 時にも自動実行）
 ```
 
+`make doctor` は、実際にホームディレクトリへリンクを配置した checkout でリンク先まで検証します。`make check` は linked worktree でも commit 前検査を行えるよう、ホームリンクを所有する checkout では同じ完全検証、それ以外では管理対象 source・構文・test・差分・秘密情報を検証する worktree-safe static mode を自動選択します。リンクの張替えは行いません。
+
 Ghostty が Ubuntu の標準リポジトリから導入できるのは十分に新しいバージョンだけです。
 Ubuntu 24.04 では、bootstrap はコミュニティパッケージを暗黙には導入せず、対応方法だけを
 表示します。そのパッケージを利用する場合は、明示的に次を指定してください。
