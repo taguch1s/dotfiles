@@ -4,11 +4,12 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: herdr-codex-orchestrate [--delegates COUNT] [--cwd PATH] TASK
+Usage: herdr-codex-orchestrate --new-top-level [--delegates COUNT] [--cwd PATH] TASK
 
 Create and focus a new Herdr tab. The main Codex session occupies the left
 half; delegate sessions occupy the right half. COUNT delegates are stacked
-vertically in the right column (default: 1).
+vertically in the right column (default: 1). --new-top-level is required so
+an existing session cannot create a tab by accident.
 EOF
 }
 
@@ -33,9 +34,14 @@ print(value)
 
 delegates=1
 cwd="$PWD"
+new_top_level=false
 
 while (($#)); do
   case "$1" in
+    --new-top-level)
+      new_top_level=true
+      shift
+      ;;
     --delegates)
       (($# >= 2)) || die '--delegates requires a positive integer'
       delegates="$2"
@@ -70,13 +76,15 @@ done
 task="$1"
 
 [[ "${HERDR_ENV:-}" == 1 ]] || die 'run this command inside a Herdr-managed pane'
+[[ "$new_top_level" == true ]] || die 'pass --new-top-level only when the user explicitly requests a new top-level tab'
+[[ "${HERDR_CODEX_ORCHESTRATED:-}" != 1 ]] || die 'nested orchestration is forbidden; use the existing main session and its delegates'
 command -v herdr >/dev/null 2>&1 || die 'herdr is not on PATH'
 command -v codex >/dev/null 2>&1 || die 'codex is not on PATH'
 [[ -n "${HERDR_WORKSPACE_ID:-}" ]] || die 'Herdr workspace context is unavailable'
 [[ -d "$cwd" ]] || die "cwd is not a directory: $cwd"
 [[ "$delegates" =~ ^[1-9][0-9]*$ ]] || die '--delegates must be a positive integer'
 
-tab_response="$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$cwd" --label "$task" --focus)"
+tab_response="$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$cwd" --env HERDR_CODEX_ORCHESTRATED=1 --label "$task" --focus)"
 tab_id="$(json_field "$tab_response" result.tab.tab_id)"
 main_pane="$(json_field "$tab_response" result.root_pane.pane_id)"
 
@@ -88,7 +96,7 @@ for ((index = 1; index <= delegates; index++)); do
   else
     direction=down
   fi
-  split_response="$(herdr pane split "$split_from" --direction "$direction" --cwd "$cwd" --no-focus)"
+  split_response="$(herdr pane split "$split_from" --direction "$direction" --cwd "$cwd" --env HERDR_CODEX_ORCHESTRATED=1 --no-focus)"
   split_from="$(json_field "$split_response" result.pane.pane_id)"
   delegate_panes+=("$split_from")
 done
