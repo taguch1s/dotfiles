@@ -2,6 +2,6 @@
 gtk-titlebar = true
 window-decoration = auto
 
-# マウスホイールを使わず、過去の出力をページ単位で確認する。
-keybind = ctrl+shift+arrow_up=scroll_page_up
-keybind = ctrl+shift+arrow_down=scroll_page_down
+# マウスホイールを使わず、Ctrl+Alt+K/J で過去の出力をページ単位で確認する。
+keybind = ctrl+alt+key_k=scroll_page_up
+keybind = ctrl+alt+key_j=scroll_page_down
