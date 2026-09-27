@@ -7,3 +7,6 @@ sandbox_mode = "danger-full-access"
 [features]
 hooks = true
 memories = true
+
+[tui]
+alternate_screen = "never"
