@@ -42,11 +42,31 @@ mode = "link"
 executable = true
 
 [[config]]
+name = "Claude worktree launcher"
+source = ".local/bin/claude-worktree"
+target = ".local/bin/claude-worktree"
+mode = "link"
+executable = true
+
+[[config]]
 name = "Codex"
 source = ".codex/config.toml"
 target = ".codex/config.toml"
 mode = "merge-toml-features"
 features = ["hooks", "memories"]
+
+[[config]]
+name = "Agent browser guard launcher"
+source = ".local/bin/agent-browser-guard"
+target = ".local/bin/agent-browser-guard"
+mode = "link"
+executable = true
+
+[[config]]
+name = "Agent browser guard Windows bridge"
+source = ".local/libexec/agent-browser-guard.ps1"
+target = ".local/libexec/agent-browser-guard.ps1"
+mode = "link"
 
 [[config]]
 name = "Codex global instructions"
@@ -157,3 +177,96 @@ source = "windows/.wslconfig"
 target = "%UserProfile%\\.wslconfig"
 mode = "manual"
 reason = "Windows 側へ書き込む"
+
+[[config]]
+name = "Claude global instructions"
+source = ".claude/CLAUDE.md"
+target = ".claude/CLAUDE.md"
+mode = "link"
+
+[[config]]
+name = "Claude user settings defaults"
+source = ".claude/settings.json"
+target = ".claude/settings.json"
+mode = "copy-if-missing"
+
+# Claude Code は ~/.claude/skills を読むため、同じ source を両方へリンクする。
+# codex-conversation-audit は ~/.codex のログに依存するので Claude へは配置しない。
+
+[[config]]
+name = "Shared Codex workflow skill (Claude)"
+source = ".agents/skills/shared-codex-workflow"
+target = ".claude/skills/shared-codex-workflow"
+mode = "link"
+
+[[config]]
+name = "Issue起点開発ワークフロー Skill (Claude)"
+source = ".agents/skills/issue-development-workflow"
+target = ".claude/skills/issue-development-workflow"
+mode = "link"
+
+[[config]]
+name = "Adversarial review skill (Claude)"
+source = ".agents/skills/adversarial-review"
+target = ".claude/skills/adversarial-review"
+mode = "link"
+
+[[config]]
+name = "Git commit skill (Claude)"
+source = ".agents/skills/git-commit"
+target = ".claude/skills/git-commit"
+mode = "link"
+
+[[config]]
+name = "Implementation cycle skill (Claude)"
+source = ".agents/skills/implementation-cycle"
+target = ".claude/skills/implementation-cycle"
+mode = "link"
+
+[[config]]
+name = "Issue design cycle skill (Claude)"
+source = ".agents/skills/issue-design-cycle"
+target = ".claude/skills/issue-design-cycle"
+mode = "link"
+
+[[config]]
+name = "Issue design loop skill (Claude)"
+source = ".agents/skills/issue-design-loop"
+target = ".claude/skills/issue-design-loop"
+mode = "link"
+
+[[config]]
+name = "Implementation design skill (Claude)"
+source = ".agents/skills/issue-implementation-design"
+target = ".claude/skills/issue-implementation-design"
+mode = "link"
+
+[[config]]
+name = "Layer implementation skill (Claude)"
+source = ".agents/skills/issue-layer-implement"
+target = ".claude/skills/issue-layer-implement"
+mode = "link"
+
+[[config]]
+name = "TDD implementation skill (Claude)"
+source = ".agents/skills/issue-tdd-implement"
+target = ".claude/skills/issue-tdd-implement"
+mode = "link"
+
+[[config]]
+name = "PR description skill (Claude)"
+source = ".agents/skills/pr-description"
+target = ".claude/skills/pr-description"
+mode = "link"
+
+[[config]]
+name = "Session handoff skill (Claude)"
+source = ".agents/skills/session-handoff"
+target = ".claude/skills/session-handoff"
+mode = "link"
+
+[[config]]
+name = "Web design guidelines skill (Claude)"
+source = ".agents/skills/web-design-guidelines"
+target = ".claude/skills/web-design-guidelines"
+mode = "link"
