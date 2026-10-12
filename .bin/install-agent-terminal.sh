@@ -23,6 +23,10 @@ if ! command -v codex >/dev/null 2>&1; then
   npm install --global @openai/codex
 fi
 
+if ! command -v claude >/dev/null 2>&1; then
+  curl -fsSL https://claude.ai/install.sh | bash
+fi
+
 if ! command -v herdr >/dev/null 2>&1; then
   curl -fsSL https://herdr.dev/install.sh | sh
 fi
