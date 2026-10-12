@@ -98,6 +98,17 @@ GHOSTTY_INSTALL=community-deb make bootstrap
 明示的に分離します。新しい設定は、秘密情報を除外したうえで `dotfiles.toml` に追加してから `make link` と
 `make check` を実行してください。
 
+### Datablog のローカル Docker
+
+Datablog を使うときだけ `datablog-stack start`、終了後に `datablog-stack stop` を実行します。
+`datablog-stack status` は対象コンテナの状態を表示します。`stop` は project ID が
+`datablog-master` の Supabase を CLI で停止し、`datablog-qdrant-integration` という名前の
+コンテナがあれば削除します。Docker volume は保持します。Qdrant は統合テストが必要時に起動します。
+
+既定の Datablog checkout は `~/datablog/worktrees/deploy-master` です。別の配置なら
+`DATABLOG_SRC=/path/to/datablog/src datablog-stack start` のように指定します。
+その `src/node_modules/.bin/supabase` を使用するため、Datablog 側の依存関係が事前に導入されている必要があります。
+
 ### Codex の Herdr オーケストレーション
 
 新しい作業は Herdr 内で次のように始めます。新規タブの左半分にオーケストレーター、右半分に

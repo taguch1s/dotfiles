@@ -42,6 +42,13 @@ mode = "link"
 executable = true
 
 [[config]]
+name = "Datablog local Docker stack"
+source = ".local/bin/datablog-stack"
+target = ".local/bin/datablog-stack"
+mode = "link"
+executable = true
+
+[[config]]
 name = "Codex"
 source = ".codex/config.toml"
 target = ".codex/config.toml"
