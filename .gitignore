@@ -59,6 +59,7 @@
 !/.local/bin/herdr-codex-status
 !/.local/bin/herdr-codex-orchestrate
 !/.local/bin/codex-worktree
+!/.local/bin/claude-worktree
 !/.local/bin/agent-browser-guard
 !/.local/libexec/
 !/.local/libexec/agent-browser-guard.ps1

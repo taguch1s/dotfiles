@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 起動する agent は呼び出された名前で決まる。claude-worktree はこの file への symlink である。
+command_name="$(basename "$0")"
+agent="${command_name%-worktree}"
+[[ "$agent" == codex || "$agent" == claude ]] || { echo "Unsupported launcher name: $command_name" >&2; exit 2; }
 start=false
 [[ "${1:-}" == "--start" ]] && { start=true; shift; }
-[[ $# -ge 1 && $# -le 2 ]] || { echo "Usage: codex-worktree [--start] <branch> [base-ref]" >&2; exit 2; }
+[[ $# -ge 1 && $# -le 2 ]] || { echo "Usage: $command_name [--start] <branch> [base-ref]" >&2; exit 2; }
 branch="$1"
 common_git_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
 root="$(dirname "$common_git_dir")"
@@ -38,7 +42,9 @@ flock -u 8
 [[ -z "${SETUP_SCRIPT:-}" ]] || (cd "$worktree" && "$worktree/$SETUP_SCRIPT")
 if [[ "$start" == true ]]; then
   exec 9>"$worktrees_root/.codex-locks/$slug.session.lock"
-  flock -n 9 || { echo "A Codex session is already using this worktree" >&2; exit 1; }
-  exec codex -C "$worktree"
+  flock -n 9 || { echo "An agent session is already using this worktree" >&2; exit 1; }
+  [[ "$agent" == codex ]] && exec codex -C "$worktree"
+  cd "$worktree"
+  exec claude
 fi
 echo "Ready worktree: $worktree"

@@ -59,4 +59,19 @@ git -C "$primary" restore README.md
 (cd "$primary" && "$launcher" chore/no-issue/second)
 [[ "$(git -C "$fixture/worktrees/chore-no-issue-second" branch --show-current)" == chore/no-issue/second ]]
 
+stubs="$fixture/stubs"
+mkdir -p "$stubs"
+for agent in codex claude; do
+  printf '%s\n' '#!/usr/bin/env bash' "printf '%s|%s|%s\n' $agent \"\$(pwd -P)\" \"\$*\" >\"\$AGENT_RECORD\"" >"$stubs/$agent"
+  chmod +x "$stubs/$agent"
+done
+export AGENT_RECORD="$fixture/agent-record"
+second="$(cd "$fixture/worktrees/chore-no-issue-second" && pwd -P)"
+(cd "$primary" && PATH="$stubs:$PATH" "$launcher" --start chore/no-issue/second)
+[[ "$(<"$AGENT_RECORD")" == "codex|$(cd "$primary" && pwd -P)|-C $second" ]]
+(cd "$primary" && PATH="$stubs:$PATH" "$repository_root/.local/bin/claude-worktree" --start chore/no-issue/second)
+[[ "$(<"$AGENT_RECORD")" == "claude|$second|" ]]
+ln -s "$launcher" "$fixture/other-worktree"
+expect_failure bash -c 'cd "$1" && "$2" chore/no-issue/third' -- "$primary" "$fixture/other-worktree"
+
 echo 'codex-worktree launcher tests passed'

@@ -42,6 +42,13 @@ mode = "link"
 executable = true
 
 [[config]]
+name = "Claude worktree launcher"
+source = ".local/bin/claude-worktree"
+target = ".local/bin/claude-worktree"
+mode = "link"
+executable = true
+
+[[config]]
 name = "Codex"
 source = ".codex/config.toml"
 target = ".codex/config.toml"
