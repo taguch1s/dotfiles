@@ -49,6 +49,19 @@ mode = "merge-toml-features"
 features = ["hooks", "memories"]
 
 [[config]]
+name = "Agent browser guard launcher"
+source = ".local/bin/agent-browser-guard"
+target = ".local/bin/agent-browser-guard"
+mode = "link"
+executable = true
+
+[[config]]
+name = "Agent browser guard Windows bridge"
+source = ".local/libexec/agent-browser-guard.ps1"
+target = ".local/libexec/agent-browser-guard.ps1"
+mode = "link"
+
+[[config]]
 name = "Codex global instructions"
 source = ".codex/AGENTS.md"
 target = ".codex/AGENTS.md"

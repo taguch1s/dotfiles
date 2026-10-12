@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+launcher="$(readlink -f "${BASH_SOURCE[0]}")"
+script="$(readlink -f "$(dirname "$launcher")/../libexec/agent-browser-guard.ps1")"
+exec powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(wslpath -w "$script")" "$@"
