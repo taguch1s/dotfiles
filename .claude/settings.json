@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Read(~/.codex/sessions)",
+      "Read(~/.codex/sessions/**)",
+      "Read(~/.codex/memories)",
+      "Read(~/.codex/memories/**)",
+      "Read(~/.codex/history.jsonl)"
+    ],
+    "blockReadsOutsideWorkingDirectories": true
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyRead": [
+        "~/.codex/sessions",
+        "~/.codex/memories",
+        "~/.codex/history.jsonl"
+      ]
+    }
+  }
+}

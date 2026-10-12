@@ -170,3 +170,15 @@ source = "windows/.wslconfig"
 target = "%UserProfile%\\.wslconfig"
 mode = "manual"
 reason = "Windows 側へ書き込む"
+
+[[config]]
+name = "Claude global instructions"
+source = ".claude/CLAUDE.md"
+target = ".claude/CLAUDE.md"
+mode = "link"
+
+[[config]]
+name = "Claude user settings defaults"
+source = ".claude/settings.json"
+target = ".claude/settings.json"
+mode = "copy-if-missing"
