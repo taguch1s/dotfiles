@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo 'Usage: datablog-stack {start|stop|status}' >&2
+  exit 2
+}
+
+[[ $# -eq 1 ]] || usage
+case "$1" in start|stop|status) action="$1" ;; *) usage ;; esac
+
+docker info --format '{{.ServerVersion}}' >/dev/null
+
+project_id=datablog-master
+qdrant_name=datablog-qdrant-integration
+src="${DATABLOG_SRC:-$HOME/datablog/worktrees/deploy-master/src}"
+root="$(dirname "$src")"
+cli="$src/node_modules/.bin/supabase"
+
+check_project() {
+  [[ -f "$src/package.json" && -f "$root/supabase/config.toml" && -x "$cli" ]] || {
+    echo "Datablog project or installed Supabase CLI is missing: $src" >&2
+    exit 1
+  }
+  local actual
+  actual="$(python3 - "$root/supabase/config.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as config:
+    print(tomllib.load(config).get("project_id", ""))
+PY
+)"
+  [[ "$actual" == "$project_id" ]] || {
+    echo "Unexpected Supabase project_id: $actual" >&2
+    exit 1
+  }
+}
+
+supabase_ids() {
+  docker container ls --all --quiet --filter "label=com.supabase.cli.project=$project_id"
+}
+
+qdrant_ids() {
+  docker container ls --all --quiet --filter "name=^/$qdrant_name$"
+}
+
+case "$action" in
+  start)
+    check_project
+    "$cli" --workdir "$root" start
+    ;;
+  stop)
+    check_project
+    sup_ids="$(supabase_ids)"
+    q_ids="$(qdrant_ids)"
+    if [[ -n "$sup_ids" ]]; then
+      "$cli" --workdir "$root" stop --project-id "$project_id"
+      remaining="$(supabase_ids)"
+      [[ -z "$remaining" ]] || {
+        echo 'Supabase containers remain after stop.' >&2
+        exit 1
+      }
+    fi
+    if [[ -n "$q_ids" ]]; then
+      mapfile -t ids <<< "$q_ids"
+      docker container rm --force "${ids[@]}" >/dev/null
+    fi
+    echo "Datablog containers stopped; Docker volumes retained."
+    ;;
+  status)
+    sup_ids="$(supabase_ids)"
+    q_ids="$(qdrant_ids)"
+    echo 'Supabase containers:'
+    if [[ -n "$sup_ids" ]]; then
+      docker container ls --all --format '{{.Names}}\t{{.Status}}' --filter "label=com.supabase.cli.project=$project_id"
+    else
+      echo 'none'
+    fi
+    echo 'Integration Qdrant:'
+    if [[ -n "$q_ids" ]]; then
+      docker container ls --all --format '{{.Names}}\t{{.Status}}' --filter "name=^/$qdrant_name$"
+    else
+      echo 'none'
+    fi
+    ;;
+esac
