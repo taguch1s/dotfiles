@@ -14,7 +14,7 @@ link: ## 移植可能な設定を現在のホームディレクトリへリン�
 codex-config: ## ローカル設定がない場合のみ、移植可能な Codex 既定値を導入する。
 	./.bin/install-codex-config.sh
 
-integration: ## Herdr が生成する Codex 連携ファイルを導入する。
+integration: ## Herdr が生成する Codex・Claude 連携ファイルを導入する。
 	./.bin/install-codex-herdr-integration.sh
 
 wsl: ## WSL 側と Windows 側の WSL 設定を導入する。
