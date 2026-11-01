@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: bootstrap link codex-config integration wsl doctor diff check hooks help
+.PHONY: bootstrap link codex-config integration wsl wsl-slim dev-mode doctor diff check hooks help
 
 bootstrap: ## 端末・エージェント用ツールを導入し、移植可能な設定をリンクする。
 	./.bin/install-agent-terminal.sh
@@ -19,6 +19,12 @@ integration: ## Herdr が生成する Codex・Claude 連携ファイルを導入
 
 wsl: ## WSL 側と Windows 側の WSL 設定を導入する。
 	./.bin/install-wsl-config.sh
+
+wsl-slim: ## WSL で常駐不要なサービスを止め、Docker を必要時起動にする。
+	./.bin/slim-wsl-services.sh
+
+dev-mode: ## Windows 側に開発モード切り替えスクリプトとショートカットを導入する。
+	./.bin/install-windows-dev-mode.sh
 
 doctor: ## コマンド、リンク、ステータスラインスクリプトを検証する。
 	./.bin/doctor-agent-terminal.sh

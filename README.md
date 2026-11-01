@@ -69,6 +69,8 @@ Herdr、Ghostty、独自スクリプトはシンボリックリンクで配置�
 # make 導入後は以下だけで実行できます。
 make bootstrap  # 未導入の gh/Herdr/Codex を導入し、設定リンクと Herdr↔Codex 連携を行う
 make wsl        # /etc/wsl.conf と Windows 側 ~/.wslconfig を書き込むため、意図的に分離
+make wsl-slim   # Docker を必要時起動にし、Ubuntu Pro・snapd など常駐不要なサービスを止める（sudo）
+make dev-mode   # スタートメニューに「Dev Mode」「Normal Mode」を作る
 make doctor     # コマンド、リンク、ステータススクリプトを検証
 make diff       # コピー管理の Codex 設定とローカル設定の差分を表示
 make check      # PR・コミット前の検査（bootstrap 後は commit 時にも自動実行）

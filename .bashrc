@@ -47,7 +47,8 @@ export PATH="$PATH:/opt/nvim-linux64/bin"
 export PYENV_ROOT="$HOME/.pyenv"
 export PATH="$PYENV_ROOT/bin:$PATH"
 export PATH="/home/issei/.local/bin:$PATH"
-eval "$(pyenv init --path)"
+# pyenv 未導入の環境でもシェル起動時にエラーを出さない。
+command -v pyenv >/dev/null 2>&1 && eval "$(pyenv init --path)"
 export PATH="/home/issei/.local/bin:/home/issei/.pyenv/shims:/home/issei/.pyenv/bin:$PATH"
 export PHP_INI_SCAN_DIR="/home/issei/.config/herd-lite/bin:$PHP_INI_SCAN_DIR"
 
