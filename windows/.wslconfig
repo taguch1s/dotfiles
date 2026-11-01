@@ -4,5 +4,6 @@ memory=10GB
 swap=4GB
 
 [experimental]
-# 未使用のファイルキャッシュを段階的に Windows へ返却する。
-autoMemoryReclaim=gradual
+# アイドル時に Linux のファイルキャッシュを破棄し、Windows へメモリを返却する。
+# gradual は返却が遅く、開発直後にキャッシュを抱えたままになるため dropCache を使う。
+autoMemoryReclaim=dropCache
