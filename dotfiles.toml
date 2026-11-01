@@ -45,3 +45,10 @@ source = "windows/.wslconfig"
 target = "%UserProfile%\\.wslconfig"
 mode = "manual"
 reason = "Windows 側へ書き込む"
+
+[[config]]
+name = "開発モード切り替え (Windows)"
+source = "windows/dev-mode.ps1"
+target = "%LocalAppData%\\dotfiles\\dev-mode.ps1"
+mode = "manual"
+reason = "Windows 側へ書き込む。make dev-mode で導入"
