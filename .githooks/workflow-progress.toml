@@ -1,3 +1,7 @@
 [[issue_branch]]
 branch = "feature/issue-9-workflow-progress-review-gate"
 handoff = "issue-9-workflow-progress-review-gate.md"
+
+[[out_of_scope_branch]]
+branch = "main"
+reason = "個人利用のため main へ直接 push する"
