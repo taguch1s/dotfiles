@@ -1,0 +1,10 @@
+[Unit]
+Description=Prevent Windows idle sleep while Claude is busy or tmux is attached via SSH
+
+[Service]
+ExecStart=%h/.local/bin/awake-keeper
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

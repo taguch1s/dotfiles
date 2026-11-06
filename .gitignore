@@ -61,6 +61,8 @@
 !/.local/bin/codex-worktree
 !/.local/bin/claude-worktree
 !/.local/bin/agent-browser-guard
+!/.local/bin/awake-hook
+!/.local/bin/awake-keeper
 !/.local/libexec/
 !/.local/libexec/agent-browser-guard.ps1
 !/.codex/

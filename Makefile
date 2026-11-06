@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: bootstrap link codex-config integration wsl wsl-slim dev-mode doctor diff check hooks help
+.PHONY: bootstrap link codex-config integration wsl wsl-slim dev-mode remote-access doctor diff check hooks help
 
 bootstrap: ## 端末・エージェント用ツールを導入し、移植可能な設定をリンクする。
 	./.bin/install-agent-terminal.sh
@@ -25,6 +25,9 @@ wsl-slim: ## WSL で常駐不要なサービスを止め、Docker を必要時�
 
 dev-mode: ## Windows 側に開発モード切り替えスクリプトとショートカットを導入する。
 	./.bin/install-windows-dev-mode.sh
+
+remote-access: ## スマホから遠隔操作中のスリープ抑止サービスを有効化する。
+	./.bin/install-remote-access.sh
 
 doctor: ## コマンド、リンク、ステータスラインスクリプトを検証する。
 	./.bin/doctor-agent-terminal.sh

@@ -277,3 +277,31 @@ source = "windows/dev-mode.ps1"
 target = "%LocalAppData%\\dotfiles\\dev-mode.ps1"
 mode = "manual"
 reason = "Windows 側へ書き込む。make dev-mode で導入"
+
+# スマホ → Tailscale SSH → tmux で遠隔操作する構成。全体像は docs/remote-access.md
+
+[[config]]
+name = "tmux"
+source = ".tmux.conf"
+target = ".tmux.conf"
+mode = "link"
+
+[[config]]
+name = "Claude 作業中マーカー hook"
+source = ".local/bin/awake-hook"
+target = ".local/bin/awake-hook"
+mode = "link"
+executable = true
+
+[[config]]
+name = "スリープ抑止ループ"
+source = ".local/bin/awake-keeper"
+target = ".local/bin/awake-keeper"
+mode = "link"
+executable = true
+
+[[config]]
+name = "スリープ抑止 systemd user service"
+source = ".config/systemd/user/awake-keeper.service"
+target = ".config/systemd/user/awake-keeper.service"
+mode = "link"

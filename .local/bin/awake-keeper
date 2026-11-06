@@ -1,0 +1,40 @@
+#!/bin/bash
+# Windows のアイドルスリープを条件付きで抑止する常駐ループ (systemd user service)
+# 条件: Claude が作業中 (~/.cache/awake/busy-* が BUSY_TTL 分以内に更新) または SSH 経由の tmux クライアントが attach 中
+# 条件を満たす間、毎分 SetThreadExecutionState(ES_SYSTEM_REQUIRED) を一回呼んでアイドルタイマーをリセットする
+DIR=$HOME/.cache/awake
+BUSY_TTL=${BUSY_TTL:-60}
+PS=${AWAKE_PS:-/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe}
+# WSL interop は引数内の " を落とすため、スクリプトは UTF-16LE base64 で渡す
+ENC=$(printf '%s' '(Add-Type -Name P -Namespace W -PassThru -MemberDefinition "[DllImport(""kernel32.dll"")] public static extern uint SetThreadExecutionState(uint f);")::SetThreadExecutionState(1) | Out-Null' | iconv -t UTF-16LE | base64 -w0)
+
+claude_busy() {
+  [ -n "$(find "$DIR" -maxdepth 1 -name 'busy-*' -mmin -"$BUSY_TTL" 2>/dev/null)" ]
+}
+
+# クライアントの環境変数に SSH_CONNECTION があるか、祖先に sshd/tailscaled がいれば SSH 経由
+ssh_attached() {
+  local pid p
+  for pid in $(tmux list-clients -F '#{client_pid}' 2>/dev/null); do
+    tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep -q '^SSH_CONNECTION=' && return 0
+    p=$pid
+    while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+      case $(command cat /proc/$p/comm 2>/dev/null) in sshd*|tailscaled) return 0 ;; esac
+      p=$(awk '/^PPid:/{print $2}' /proc/$p/status 2>/dev/null)
+    done
+  done
+  return 1
+}
+
+prev=-
+while true; do
+  reason=
+  claude_busy && reason=claude
+  ssh_attached && reason="${reason:+$reason+}ssh-tmux"
+  if [ -n "$reason" ]; then
+    timeout 30 "$PS" -NoProfile -NonInteractive -EncodedCommand "$ENC" </dev/null >/dev/null 2>&1 \
+      || echo "SetThreadExecutionState call failed (exit $?)"
+  fi
+  [ "$reason" != "$prev" ] && echo "state: ${reason:-idle}" && prev=$reason
+  sleep 60
+done

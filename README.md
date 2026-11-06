@@ -71,6 +71,7 @@ make bootstrap  # 未導入の gh/Herdr/Codex を導入し、設定リンクと 
 make wsl        # /etc/wsl.conf と Windows 側 ~/.wslconfig を書き込むため、意図的に分離
 make wsl-slim   # Docker を必要時起動にし、Ubuntu Pro・snapd など常駐不要なサービスを止める（sudo）
 make dev-mode   # スタートメニューに「Dev Mode」「Normal Mode」を作る
+make remote-access # スマホから遠隔操作中のスリープ抑止サービスを有効化する（docs/remote-access.md）
 make doctor     # コマンド、リンク、ステータススクリプトを検証
 make diff       # コピー管理の Codex 設定とローカル設定の差分を表示
 make check      # PR・コミット前の検査（bootstrap 後は commit 時にも自動実行）

@@ -1,0 +1,11 @@
+#!/bin/bash
+# Claude Code hook: 作業中マーカーを置く/消すだけ。スリープ抑止は awake-keeper.service が行う
+SID=$(python3 -c 'import json,sys;print(json.load(sys.stdin).get("session_id","x"))')
+DIR=$HOME/.cache/awake
+mkdir -p "$DIR"
+if [ "$1" = on ]; then
+  touch "$DIR/busy-$SID"
+else
+  rm -f "$DIR/busy-$SID"
+fi
+exit 0
