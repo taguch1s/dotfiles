@@ -80,6 +80,12 @@ target = ".config/herdr-core/claude/supervisor-prompt.md"
 mode = "link"
 
 [[config]]
+name = "herdr-core ワーカーの settings（sandbox の例外）"
+source = ".config/herdr-core/claude/worker-settings.json"
+target = ".config/herdr-core/claude/worker-settings.json"
+mode = "link"
+
+[[config]]
 name = "herdr-core ワーカーのシステムプロンプト"
 source = ".config/herdr-core/claude/worker-prompt.md"
 target = ".config/herdr-core/claude/worker-prompt.md"

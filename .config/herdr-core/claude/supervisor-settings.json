@@ -28,5 +28,12 @@
         ]
       }
     ]
+  },
+  "sandbox": {
+    "excludedCommands": [
+      "hc",
+      "hc *",
+      "hc-permission *"
+    ]
   }
 }

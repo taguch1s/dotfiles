@@ -14,7 +14,8 @@ Usage: hc-supervisor [start] [--cwd DIR]
 
 start   監督役（名前 supervisor、ラベル role=supervisor）と watcher（supervisor-watch）を起動する。
         既に監督役がいれば起動せず、watcher が欠けていれば watcher だけ起動する。
-        --cwd の既定は $HOME。
+        --cwd の既定は ~/.local/share/hc-supervisor（$HOME はフォルダ信頼が保存されず、
+        起動のたびに trust ダイアログが出るため）。
 status  監督役と watcher の状態を表示する。
 stop    watcher と監督役を止める。監督役が起動したワーカーは止まらない（--outlive-parent）。
 EOF
@@ -47,7 +48,8 @@ if (($#)) && [[ "$1" != -* ]]; then
   command="$1"
   shift
 fi
-cwd="$HOME"
+default_cwd="${XDG_DATA_HOME:-$HOME/.local/share}/hc-supervisor"
+cwd="$default_cwd"
 while (($#)); do
   case "$1" in
     --cwd)
@@ -98,6 +100,7 @@ command -v hc-permission >/dev/null 2>&1 \
   || die 'hc-permission が PATH にありません（dotfiles で make link を実行してください）'
 watcher="$(command -v hc-supervisor-watch)" \
   || die 'hc-supervisor-watch が PATH にありません（dotfiles で make link を実行してください）'
+[[ "$cwd" != "$default_cwd" ]] || mkdir -p "$cwd"
 [[ -d "$cwd" ]] || die "ディレクトリがありません: $cwd"
 
 has_permission_hook() {

@@ -11,6 +11,7 @@ trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/bin" "$fixture/live" "$fixture/home"
 export MOCK_HC_DIR="$fixture" PATH="$fixture/bin:$PATH" HOME="$fixture/home"
 export HC_SUPERVISOR_CLAUDE_SETTINGS="$fixture/settings.json"
+unset XDG_DATA_HOME
 cat >"$fixture/bin/hc" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -48,7 +49,7 @@ reset() { : >"$fixture/hc.log"; }
 echo '{}' >"$fixture/settings.json"
 reset
 "$launcher" >/dev/null 2>"$fixture/err"
-home="$fixture/home"
+home="$fixture/home/.local/share/hc-supervisor"
 expected_supervisor="run --bg --timeout 20 --no-parent --keep --name supervisor --label role=supervisor --cwd $home claude-supervisor 監督を開始してください。"
 expected_watch="run --bg --parent supervisor --no-notify --name supervisor-watch --label role=supervisor-watch --cwd $home $fixture/bin/hc-supervisor-watch supervisor"
 if [[ "$(runs)" == "$expected_supervisor"$'\n'"$expected_watch" ]]; then

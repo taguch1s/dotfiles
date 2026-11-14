@@ -207,7 +207,7 @@ class RoleConfigTest(unittest.TestCase):
 
     def test_templates_point_to_existing_role_files(self):
         for role, flags in (("supervisor", ("--settings", "--append-system-prompt-file")),
-                            ("worker", ("--append-system-prompt-file",))):
+                            ("worker", ("--settings", "--append-system-prompt-file"))):
             command = self.command(role)
             for flag in flags:
                 match = re.search(rf'{flag} "\$HOME/([^"]+)"', command)
@@ -225,6 +225,16 @@ class RoleConfigTest(unittest.TestCase):
         self.assertIn("hook-supervisor", guard["hooks"][0]["command"])
         # 生の hc keys は自動許可しない（hook で拒否する対象）。
         self.assertFalse(any("hc keys" in rule for rule in supervisor["permissions"]["allow"]))
+
+    def test_sandbox_exclusions_are_per_role(self):
+        # 監督役は hc の core と話すのが仕事なので hc と hc-permission を sandbox の外で動かす。
+        # ワーカーは報告の hc send だけ。
+        base = self.ROOT / ".config/herdr-core/claude"
+        supervisor = json.loads((base / "supervisor-settings.json").read_text())["sandbox"]["excludedCommands"]
+        worker = json.loads((base / "worker-settings.json").read_text())["sandbox"]["excludedCommands"]
+        self.assertIn("hc-permission *", supervisor)
+        self.assertIn("hc *", supervisor)
+        self.assertEqual(worker, ["hc send *"])
 
     def test_default_user_settings_install_the_permission_hook(self):
         settings = json.loads((self.ROOT / ".claude/settings.json").read_text())

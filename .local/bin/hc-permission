@@ -795,6 +795,7 @@ def parse_terminal(data: object, target: str = "") -> dict:
         "parent": str((parent.get("address") if isinstance(parent, dict) else parent) or ""),
         "state": str(status.get("state") or "") if isinstance(status, dict) else "",
         "kind": str(status.get("kind") or "") if isinstance(status, dict) else "",
+        "msg": str(status.get("msg") or "") if isinstance(status, dict) else "",
         "cwd": str((foreground.get("cwd") if isinstance(foreground, dict) else "") or data.get("cwd") or ""),
         "labels": parse_labels(data.get("labels")),
     }
@@ -860,7 +861,8 @@ def pending_matches_screen(pending: dict, screen: str) -> bool:
 
 def describe(pending: dict | None) -> str:
     if not pending:
-        return "保留要求: なし（hook を通らなかったダイアログ。ユーザーに回してください）"
+        return ("保留要求: なし（hook を通らなかったダイアログ。sandbox のネットワーク許可など。"
+                "approve できないのでユーザーに回してください）")
     tool_input = pending.get("tool_input") or {}
     if pending.get("tool_name") == "Bash":
         body = str(tool_input.get("command") or "")
@@ -884,7 +886,8 @@ def operate(action: str, target: str, reason: str) -> int:
         labels = " ".join(f"{k}={v}" for k, v in sorted(info["labels"].items())) or "-"
         print(f"terminal: {address}（{info['name'] or '-'}）\ncwd: {info['cwd'] or '-'}\n"
               f"parent: {info['parent'] or '-'}\nlabels: {labels}\n"
-              f"status: {info['state'] or 'none'}{' (' + info['kind'] + ')' if info['kind'] else ''}")
+              f"status: {info['state'] or 'none'}{' (' + info['kind'] + ')' if info['kind'] else ''}"
+              f"{' — ' + info['msg'] if info['msg'] else ''}")
         print(describe(pending))
         print("--- 画面末尾")
         print("\n".join(screen.splitlines()[-30:]))

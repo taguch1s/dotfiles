@@ -53,6 +53,19 @@ supervisor（role=supervisor、親なし）      t5, t6 …（親なし）──
 
 ルールを変えるときは `hc-permission` を編集し、`tests/test_hc_permission_policy.py` に例を足します。
 
+### sandbox との関係
+
+`~/.claude/settings.json` で sandbox を有効にしているので、hc 上のセッションの Bash も sandbox の中で動きます。sandbox 内の Bash は確認なしで通る（`autoAllowBashIfSandboxed`）ため、権限ダイアログは大きく減ります。worktree の外に書けないことも OS が保証するので、監督役の判断を誤っても被害が広がりません。この構成では sandbox を残す前提です。
+
+一方、sandbox の中からは hc の core に接続できません。そこで、役割ごとの settings で必要なコマンドだけを sandbox の外で実行できるようにしています（`sandbox.excludedCommands`）。sandbox の外で動くのはコマンドを単独で実行したときだけで、パイプや `&&` でつなぐと sandbox の中に戻ります。
+
+| 役割 | sandbox の外で動くもの | 理由 |
+| --- | --- | --- |
+| 監督役（[supervisor-settings.json](../.config/herdr-core/claude/supervisor-settings.json)） | `hc`、`hc-permission` | core と話して権限確認に答えるのが仕事 |
+| ワーカー（[worker-settings.json](../.config/herdr-core/claude/worker-settings.json)） | `hc send` | 監督役への報告 |
+
+sandbox のネットワーク許可ダイアログ（「Network request outside of sandbox」）は PermissionRequest hook を通りません。hc 上は `blocked (permission)` と `allow network: <接続先>` として見えるので、watcher は知らせ、監督役は `hc-permission show` で接続先を確かめますが、保留要求がないので承認はできず、あなたに回します。よく使う接続先は `~/.claude/settings.json` の `sandbox.network.allowedDomains` に入れておくと、ダイアログ自体が出なくなります。
+
 ### permission mode
 
 ワーカーにも手動セッションにも permission mode を強制しません（`--permission-mode` を付けない）。手動セッションには強制できず、ワーカーだけ変えると扱いが揃わないためです。あなたの既定が auto mode などなら、Claude Code 自身の判定で通る操作はダイアログにならず、hook にも監督役にも届きません。監督役に判断させたいセッションは default mode で開いてください。
@@ -116,7 +129,7 @@ hc-supervisor stop       # 止める（ワーカーは止まらない）
 hc attach supervisor     # 端末から見る場合。Ctrl+\ で離れる（止まらない）
 ```
 
-初回は監督役の cwd（既定は `$HOME`、`--cwd` で変更）でフォルダ信頼のダイアログが出ます。**既定で「No, exit」が選ばれている**ので、Herdr app かスマホ、または `hc attach supervisor` で開き、↓ で「Yes, I trust this folder」を選んでから Enter を押してください。ダイアログが出ている間は最初の依頼文が届きませんが、役割はシステムプロンプトで渡しているので、そのまま待機状態になります。`~/.claude/settings.json` に hook がなければ、`hc-supervisor` が注意を表示します。
+初回は監督役の cwd（既定は `~/.local/share/hc-supervisor`、`--cwd` で変更）でフォルダ信頼のダイアログが出ます。**既定で「No, exit」が選ばれている**ので、Herdr app かスマホ、または `hc attach supervisor` で開き、↓ で「Yes, I trust this folder」を選んでから Enter を押してください。ダイアログが出ている間は最初の依頼文が届きませんが、役割はシステムプロンプトで渡しているので、そのまま待機状態になります。`~/.claude/settings.json` に hook がなければ、`hc-supervisor` が注意を表示します。
 
 Herdr app の端末での貼り付けは **Ctrl+Shift+V**（または右クリック）です。Ctrl+V はシェルにそのまま送られ、zsh では「次のキーを文字として入れる」になるので、続けて Enter を押すと `command not found: ^M` になります。
 
@@ -174,6 +187,7 @@ Tailscale SSH で WSL に入り、`hc attach supervisor` で同じ terminal を�
 - 次の点は実機確認が必要です。実装はどれも形が違っても動くよう寛容にしてありますが、前提が外れていれば直します。
   - `hc events --json` の 1 行の形（watcher はアドレスらしい値を拾い、拾えなければ `hc ls --json` で全体を見直す）
   - 権限ダイアログの選択肢の形（`❯ 1. Yes` と番号なしの `❯ Yes` の両方を受け付ける）
+- 実機で確認済み（続き）: Claude Code は hc に状態を報告し、権限待ちは `blocked (permission)` と `msg`（`approve Fetch: …`、`allow network: …`）で見える。watcher は手動セッションの権限待ちを監督役に知らせる。WebFetch など通常のツール権限では hook に `HC_TERMINAL_ID` が引き継がれ、保留要求が保存される。`$HOME` のフォルダ信頼は保存されないため、監督役の既定の cwd は `~/.local/share/hc-supervisor`
   - PermissionRequest hook に `HC_TERMINAL_ID` が引き継がれること、`--settings` で渡した監督役の PreToolUse hook が `~/.claude/settings.json` の hook と併合されて動くこと
   - Claude Code が hc の terminal 内で `blocked (permission)` を報告すること、親への通知と watcher の `hc send` が監督役に届くこと（監督役が作業中・自分のダイアログで止まっているときを含む）
   - `hc run` のテンプレートに渡した最初の依頼文が送られること、`--keep` の監督役が herdr-core の再起動後にどうなるか
