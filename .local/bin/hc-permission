@@ -1,0 +1,949 @@
+#!/usr/bin/env python3
+"""herdr-core (hc) 上の Claude Code ワーカーの権限確認を判断・代行する。
+
+1 つのスクリプトに、判断ルール（ポリシー）と、それを使う 3 つの入口をまとめる。
+ルールを 1 か所に置き、hook と承認ヘルパーで同じ判定を使うため。
+
+  hook-worker        ワーカーの PermissionRequest hook。明確に無害なら allow、
+                     明確に危険なら deny。どちらでもなければ保留要求を保存し、
+                     決定を返さずに通常の権限ダイアログへ回す。
+  hook-orchestrator  オーケストレーターの PreToolUse hook。生の `hc keys` や
+                     `hc send --force` を拒否し、このヘルパー経由に限定する。
+  show / approve / deny / escalate / trust
+                     オーケストレーターが、子のダイアログに答えるための操作。
+                     approve は保留要求を危険ルールと再照合し、当たれば拒否する。
+
+全体像は docs/herdr-core-orchestration.md を参照。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+ALLOW = "allow"
+DENY = "deny"
+ASK = "ask"
+_RANK = {ALLOW: 0, ASK: 1, DENY: 2}
+
+PROTECTED_BRANCHES = ("main", "master", "develop", "release", "production")
+# worktree の外でも書き込みを許す一時ディレクトリ。
+SCRATCH_PREFIXES: tuple[str, ...] = ("/tmp/",)
+
+
+def scratch_prefixes() -> tuple[str, ...]:
+    tmpdir = os.environ.get("TMPDIR")
+    extra = (os.path.realpath(tmpdir) + "/",) if tmpdir else ()
+    return SCRATCH_PREFIXES + extra
+PENDING_MAX_AGE_SECONDS = 3600
+
+
+@dataclass
+class Verdict:
+    decision: str
+    reason: str
+
+    def worse(self, other: "Verdict") -> "Verdict":
+        return other if _RANK[other.decision] > _RANK[self.decision] else self
+
+
+# ---------------------------------------------------------------------------
+# 危険ルール（コマンド文字列全体に対する正規表現。$(...) の中も対象にする）
+# ---------------------------------------------------------------------------
+
+_SEG = r"[^;&|\n]*"  # 同じ単純コマンドの中だけを見る
+DANGER_PATTERNS: list[tuple[str, str]] = [
+    (r"(^|[\s;&|(`])(sudo|doas|pkexec)\b", "管理者権限（sudo など）"),
+    (r"(^|[\s;&|(`])su(\s+-|\s+root|\s*$)", "ユーザー切り替え（su）"),
+    (rf"\bgit\b{_SEG}\bpush\b{_SEG}(\s--force(-with-lease|-if-includes)?\b|\s-[a-zA-Z]*f[a-zA-Z]*\b|\s\+\S)",
+     "force push"),
+    (rf"\bgit\b{_SEG}\bpush\b{_SEG}(\s--mirror\b|\s--delete\b|\s-d\b|\s:\S|\s--prune\b)",
+     "リモートのブランチ・tag の削除や mirror push"),
+    (rf"\bgit\b{_SEG}\bpush\b{_SEG}\s(\S+:)?(refs/heads/)?({'|'.join(PROTECTED_BRANCHES)})(?=\s|$|;|&|\|)",
+     "既定ブランチ（main など）への直接 push"),
+    (rf"\bgit\b{_SEG}\breset\b{_SEG}--hard\b", "git reset --hard"),
+    (rf"\bgit\b{_SEG}\bclean\b{_SEG}\s-[a-zA-Z]*f", "git clean -f"),
+    (rf"\bgit\b{_SEG}\bbranch\b{_SEG}\s(-[a-zA-Z]*[dD]\b|--delete\b)", "ブランチの削除"),
+    (rf"\bgit\b{_SEG}\btag\b{_SEG}\s(-d\b|--delete\b)", "tag の削除"),
+    (rf"\bgit\b{_SEG}\bstash\s+(drop|clear)\b", "stash の破棄"),
+    (rf"\bgit\b{_SEG}\b(filter-branch|filter-repo|update-ref\s+-d)\b", "履歴・参照の書き換え"),
+    (rf"\bgit\b{_SEG}\bconfig\b{_SEG}--(global|system)\b", "Git の全体設定の変更"),
+    (r"\bgh\s+pr\s+merge\b", "PR の merge"),
+    (r"\bgh\s+repo\s+(delete|archive|rename|edit)\b", "リポジトリ設定の変更・削除"),
+    (r"\bgh\s+release\s+(create|delete|upload|edit)\b", "リリースの操作"),
+    (r"\bgh\s+(secret|variable|ssh-key|gpg-key)\b", "秘密情報・鍵の操作"),
+    (r"\bgh\s+auth\b", "GitHub 認証情報の操作"),
+    (rf"\bgh\s+api\b{_SEG}(-X|--method)\s*['\"]?DELETE", "GitHub API での削除"),
+    (r"\b(npm|pnpm|yarn|bun)\s+publish\b|\bcargo\s+publish\b|\btwine\s+upload\b|\buv\s+publish\b|\bdocker\s+push\b",
+     "パッケージ・イメージの公開"),
+    (r"\b(curl|wget)\b[^;&\n]*\|\s*(sudo\s+)?(ba|z|da)?sh\b", "ダウンロードしたスクリプトの実行"),
+    (r"(^|[\s;&|(`])(mkfs(\.\w+)?|shutdown|reboot|poweroff|halt|fdisk|parted)\b", "システム操作"),
+    (r"\bdd\b[^;&|\n]*\bof=/dev/", "デバイスへの書き込み"),
+    (r"\bcrontab\s+-r\b", "crontab の削除"),
+    (r"\bchmod\b[^;&|\n]*\b777\b", "chmod 777"),
+    (rf"\brm\b{_SEG}\s(/|/\*|~|~/|~/\*|\$HOME|\$HOME/|\$\{{HOME\}}|\.\.?/?)(?=\s|$|;|&|\|)",
+     "ルート・ホーム・カレントディレクトリ全体の削除"),
+]
+
+# 秘密情報らしいパス。読み取りも書き込みも deny にする。
+SECRET_PATTERNS: list[str] = [
+    r"(^|[\s/'\"=~])\.ssh(/|\b)",
+    r"\bid_(rsa|ecdsa|ed25519|dsa)\b",
+    r"\.aws/(credentials|config)\b",
+    r"\.config/gh/hosts\.ya?ml\b",
+    r"\.git-credentials\b",
+    r"\.netrc\b",
+    r"\.claude/\.credentials",
+    r"\.codex/auth\.json\b",
+    r"\.docker/config\.json\b",
+    r"\.kube/config\b",
+    r"\.gnupg\b",
+    r"(^|[\s/'\"=])\.env(\.(?!example\b|sample\b|template\b|dist\b)[\w.-]+)?(?=$|[\s'\";|&)])",
+    r"\.(pem|p12|pfx|keystore)(?=$|[\s'\";|&)])",
+    r"(^|[\s;&|(`])(printenv|env)(?=$|[\s;&|)])",
+]
+
+
+def danger_reason(text: str) -> str | None:
+    for pattern, reason in DANGER_PATTERNS:
+        if re.search(pattern, text):
+            return reason
+    for pattern in SECRET_PATTERNS:
+        if re.search(pattern, text):
+            return "秘密情報（認証情報・鍵・.env・環境変数）へのアクセス"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# パスの判定
+# ---------------------------------------------------------------------------
+
+
+class Paths:
+    def __init__(self, project_dir: str, cwd: str | None, home: str | None = None):
+        self.home = os.path.realpath(home or os.path.expanduser("~"))
+        self.project = os.path.realpath(project_dir)
+        self.cwd = os.path.realpath(cwd or project_dir)
+        # ホームやルートで起動したワーカーは「worktree 内」を定義できない。
+        self.project_is_usable = self.project not in ("/", self.home)
+
+    def resolve(self, raw: str) -> str | None:
+        """展開できないパス（$VAR, glob 以外の変数）は None。"""
+        text = raw
+        if text.startswith("~/") or text == "~":
+            text = self.home + text[1:]
+        text = re.sub(r"^\$(HOME|\{HOME\})(?=/|$)", self.home, text)
+        if "$" in text or "`" in text:
+            return None
+        if not os.path.isabs(text):
+            text = os.path.join(self.cwd, text)
+        return os.path.realpath(text)
+
+    def inside_project(self, resolved: str) -> bool:
+        if not self.project_is_usable:
+            return False
+        return resolved == self.project or resolved.startswith(self.project + os.sep)
+
+    def is_scratch(self, resolved: str) -> bool:
+        return resolved == "/dev/null" or any(resolved.startswith(p) for p in scratch_prefixes())
+
+    def write_verdict(self, raw: str) -> Verdict:
+        resolved = self.resolve(raw)
+        if resolved is None:
+            return Verdict(ASK, f"書き込み先を特定できない: {raw}")
+        if self.is_scratch(resolved):
+            return Verdict(ALLOW, "一時ディレクトリへの書き込み")
+        if not self.inside_project(resolved):
+            return Verdict(DENY, f"worktree の外への書き込み: {raw}")
+        if resolved == self.project:
+            return Verdict(DENY, "worktree 全体の削除・置き換え")
+        rel = os.path.relpath(resolved, self.project)
+        if rel == ".git" or rel.startswith(".git" + os.sep):
+            return Verdict(ASK, ".git の中への書き込み")
+        return Verdict(ALLOW, "worktree 内への書き込み")
+
+
+# ---------------------------------------------------------------------------
+# Bash の分類
+# ---------------------------------------------------------------------------
+
+READ_ONLY_COMMANDS = {
+    "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "diff", "cmp", "comm",
+    "pwd", "echo", "printf", "true", "false", "test", "[", "which", "type", "command", "file",
+    "stat", "tree", "jq", "yq", "sort", "uniq", "cut", "tr", "basename", "dirname", "realpath",
+    "readlink", "du", "df", "date", "whoami", "id", "uname", "column", "nl", "fold", "seq",
+    "sha256sum", "sha1sum", "md5sum", "sleep", "less", "more", "bat", "fd", "xxd", "od", "hexdump",
+}
+WRITE_COMMANDS = {"mkdir", "touch", "cp", "mv", "rm", "rmdir", "ln", "tee", "chmod", "install"}
+TEST_TOOLS = {
+    "pytest", "ruff", "mypy", "pyright", "black", "isort", "flake8", "pylint", "eslint", "prettier",
+    "tsc", "vitest", "jest", "biome", "shellcheck", "shfmt", "actionlint", "markdownlint", "yamllint",
+    "hadolint", "gofmt", "rustfmt", "clippy-driver",
+}
+SAFE_MAKE_TARGETS = {
+    "", "test", "tests", "check", "lint", "build", "fmt", "format", "typecheck", "type-check",
+    "doctor", "help", "verify", "all",
+}
+RISKY_ENV_VARS = {"PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "GIT_SSH_COMMAND",
+                  "GIT_DIR", "GIT_WORK_TREE", "PYTHONSTARTUP", "NODE_OPTIONS", "PROMPT_COMMAND"}
+
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SEPARATORS = {"&&", "||", ";", "|", "&", "|&", ";;", "\n"}
+_REDIRECTS = {">", ">>", "<", "&>", "&>>", ">|", "<>", ">&", "<&"}
+
+
+def _tokenize(command: str) -> list[str] | None:
+    lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=";&|<>")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _split_segments(tokens: list[str]) -> list[tuple[list[str], list[tuple[str, str]]]]:
+    """[(argv, [(redirect_op, target)])] に分ける。"""
+    segments: list[tuple[list[str], list[tuple[str, str]]]] = []
+    argv: list[str] = []
+    redirects: list[tuple[str, str]] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _SEPARATORS:
+            if argv or redirects:
+                segments.append((argv, redirects))
+            argv, redirects = [], []
+        elif token in _REDIRECTS:
+            target = tokens[index + 1] if index + 1 < len(tokens) else ""
+            # `2>&1` の `2` は argv に入ってしまうので取り除く。
+            if argv and argv[-1].isdigit():
+                argv.pop()
+            redirects.append((token, target))
+            index += 1
+        else:
+            argv.append(token)
+        index += 1
+    if argv or redirects:
+        segments.append((argv, redirects))
+    return segments
+
+
+class BashClassifier:
+    def __init__(self, paths: Paths):
+        self.paths = paths
+
+    def classify(self, command: str) -> Verdict:
+        reason = danger_reason(command)
+        if reason:
+            return Verdict(DENY, reason)
+        if re.search(r"\$\(|`|<\(|>\(|<<", command):
+            return Verdict(ASK, "コマンド置換・プロセス置換・ヒアドキュメントを含む")
+        tokens = _tokenize(command)
+        if tokens is None:
+            return Verdict(ASK, "コマンドを解析できない")
+        segments = _split_segments(tokens)
+        if not segments:
+            return Verdict(ASK, "空のコマンド")
+        verdict = Verdict(ALLOW, "")
+        reasons: list[str] = []
+        for argv, redirects in segments:
+            for op, target in redirects:
+                if op in (">&", "<&") and (target.isdigit() or target == "-"):
+                    continue
+                if op in ("<",):
+                    continue
+                current = self.paths.write_verdict(target)
+                verdict = verdict.worse(current)
+                reasons.append(current.reason)
+            current = self._segment(argv)
+            verdict = verdict.worse(current)
+            reasons.append(current.reason)
+        if verdict.decision == ALLOW:
+            return Verdict(ALLOW, "無害なコマンド: " + "; ".join(sorted({r for r in reasons if r})))
+        return verdict
+
+    # -- 単純コマンド ----------------------------------------------------
+
+    def _segment(self, argv: list[str]) -> Verdict:
+        while argv and _ENV_ASSIGN.match(argv[0]):
+            name = argv[0].split("=", 1)[0]
+            if name in RISKY_ENV_VARS:
+                return Verdict(ASK, f"環境変数 {name} を変更して実行")
+            argv = argv[1:]
+        if not argv:
+            return Verdict(ALLOW, "変数代入")
+        name = os.path.basename(argv[0])
+        args = argv[1:]
+
+        if name == "cd":
+            target = args[0] if args else "~"
+            resolved = self.paths.resolve(target)
+            if resolved and self.paths.inside_project(resolved):
+                self.paths.cwd = resolved
+                return Verdict(ALLOW, "worktree 内への cd")
+            return Verdict(ASK, f"worktree の外への cd: {target}")
+        if name in READ_ONLY_COMMANDS:
+            return Verdict(ALLOW, "読み取り")
+        if name == "find":
+            if any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls")
+                   for a in args):
+                return Verdict(ASK, "find の -exec / -delete")
+            return Verdict(ALLOW, "読み取り")
+        if name == "sed":
+            if any(a == "--in-place" or re.match(r"^-[a-zA-Z]*i", a) for a in args):
+                return self._writes([a for a in args[1:] if not a.startswith("-")], "sed -i")
+            return Verdict(ALLOW, "読み取り")
+        if name in ("awk", "gawk", "mawk"):
+            program = " ".join(args)
+            if re.search(r"system\s*\(|\|\s*\"|>\s*\"", program):
+                return Verdict(ASK, "awk からの外部コマンド・書き込み")
+            return Verdict(ALLOW, "読み取り")
+        if name in WRITE_COMMANDS:
+            return self._write_command(name, args)
+        if name == "git":
+            return self._git(args)
+        if name == "gh":
+            return self._gh(args)
+        if name == "hc":
+            return self._hc(args)
+        if name == "make":
+            return self._make(args)
+        if name in ("npm", "pnpm", "yarn", "bun"):
+            return self._node(name, args)
+        if name == "uv":
+            return self._uv(args)
+        if name in ("python", "python3"):
+            return self._python(args)
+        if name in ("bash", "sh", "zsh"):
+            return self._shell(args)
+        if name in TEST_TOOLS:
+            return Verdict(ALLOW, f"テスト・lint ({name})")
+        if name == "cargo":
+            sub = args[0] if args else ""
+            if sub in ("test", "build", "check", "clippy", "fmt", "doc", "bench", "run", "tree", "metadata"):
+                return Verdict(ALLOW, f"cargo {sub}")
+            return Verdict(ASK, f"cargo {sub}")
+        if name == "go":
+            sub = args[0] if args else ""
+            if sub in ("test", "build", "vet", "fmt", "list", "version", "env"):
+                return Verdict(ALLOW, f"go {sub}")
+            return Verdict(ASK, f"go {sub}")
+        if name in ("hc-permission",):
+            return Verdict(DENY, "ワーカーは hc-permission を使わない")
+        return Verdict(ASK, f"判定ルールにないコマンド: {name}")
+
+    def _writes(self, targets: list[str], label: str) -> Verdict:
+        if not targets:
+            return Verdict(ASK, f"{label} の対象が分からない")
+        verdict = Verdict(ALLOW, f"worktree 内での {label}")
+        for target in targets:
+            current = self.paths.write_verdict(target)
+            if current.decision != ALLOW:
+                verdict = verdict.worse(Verdict(current.decision, f"{label}: {current.reason}"))
+        return verdict
+
+    def _write_command(self, name: str, args: list[str]) -> Verdict:
+        operands = [a for a in args if not a.startswith("-") or a == "-"]
+        if name == "chmod" and operands:
+            operands = operands[1:]
+        if name == "tee":
+            operands = [a for a in operands if a != "-"]
+            if not operands:
+                return Verdict(ALLOW, "tee（標準出力のみ）")
+        return self._writes(operands, name)
+
+    def _git_target(self, args: list[str]) -> tuple[list[str], Verdict | None]:
+        """`git -C <path>` などのグローバルオプションを取り除く。"""
+        rest = list(args)
+        while rest and rest[0].startswith("-"):
+            option = rest.pop(0)
+            if option == "-C" and rest:
+                path = rest.pop(0)
+                resolved = self.paths.resolve(path)
+                if resolved is None:
+                    return rest, Verdict(ASK, f"git -C の対象を特定できない: {path}")
+                if not self.paths.inside_project(resolved):
+                    return rest, Verdict(ASK, f"worktree の外のリポジトリ: {path}")
+                self.paths.cwd = resolved
+            elif option in ("-c", "--git-dir", "--work-tree", "--namespace"):
+                return rest, Verdict(ASK, f"git {option}")
+            elif option in ("--no-pager", "-P", "--paginate", "--no-optional-locks"):
+                continue
+            else:
+                return rest, Verdict(ASK, f"git {option}")
+        return rest, None
+
+    def _current_branch(self) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "-C", self.paths.cwd, "symbolic-ref", "--short", "-q", "HEAD"],
+                capture_output=True, text=True, timeout=5, check=False,
+                env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def _git(self, args: list[str]) -> Verdict:
+        rest, problem = self._git_target(args)
+        if problem:
+            return problem
+        sub = rest[0] if rest else ""
+        sub_args = rest[1:]
+        read_only = {"status", "diff", "log", "show", "rev-parse", "ls-files", "ls-tree", "blame",
+                     "merge-base", "describe", "shortlog", "cat-file", "fetch", "grep", "reflog",
+                     "rev-list", "name-rev", "for-each-ref", "show-ref", "check-ignore", "version"}
+        if sub in read_only:
+            return Verdict(ALLOW, f"git {sub}")
+        if sub in ("add", "commit", "mv", "rm", "restore"):
+            if sub == "restore" and not any(a.startswith("--staged") or a == "-S" for a in sub_args):
+                return Verdict(ASK, "git restore（作業中の変更の破棄）")
+            return Verdict(ALLOW, f"git {sub}")
+        if sub in ("switch", "checkout"):
+            if "--" in sub_args or "." in sub_args or "-f" in sub_args or "--force" in sub_args:
+                return Verdict(ASK, f"git {sub}（変更の破棄）")
+            return Verdict(ALLOW, f"git {sub}")
+        if sub == "branch":
+            if any(a in ("-m", "-M", "--move", "-c", "-C", "--copy", "-f", "--force",
+                         "-u", "--set-upstream-to", "--unset-upstream") for a in sub_args):
+                return Verdict(ASK, "git branch の変更操作")
+            return Verdict(ALLOW, "git branch")
+        if sub == "stash":
+            action = sub_args[0] if sub_args else "push"
+            if action in ("push", "list", "show", "apply", "pop", "save"):
+                return Verdict(ALLOW, f"git stash {action}")
+            return Verdict(ASK, f"git stash {action}")
+        if sub == "remote":
+            if not sub_args or sub_args[0] in ("-v", "show", "get-url"):
+                return Verdict(ALLOW, "git remote（参照）")
+            return Verdict(ASK, "git remote の変更")
+        if sub == "worktree":
+            if sub_args[:1] == ["list"]:
+                return Verdict(ALLOW, "git worktree list")
+            return Verdict(ASK, "git worktree の変更")
+        if sub == "config":
+            if any(a in ("--get", "--get-all", "--list", "-l", "--get-regexp") for a in sub_args):
+                return Verdict(ALLOW, "git config（参照）")
+            return Verdict(ASK, "git config の変更")
+        if sub == "push":
+            return self._git_push(sub_args)
+        return Verdict(ASK, f"git {sub}")
+
+    def _git_push(self, args: list[str]) -> Verdict:
+        positional = [a for a in args if not a.startswith("-")]
+        options = [a for a in args if a.startswith("-")]
+        allowed_options = {"-u", "--set-upstream", "--no-verify", "-q", "--quiet", "-v", "--verbose",
+                           "--porcelain", "--progress"}
+        if any(o not in allowed_options for o in options):
+            return Verdict(ASK, "git push のオプション: " + " ".join(options))
+        if len(positional) > 2:
+            return Verdict(ASK, "複数の refspec を push")
+        if len(positional) == 2:
+            refspec = positional[1]
+            destination = refspec.split(":", 1)[-1].removeprefix("refs/heads/")
+            if destination in PROTECTED_BRANCHES:
+                return Verdict(DENY, "既定ブランチ（main など）への直接 push")
+            if destination != "HEAD":
+                return Verdict(ALLOW, f"自分のブランチへの push ({destination})")
+        # 引数なし・HEAD の push は現在のブランチを見て決める。
+        branch = self._current_branch()
+        if not branch or branch == "HEAD":
+            return Verdict(ASK, "現在のブランチを特定できない push")
+        if branch in PROTECTED_BRANCHES:
+            return Verdict(DENY, f"既定ブランチ（{branch}）からの push")
+        return Verdict(ALLOW, f"自分のブランチへの push ({branch})")
+
+    def _gh(self, args: list[str]) -> Verdict:
+        group = args[0] if args else ""
+        action = args[1] if len(args) > 1 else ""
+        allowed = {
+            "pr": {"create", "view", "list", "checks", "diff", "status", "comment"},
+            "issue": {"view", "list", "status", "comment"},
+            "run": {"view", "list", "watch"},
+            "repo": {"view"},
+            "workflow": {"list", "view"},
+            "search": {"issues", "prs", "code", "commits", "repos"},
+        }
+        if action in allowed.get(group, set()):
+            return Verdict(ALLOW, f"gh {group} {action}")
+        if group == "api":
+            if any(a in ("-X", "--method", "-f", "-F", "--field", "--raw-field", "--input")
+                   or a.startswith(("-X", "--method=", "-f", "-F")) for a in args[1:]):
+                return Verdict(ASK, "gh api の書き込み")
+            return Verdict(ALLOW, "gh api（参照）")
+        return Verdict(ASK, f"gh {group} {action}".strip())
+
+    def _hc(self, args: list[str]) -> Verdict:
+        sub = args[0] if args else ""
+        if "--force" in args:
+            return Verdict(DENY, "hc の --force")
+        if sub in ("read", "get", "ls", "wait", "templates", "send"):
+            return Verdict(ALLOW, f"hc {sub}")
+        return Verdict(ASK, f"hc {sub}")
+
+    def _make(self, args: list[str]) -> Verdict:
+        targets: list[str] = []
+        rest = list(args)
+        while rest:
+            arg = rest.pop(0)
+            if arg in ("-C", "--directory"):
+                if not rest:
+                    return Verdict(ASK, "make -C の対象がない")
+                path = rest.pop(0)
+                resolved = self.paths.resolve(path)
+                if not resolved or not self.paths.inside_project(resolved):
+                    return Verdict(ASK, f"worktree の外で make: {path}")
+            elif arg in ("-j", "-k", "-s", "--silent", "-n", "--keep-going") or re.match(r"^-j\d+$", arg):
+                continue
+            elif arg.startswith("-") or "=" in arg:
+                return Verdict(ASK, f"make のオプション・変数: {arg}")
+            else:
+                targets.append(arg)
+        if all(t in SAFE_MAKE_TARGETS for t in targets or [""]):
+            return Verdict(ALLOW, "make " + " ".join(targets))
+        return Verdict(ASK, "make " + " ".join(targets))
+
+    def _node(self, name: str, args: list[str]) -> Verdict:
+        sub = args[0] if args else "install"
+        if sub in ("test", "t", "run", "run-script", "lint", "build", "typecheck"):
+            return Verdict(ALLOW, f"{name} {sub}（リポジトリのスクリプト）")
+        if sub in ("install", "i", "ci"):
+            packages = [a for a in args[1:] if not a.startswith("-")]
+            if packages:
+                return Verdict(ASK, f"{name} {sub} で新しいパッケージを追加")
+            return Verdict(ALLOW, f"lockfile に沿った依存の導入 ({name} {sub})")
+        if sub in ("list", "ls", "outdated", "why", "view", "info", "audit"):
+            return Verdict(ALLOW, f"{name} {sub}")
+        return Verdict(ASK, f"{name} {sub}")
+
+    def _uv(self, args: list[str]) -> Verdict:
+        sub = args[0] if args else ""
+        if sub == "sync":
+            if any(a.startswith(("--upgrade", "-U", "-P")) for a in args[1:]):
+                return Verdict(ASK, "uv sync --upgrade")
+            return Verdict(ALLOW, "lockfile に沿った依存の導入 (uv sync)")
+        if sub in ("tree", "version", "lock") and "--upgrade" not in args:
+            return Verdict(ALLOW, f"uv {sub}")
+        if sub == "run":
+            rest = args[1:]
+            while rest and rest[0].startswith("-"):
+                option = rest.pop(0)
+                if option in ("--directory", "--project") and rest:
+                    path = rest.pop(0)
+                    resolved = self.paths.resolve(path)
+                    if not resolved or not self.paths.inside_project(resolved):
+                        return Verdict(ASK, f"worktree の外で uv run: {path}")
+                    self.paths.cwd = resolved
+                elif option in ("--frozen", "--locked", "--no-sync", "--offline", "-q", "--quiet"):
+                    continue
+                else:
+                    return Verdict(ASK, f"uv run {option}")
+            if not rest:
+                return Verdict(ASK, "uv run の対象がない")
+            return self._segment(rest)
+        return Verdict(ASK, f"uv {sub}")
+
+    def _python(self, args: list[str]) -> Verdict:
+        if not args:
+            return Verdict(ASK, "対話的な python")
+        if args[0] == "-m" and len(args) > 1:
+            module = args[1]
+            if module in TEST_TOOLS or module in ("unittest", "py_compile", "compileall", "pytest", "json.tool"):
+                return Verdict(ALLOW, f"python -m {module}")
+            return Verdict(ASK, f"python -m {module}")
+        return self._script(args, "python")
+
+    def _shell(self, args: list[str]) -> Verdict:
+        if args and args[0] == "-n":
+            return Verdict(ALLOW, "構文検査")
+        return self._script(args, "shell")
+
+    def _script(self, args: list[str], label: str) -> Verdict:
+        options = [a for a in args if a.startswith("-")]
+        if options and options[0] in ("-c", "-") or not args or args[0].startswith("-"):
+            return Verdict(ASK, f"{label} のインラインコード")
+        resolved = self.paths.resolve(args[0])
+        if resolved and self.paths.inside_project(resolved):
+            return Verdict(ALLOW, f"worktree 内のスクリプト ({args[0]})")
+        return Verdict(ASK, f"worktree の外のスクリプト: {args[0]}")
+
+
+# ---------------------------------------------------------------------------
+# ツール全体の分類
+# ---------------------------------------------------------------------------
+
+FILE_WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+FILE_READ_TOOLS = {"Read", "Glob", "Grep", "LS", "NotebookRead"}
+
+
+def classify(tool_name: str, tool_input: dict, project_dir: str, cwd: str | None = None,
+             home: str | None = None) -> Verdict:
+    paths = Paths(project_dir, cwd, home)
+    if tool_name == "Bash":
+        command = str(tool_input.get("command") or "")
+        return BashClassifier(paths).classify(command)
+    if tool_name in FILE_WRITE_TOOLS or tool_name in FILE_READ_TOOLS:
+        raw = str(tool_input.get("file_path") or tool_input.get("notebook_path") or tool_input.get("path") or "")
+        if raw and danger_reason(raw):
+            return Verdict(DENY, "秘密情報（認証情報・鍵・.env）へのアクセス")
+        if tool_name in FILE_READ_TOOLS:
+            return Verdict(ALLOW, "読み取り")
+        if not raw:
+            return Verdict(ASK, "書き込み先がない")
+        return paths.write_verdict(raw)
+    if tool_name in ("WebSearch", "TodoWrite"):
+        return Verdict(ALLOW, f"{tool_name}")
+    return Verdict(ASK, f"判定ルールにないツール: {tool_name}")
+
+
+# ---------------------------------------------------------------------------
+# 状態ファイル
+# ---------------------------------------------------------------------------
+
+
+def state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    path = Path(base) / "hc-orchestrator"
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def pending_path(terminal: str) -> Path:
+    directory = state_dir() / "pending"
+    directory.mkdir(exist_ok=True)
+    os.chmod(directory, 0o700)
+    return directory / (re.sub(r"[^A-Za-z0-9_.-]", "_", terminal) + ".json")
+
+
+def _truncate(value: object, limit: int = 600) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def record(entry: dict) -> None:
+    entry = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **entry}
+    with open(state_dir() / "decisions.jsonl", "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# hook
+# ---------------------------------------------------------------------------
+
+
+def hook_worker() -> int:
+    """PermissionRequest hook。ask のときは何も出力しない（ダイアログへ回す）。"""
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        return 0
+    tool_name = str(payload.get("tool_name") or "")
+    tool_input = payload.get("tool_input") or {}
+    cwd = payload.get("cwd")
+    project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or cwd or os.getcwd()
+    verdict = classify(tool_name, tool_input, project_dir, cwd)
+    terminal = os.environ.get("HC_TERMINAL_ID", "")
+
+    record({"action": f"hook-{verdict.decision}", "actor": "hook", "terminal": terminal,
+            "tool_name": tool_name, "tool_input": _truncate(tool_input), "reason": verdict.reason})
+
+    pending = pending_path(terminal) if terminal else None
+    if verdict.decision == ASK:
+        if pending:
+            content = {
+                "terminal": terminal,
+                "created_at": time.time(),
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "cwd": cwd,
+                "project_dir": project_dir,
+                "reason": verdict.reason,
+            }
+            handle, temporary = tempfile.mkstemp(dir=pending.parent, prefix=".pending-")
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                json.dump(content, stream, ensure_ascii=False, indent=2)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, pending)
+        return 0
+
+    if pending and pending.exists():
+        pending.unlink()
+    decision: dict = {"behavior": verdict.decision}
+    if verdict.decision == DENY:
+        decision["message"] = (
+            f"hc-permission のポリシーで拒否しました: {verdict.reason}。"
+            "同じ操作を別のコマンドに書き換えて回避せず、方針を変えるか親に hc send で相談してください。")
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}},
+                     ensure_ascii=False))
+    return 0
+
+
+ORCHESTRATOR_BASH_RULES: list[tuple[str, str]] = [
+    (r"\bhc\b(\s+--?[\w-]+(=\S+)?)*\s+keys\b", "hc keys で直接キーを送らず、hc-permission を使ってください"),
+    (r"\bhc\b[^;&|\n]*\bsend\b[^;&|\n]*\s--force\b",
+     "hc send --force で権限ダイアログを迂回しないでください。hc-permission を使ってください"),
+    (r"hc-orchestrator/(pending|decisions)", "保留要求・監査ログを直接操作しないでください"),
+]
+
+
+def hook_orchestrator() -> int:
+    """PreToolUse hook。違反時は deny を返す。"""
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        return 0
+    tool_name = str(payload.get("tool_name") or "")
+    tool_input = payload.get("tool_input") or {}
+    reason = None
+    if tool_name == "Bash":
+        command = str(tool_input.get("command") or "")
+        for pattern, message in ORCHESTRATOR_BASH_RULES:
+            if re.search(pattern, command):
+                reason = message
+                break
+    elif tool_name in FILE_WRITE_TOOLS:
+        raw = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
+        resolved = os.path.realpath(os.path.expanduser(raw)) if raw else ""
+        protected = [os.path.realpath(__file__), str(state_dir())]
+        if any(resolved == p or resolved.startswith(p + os.sep) for p in protected):
+            reason = "権限判断のルール・状態ファイルは編集できません"
+    if not reason:
+        return 0
+    record({"action": "guard-deny", "actor": os.environ.get("HC_TERMINAL_ID", ""),
+            "tool_name": tool_name, "tool_input": _truncate(tool_input), "reason": reason})
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}, ensure_ascii=False))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# オーケストレーター用の操作
+# ---------------------------------------------------------------------------
+
+
+class Refused(Exception):
+    pass
+
+
+def hc(*args: str) -> str:
+    result = subprocess.run(["hc", *args], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise Refused(f"hc {' '.join(args)} が失敗しました: {result.stderr.strip()}")
+    return result.stdout
+
+
+def terminal_info(target: str) -> dict:
+    data = json.loads(hc("get", target, "--json"))
+    if isinstance(data, dict) and "address" not in data:
+        for key in ("terminal", "result"):
+            if isinstance(data.get(key), dict):
+                data = data[key]
+                break
+    status = data.get("status") or {}
+    return {
+        "address": data.get("address") or target,
+        "parent": data.get("parent") or "",
+        "state": status.get("state") or "",
+        "kind": status.get("kind") or "",
+    }
+
+
+def read_pending(address: str) -> dict | None:
+    candidates = [address, address.rsplit("/", 1)[-1]]
+    for name in candidates:
+        path = pending_path(name)
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["_path"] = str(path)
+            return data
+    return None
+
+
+PERMISSION_DIALOG = re.compile(r"Do you want to|Would you like to")
+SELECTED_YES = re.compile(r"^\s*❯\s*1\.\s*Yes\s*$", re.MULTILINE)
+TRUST_DIALOG = re.compile(r"trust (the files in )?this folder|Is this a project you created or one you trust",
+                          re.IGNORECASE)
+SELECTED_TRUST_YES = re.compile(r"^\s*❯\s*1\.\s*Yes", re.MULTILINE)
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"[\s│|]+", "", text)
+
+
+def pending_matches_screen(pending: dict, screen: str) -> bool:
+    """保留要求が、いま画面に出ているダイアログのものかを確かめる。"""
+    tool_input = pending.get("tool_input") or {}
+    flat = _normalize(screen)
+    if pending.get("tool_name") == "Bash":
+        needle = _normalize(str(tool_input.get("command") or ""))[:40]
+    else:
+        raw = str(tool_input.get("file_path") or tool_input.get("notebook_path") or tool_input.get("path") or "")
+        needle = _normalize(os.path.basename(raw))
+    return bool(needle) and needle in flat
+
+
+def describe(pending: dict | None) -> str:
+    if not pending:
+        return "保留要求: なし（hook を通らなかったダイアログ。ユーザーに回してください）"
+    tool_input = pending.get("tool_input") or {}
+    if pending.get("tool_name") == "Bash":
+        body = str(tool_input.get("command") or "")
+    else:
+        body = json.dumps(tool_input, ensure_ascii=False, indent=2)
+    verdict = classify(str(pending.get("tool_name") or ""), tool_input,
+                       str(pending.get("project_dir") or "/"), pending.get("cwd"))
+    age = int(time.time() - float(pending.get("created_at") or 0))
+    return (f"保留要求: {pending.get('tool_name')}（{age} 秒前）\n"
+            f"worktree: {pending.get('project_dir')}\n"
+            f"ポリシー: {verdict.decision}（{verdict.reason}）\n---\n{body}")
+
+
+def operate(action: str, target: str, reason: str) -> int:
+    info = terminal_info(target)
+    address = info["address"]
+    screen = hc("read", target, "--lines", "0")
+    pending = read_pending(address)
+
+    if action == "show":
+        print(f"terminal: {address}\nparent: {info['parent'] or '-'}\n"
+              f"status: {info['state'] or 'none'}{' (' + info['kind'] + ')' if info['kind'] else ''}")
+        print(describe(pending))
+        print("--- 画面末尾")
+        print("\n".join(screen.splitlines()[-30:]))
+        return 0
+
+    caller = os.environ.get("HC_TERMINAL_ID", "")
+    entry = {"action": action, "actor": caller, "terminal": address, "parent": info["parent"],
+             "reason": reason,
+             "tool_name": (pending or {}).get("tool_name"),
+             "tool_input": _truncate((pending or {}).get("tool_input")) if pending else None,
+             "screen": "\n".join(line.rstrip() for line in screen.splitlines()[-15:])}
+
+    def refuse(message: str) -> int:
+        record({**entry, "outcome": f"refused: {message}"})
+        print(f"hc-permission: {message}", file=sys.stderr)
+        return 1
+
+    if action == "escalate":
+        record({**entry, "outcome": "escalated"})
+        print(f"escalated: {address} をユーザー判断として記録しました。次の形でユーザーに質問して止まってください。\n"
+              f"【確認】{address}: {reason}\n推奨: <承認/却下と理由>\n返答: 「承認」/「却下: 理由」")
+        return 0
+
+    if not caller:
+        return refuse("hc の terminal 内（オーケストレーター）から実行してください")
+    if info["parent"] != caller:
+        return refuse(f"直接の親だけが答えられます（対象の親: {info['parent'] or 'なし'}、呼び出し元: {caller}）")
+
+    if action == "trust":
+        if not TRUST_DIALOG.search(screen):
+            return refuse("フォルダ信頼（trust）のダイアログが画面にありません")
+        if not SELECTED_TRUST_YES.search(screen):
+            return refuse("trust ダイアログで「1. Yes」が選択されていません。画面を確認してください")
+        hc("keys", target, "enter")
+        record({**entry, "outcome": "trusted"})
+        print(f"trusted: {address}")
+        return 0
+
+    if info["state"] != "blocked":
+        return refuse(f"対象は blocked ではありません（status: {info['state'] or 'none'}）")
+    if info["kind"] != "permission":
+        return refuse(f"権限待ちではありません（kind: {info['kind'] or 'なし'}）。質問ならユーザーに確認してください")
+    if not PERMISSION_DIALOG.search(screen):
+        return refuse("Claude Code の権限ダイアログが画面にありません。hc-permission show で確認してください")
+
+    if action == "approve":
+        if not pending:
+            return refuse("保留要求がありません（hook を通っていない）。escalate してユーザーに回してください")
+        age = time.time() - float(pending.get("created_at") or 0)
+        if age > PENDING_MAX_AGE_SECONDS:
+            return refuse("保留要求が古すぎます。escalate してユーザーに回してください")
+        if not pending_matches_screen(pending, screen):
+            return refuse("保留要求と画面のダイアログが一致しません。escalate してユーザーに回してください")
+        verdict = classify(str(pending.get("tool_name") or ""), pending.get("tool_input") or {},
+                           str(pending.get("project_dir") or "/"), pending.get("cwd"))
+        if verdict.decision == DENY:
+            return refuse(f"危険ルールに該当するため承認できません: {verdict.reason}。"
+                          "hc-permission deny で却下してください")
+        if not SELECTED_YES.search(screen):
+            return refuse("ダイアログで「1. Yes」が選択されていません。画面を確認してください")
+        hc("keys", target, "enter")
+        Path(pending["_path"]).unlink(missing_ok=True)
+        record({**entry, "outcome": "approved"})
+        print(f"approved: {address}")
+        return 0
+
+    # deny
+    hc("keys", target, "esc")
+    if pending:
+        Path(pending["_path"]).unlink(missing_ok=True)
+    subprocess.run(["hc", "wait", target, "--timeout", "30"], capture_output=True, check=False)
+    sent = subprocess.run(["hc", "send", target, "--if", "idle", f"オーケストレーターが却下しました: {reason}"],
+                          capture_output=True, text=True, check=False)
+    if sent.returncode != 0:
+        return refuse("ダイアログは閉じましたが、却下理由を送れませんでした。hc-permission show で確認してください")
+    record({**entry, "outcome": "denied"})
+    print(f"denied: {address}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="hc-permission",
+        description="herdr-core 上の Claude Code ワーカーの権限確認を判断・代行する。")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("hook-worker", help="ワーカーの PermissionRequest hook（stdin に hook 入力）")
+    sub.add_parser("hook-orchestrator", help="オーケストレーターの PreToolUse hook")
+    classify_parser = sub.add_parser("classify", help="tool 入力 JSON（stdin）を判定して表示する")
+    classify_parser.add_argument("--project-dir", required=True)
+    classify_parser.add_argument("--cwd")
+    show = sub.add_parser("show", help="保留要求・ポリシー判定・画面末尾を表示する")
+    show.add_argument("terminal")
+    for name, text in (
+        ("approve", "保留要求を危険ルールと再照合し、問題なければ「1. Yes」を選ぶ"),
+        ("deny", "Esc でダイアログを閉じ、却下理由をワーカーへ送る"),
+        ("escalate", "ユーザー判断へ回したことを記録する（キーは送らない）"),
+        ("trust", "初回起動時のフォルダ信頼ダイアログに「1. Yes」で答える"),
+    ):
+        command = sub.add_parser(name, help=text)
+        command.add_argument("terminal")
+        command.add_argument("--reason", required=True)
+    args = parser.parse_args(argv)
+
+    if args.command == "hook-worker":
+        return hook_worker()
+    if args.command == "hook-orchestrator":
+        return hook_orchestrator()
+    if args.command == "classify":
+        payload = json.load(sys.stdin)
+        verdict = classify(payload.get("tool_name", ""), payload.get("tool_input") or {},
+                           args.project_dir, args.cwd)
+        print(json.dumps({"decision": verdict.decision, "reason": verdict.reason}, ensure_ascii=False))
+        return 0
+    if args.command != "show" and not args.reason.strip():
+        parser.error("--reason に理由を書いてください")
+    try:
+        return operate(args.command, args.terminal, getattr(args, "reason", ""))
+    except Refused as error:
+        print(f"hc-permission: {error}", file=sys.stderr)
+        return 1
+    except FileNotFoundError:
+        print("hc-permission: hc が PATH にありません（herdr-core を導入してください）", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

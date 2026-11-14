@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.local/bin/hc-permission\" hook-worker",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

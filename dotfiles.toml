@@ -35,6 +35,56 @@ mode = "link"
 executable = true
 
 [[config]]
+name = "herdr-core 権限判断ヘルパー（hook とポリシー）"
+source = ".local/bin/hc-permission"
+target = ".local/bin/hc-permission"
+mode = "link"
+executable = true
+
+[[config]]
+name = "herdr-core オーケストレーター起動"
+source = ".local/bin/hc-orch"
+target = ".local/bin/hc-orch"
+mode = "link"
+executable = true
+
+[[config]]
+name = "herdr-core オーケストレーターテンプレート"
+source = ".config/herdr-core/templates/claude-orchestrator.md"
+target = ".config/herdr-core/templates/claude-orchestrator.md"
+mode = "link"
+
+[[config]]
+name = "herdr-core ワーカーテンプレート"
+source = ".config/herdr-core/templates/claude-worker.md"
+target = ".config/herdr-core/templates/claude-worker.md"
+mode = "link"
+
+[[config]]
+name = "herdr-core オーケストレーターの settings"
+source = ".config/herdr-core/claude/orchestrator-settings.json"
+target = ".config/herdr-core/claude/orchestrator-settings.json"
+mode = "link"
+
+[[config]]
+name = "herdr-core オーケストレーターのシステムプロンプト"
+source = ".config/herdr-core/claude/orchestrator-prompt.md"
+target = ".config/herdr-core/claude/orchestrator-prompt.md"
+mode = "link"
+
+[[config]]
+name = "herdr-core ワーカーの settings"
+source = ".config/herdr-core/claude/worker-settings.json"
+target = ".config/herdr-core/claude/worker-settings.json"
+mode = "link"
+
+[[config]]
+name = "herdr-core ワーカーのシステムプロンプト"
+source = ".config/herdr-core/claude/worker-prompt.md"
+target = ".config/herdr-core/claude/worker-prompt.md"
+mode = "link"
+
+[[config]]
 name = "Codex worktree launcher"
 source = ".local/bin/codex-worktree"
 target = ".local/bin/codex-worktree"

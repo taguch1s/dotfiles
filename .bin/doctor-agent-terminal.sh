@@ -24,10 +24,13 @@ check_command() {
 
 check_command gh
 check_command herdr
+check_command hc
 check_command codex
 check_command claude
 check_command ghostty
 python3 "$root/.bin/manage-dotfiles-configs.py" doctor "${doctor_args[@]}" || failures=1
 python3 -m py_compile "$root/.local/bin/herdr-codex-status"
 bash -n "$root/.local/bin/herdr-codex-orchestrate"
+python3 -m py_compile "$root/.local/bin/hc-permission"
+bash -n "$root/.local/bin/hc-orch"
 exit "$failures"

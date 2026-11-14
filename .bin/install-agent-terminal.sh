@@ -31,6 +31,11 @@ if ! command -v herdr >/dev/null 2>&1; then
   curl -fsSL https://herdr.dev/install.sh | sh
 fi
 
+# Herdr app（GUI）とスマホアプリが接続する実行基盤。TUI の herdr とは別物。
+if ! command -v hc >/dev/null 2>&1; then
+  curl -fsSL https://releases.herdr.dev/core/install.sh | sh
+fi
+
 if ! command -v ghostty >/dev/null 2>&1; then
   if apt-cache show ghostty >/dev/null 2>&1; then
     ensure_apt_package ghostty

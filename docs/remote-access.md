@@ -56,3 +56,5 @@ journalctl --user -u awake-keeper -f   # state: claude / ssh-tmux / idle が出�
 - WSL から `powershell.exe -Command '...'` を呼ぶと、引数中の `"` が落ちる。awake-keeper は `-EncodedCommand`（UTF-16LE の base64）で渡している
 - Windows 側に常駐プロセスを置かず、毎回すぐ終わる呼び出しでアイドルタイマーをリセットしている。これにより、プロセスが残る問題が起きない
 - Claude Code の sandbox からは `/mnt` の読み取りもホスト側のプロセス一覧も見えない。動作確認は通常のターミナルで行う
+
+herdr-core（Herdr app・スマホの Herdr アプリ）でオーケストレーターを動かす構成は [herdr-core-orchestration.md](herdr-core-orchestration.md) を参照してください。

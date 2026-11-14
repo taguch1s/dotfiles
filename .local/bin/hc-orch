@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# herdr-core 上にオーケストレーター役の Claude Code を 1 つ起動する。
+# Herdr app・スマホ・端末のどこからでも同じ 1 行で使う。全体像は docs/herdr-core-orchestration.md
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: hc-orch [--name NAME] <repository> "<指示>"
+
+<repository> を作業ディレクトリにして claude-orchestrator テンプレートを起動する。
+NAME の既定は orch-<repository のディレクトリ名>。
+起動後は Herdr app / スマホのサイドバー、または `hc attach NAME` で操作する。
+EOF
+}
+
+die() {
+  printf 'hc-orch: %s\n' "$*" >&2
+  exit 1
+}
+
+name=''
+while (($#)); do
+  case "$1" in
+    --name)
+      (($# >= 2)) || die '--name に名前を指定してください'
+      name="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+(($# == 2)) || {
+  usage >&2
+  exit 2
+}
+repository="$1"
+instruction="$2"
+
+command -v hc >/dev/null 2>&1 || die 'hc が PATH にありません（herdr-core を導入してください）'
+command -v hc-permission >/dev/null 2>&1 \
+  || die 'hc-permission が PATH にありません（dotfiles で make link を実行してください）'
+[[ -n "$instruction" ]] || die '指示が空です'
+[[ -d "$repository" ]] || die "ディレクトリがありません: $repository"
+repository="$(cd "$repository" && pwd -P)"
+if [[ -z "$name" ]]; then
+  # hc の名前は a-z 0-9 - _ の 1〜32 文字。
+  slug="$(basename "$repository" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_\n-' '-')"
+  name="orch-${slug}"
+  name="${name:0:32}"
+fi
+[[ "$name" =~ ^[a-z0-9_-]{1,32}$ ]] || die "名前は a-z 0-9 - _ の 1〜32 文字にしてください: $name"
+
+hc run --bg --name "$name" --cwd "$repository" claude-orchestrator "$instruction"
+printf '\n起動しました: %s（%s）\n' "$name" "$repository"
+printf '見る: Herdr app / スマホのサイドバー、または hc attach %s（Ctrl+\\ で離れる）\n' "$name"
+printf '最初の指示が送れていない場合は、hc read %s で画面（trust ダイアログなど）を確認してください。\n' "$name"

@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(hc-permission show:*)",
+      "Bash(hc-permission approve:*)",
+      "Bash(hc-permission deny:*)",
+      "Bash(hc-permission escalate:*)",
+      "Bash(hc-permission trust:*)",
+      "Bash(hc templates)",
+      "Bash(hc ls:*)",
+      "Bash(hc get:*)",
+      "Bash(hc read:*)",
+      "Bash(hc wait:*)",
+      "Bash(hc run:*)",
+      "Bash(hc send:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.local/bin/hc-permission\" hook-orchestrator",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
