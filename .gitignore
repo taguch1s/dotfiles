@@ -35,6 +35,8 @@
 !.gitignore
 !.gitkeep
 !/README.md
+!/AGENTS.md
+!/CLAUDE.md
 !/LICENSE
 
 # other
