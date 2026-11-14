@@ -123,7 +123,7 @@ hook は hc の外（`HC_TERMINAL_ID` がない）では何もしないので、
 ### 3. 監督役の起動
 
 ```bash
-hc-supervisor            # 監督役（supervisor）と watcher（supervisor-watch）を起動
+hc-supervisor            # 監督役（supervisor）と watcher（supervisor-watch）を起動。Herdr app のタブから実行する
 hc-supervisor status     # 状態を見る
 hc-supervisor stop       # 止める（ワーカーは止まらない）
 hc attach supervisor     # 端末から見る場合。Ctrl+\ で離れる（止まらない）
@@ -135,7 +135,8 @@ Herdr app の端末での貼り付けは **Ctrl+Shift+V**（または右クリ�
 
 ### 4. 使い方
 
-- 手動セッション: これまでどおり Herdr app やスマホで Claude Code を開くだけです。権限待ちになると、hook が判断できたものは自動で決まり、残りは監督役に届きます。
+- 監督役の表示: Herdr app は terminal のラベル `herdr.space` / `herdr.tab` でスペースとタブに配置します（文書化されていない仕組みを実機で確認）。`hc-supervisor` を Herdr app のタブから実行すると、そのスペースに「supervisor」タブとして出し、左下の Agents にも watcher と一緒に並びます。Herdr app の外から起動した場合は表示されないので、`hc attach supervisor` で見るか、Herdr app のタブで `hc-supervisor stop` → `hc-supervisor` で起動し直します。
+- 手動セッション: これまでどおり Herdr app で横に新しいタブを開き、Claude Code に実装を頼むだけです。権限待ちになると、無害なものは hook が自動で許可し、判断が要るものは監督役に届き、迷うものは監督役のタブで「【確認】…」としてあなたに質問が出ます。危険ルールに当たるものと、sandbox のネットワーク許可は、そのタブのダイアログにあなたが答えます。`~` で開くと毎回フォルダ信頼のダイアログが出るので、リポジトリや worktree のディレクトリで開きます。
 - ワーカーを頼む: Herdr app かスマホで `supervisor` を開き、「~/mlbot-dev の Issue #12 と #13 を /issue-development-workflow で PR 作成まで進めて」のように頼みます。監督役は `role=worker` のワーカーを `--outlive-parent` で起動し、結果を確かめて報告します。
 
 ## 外出先から操作する

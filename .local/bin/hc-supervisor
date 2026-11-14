@@ -43,6 +43,27 @@ sys.exit(1 if isinstance(data, dict) and data.get("state") == "finished" else 0)
 ' "$json"
 }
 
+# Herdr app は terminal のラベル herdr.space / herdr.tab でスペースとタブに配置する（実機 2026-11-14、
+# 文書化されていない）。Herdr app のタブから起動したときは、そのスペースの新しいタブに監督役を出す。
+show_in_herdr_app() {
+  [[ -n "${HC_TERMINAL_ID:-}" ]] || return 0
+  local self space tab
+  self="$(hc get "$HC_TERMINAL_ID" --json 2>/dev/null)" || return 0
+  space="$(python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+    sys.exit(0)
+labels = data.get("labels") if isinstance(data, dict) else None
+print((labels or {}).get("herdr.space", "") if isinstance(labels, dict) else "")
+' "$self")"
+  [[ -n "$space" ]] || return 0
+  tab="tb$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  hc label "$name" "herdr.space=$space" "herdr.tab=$tab" "where=supervisor" >/dev/null \
+    && printf 'Herdr app のこのスペースにタブとして表示します: %s\n' "$name"
+}
+
 command="start"
 if (($#)) && [[ "$1" != -* ]]; then
   command="$1"
@@ -132,6 +153,7 @@ else
     claude-supervisor '監督を開始してください。' || true
   exists "$name" || die "監督役を起動できませんでした（hc ls で確認してください）"
   printf '起動しました: %s\n' "$name"
+  show_in_herdr_app
 fi
 
 if exists "$watch_name"; then

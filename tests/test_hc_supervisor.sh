@@ -11,13 +11,17 @@ trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/bin" "$fixture/live" "$fixture/home"
 export MOCK_HC_DIR="$fixture" PATH="$fixture/bin:$PATH" HOME="$fixture/home"
 export HC_SUPERVISOR_CLAUDE_SETTINGS="$fixture/settings.json"
-unset XDG_DATA_HOME
+unset XDG_DATA_HOME HC_TERMINAL_ID
 cat >"$fixture/bin/hc" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 (IFS=$'\x1f'; printf '%s\n' "$*") >>"$MOCK_HC_DIR/hc.log"
 case "$1" in
   get)
+    if [[ "$2" == self ]]; then
+      echo '{"address":"t1","state":"live","labels":{"herdr.space":"spABC","herdr.tab":"tbOLD"}}'
+      exit 0
+    fi
     [[ -f "$MOCK_HC_DIR/live/$2" ]] || { echo '{"error":{"kind":"not_found"}}' >&2; exit 3; }
     printf '{"address":"t1","name":"%s","state":"%s"}\n' "$2" "$(<"$MOCK_HC_DIR/live/$2")"
     ;;
@@ -29,6 +33,7 @@ case "$1" in
     done
     ;;
   kill) rm -f "$MOCK_HC_DIR/live/$2" ;;
+  label) ;;
   *) echo "unexpected hc command: $*" >&2; exit 1 ;;
 esac
 EOF
@@ -75,6 +80,21 @@ echo finished >"$fixture/live/supervisor"
 reset
 "$launcher" >/dev/null 2>&1
 [[ "$(runs)" == "$expected_supervisor" ]] && ok 'start: 終了済みの監督役は無いものとみなす' || ng "終了済みの扱いが違う: $(runs)"
+
+rm -f "$fixture/live/"*
+reset
+"$launcher" >/dev/null 2>&1
+grep -q $'^label' "$fixture/hc.log" && ng 'Herdr app の外から起動したのにラベルを付けた' || ok 'start: Herdr app の外ではタブのラベルを付けない'
+
+rm -f "$fixture/live/"*
+reset
+HC_TERMINAL_ID=self "$launcher" >/dev/null 2>&1
+label_line="$(grep $'^label' "$fixture/hc.log" | tr '\037' ' ')"
+if [[ "$label_line" =~ ^label\ supervisor\ herdr\.space=spABC\ herdr\.tab=tb[0-9a-f]{32}\ where=supervisor$ ]]; then
+  ok 'start: Herdr app のタブから起動すると、同じスペースの新しいタブに出すラベルを付ける'
+else
+  ng "タブのラベルが違う: $label_line"
+fi
 
 reset
 "$launcher" stop >/dev/null
