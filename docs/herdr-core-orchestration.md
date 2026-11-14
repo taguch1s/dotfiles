@@ -184,6 +184,7 @@ Tailscale SSH で WSL に入り、`hc attach supervisor` で同じ terminal を�
   - `hc-supervisor` で監督役（`role=supervisor`、親なし）と watcher（監督役の子）が起動する
   - Claude Code の trust ダイアログは `❯ No, exit` / `Yes, I trust this folder` で、No が既定。`hc-permission trust` は ↓ で Yes に動かし、画面で確かめてから Enter を送る
   - 初回の trust ダイアログ中は `hc run` が最初の依頼文を届けられず待つ（`first_message.sent: false`）。`hc-supervisor` は `--timeout 20` で待ちを切り上げる
+- 端から端まで実機で確認済み（2026-11-14）: 手動で開いたセッションの WebFetch が権限待ちになる → hook が保留要求を保存 → watcher が監督役へ通知 → 監督役が `hc-permission show` / `approve` で承認 → セッションの WebFetch が成功、`decisions.jsonl` に記録。
 - 次の点は実機確認が必要です。実装はどれも形が違っても動くよう寛容にしてありますが、前提が外れていれば直します。
   - `hc events --json` の 1 行の形（watcher はアドレスらしい値を拾い、拾えなければ `hc ls --json` で全体を見直す）
   - 権限ダイアログの選択肢の形（`❯ 1. Yes` と番号なしの `❯ Yes` の両方を受け付ける）
