@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
-# herdr-core 上に監督役の Claude Code と、権限待ちを監督役へ知らせる watcher を常駐させる。
+# herdr-core 上に監督役の Claude Code を常駐させる。dev ディストリでだけ動く（hc-claude と同じ判定）。
 # Herdr app・スマホ・端末のどこからでも同じ 1 行で使う。全体像は docs/herdr-core-orchestration.md
 set -euo pipefail
 
 name=supervisor
-watch_name=supervisor-watch
-claude_settings="${HC_SUPERVISOR_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+role_file="${HC_CLAUDE_ROLE_FILE:-/etc/dotfiles-role}"
 
 usage() {
   cat <<'EOF'
 Usage: hc-supervisor [start] [--cwd DIR]
        hc-supervisor status | stop
 
-start   監督役（名前 supervisor、ラベル role=supervisor）と watcher（supervisor-watch）を起動する。
-        既に監督役がいれば起動せず、watcher が欠けていれば watcher だけ起動する。
+start   監督役（名前 supervisor、ラベル role=supervisor）を起動する。既に監督役がいれば起動しない。
         --cwd の既定は ~/.local/share/hc-supervisor（$HOME はフォルダ信頼が保存されず、
         起動のたびに trust ダイアログが出るため）。
-status  監督役と watcher の状態を表示する。
-stop    watcher と監督役を止める。監督役が起動したワーカーは止まらない（--outlive-parent）。
+status  監督役の状態を表示する。
+stop    監督役を止める。監督役が起動したワーカーは止まらない（--outlive-parent）。
 EOF
 }
 
@@ -93,21 +91,17 @@ command -v hc >/dev/null 2>&1 || die 'hc が PATH にありません（herdr-cor
 
 case "$command" in
   status)
-    for terminal in "$name" "$watch_name"; do
-      if exists "$terminal"; then
-        hc get "$terminal"
-      else
-        printf '%s: 起動していません\n' "$terminal"
-      fi
-    done
+    if exists "$name"; then
+      hc get "$name"
+    else
+      printf '%s: 起動していません\n' "$name"
+    fi
     exit 0
     ;;
   stop)
-    for terminal in "$watch_name" "$name"; do
-      if exists "$terminal"; then
-        hc kill "$terminal" >/dev/null && printf '止めました: %s\n' "$terminal"
-      fi
-    done
+    if exists "$name"; then
+      hc kill "$name" >/dev/null && printf '止めました: %s\n' "$name"
+    fi
     exit 0
     ;;
   start) ;;
@@ -117,31 +111,12 @@ case "$command" in
     ;;
 esac
 
-command -v hc-permission >/dev/null 2>&1 \
-  || die 'hc-permission が PATH にありません（dotfiles で make link を実行してください）'
-watcher="$(command -v hc-supervisor-watch)" \
-  || die 'hc-supervisor-watch が PATH にありません（dotfiles で make link を実行してください）'
+[[ "$(cat "$role_file" 2>/dev/null || true)" == dev ]] \
+  || die "dev ディストリでだけ起動します（$role_file が dev ではありません）。admin ではエージェントを動かしません。docs/wsl-dev-distro.md"
+command -v hc-claude >/dev/null 2>&1 \
+  || die 'hc-claude が PATH にありません（dotfiles で make link を実行してください）'
 [[ "$cwd" != "$default_cwd" ]] || mkdir -p "$cwd"
 [[ -d "$cwd" ]] || die "ディレクトリがありません: $cwd"
-
-has_permission_hook() {
-  python3 -c '
-import json, sys
-try:
-    settings = json.load(open(sys.argv[1], encoding="utf-8"))
-except (OSError, ValueError):
-    sys.exit(1)
-groups = (settings.get("hooks") or {}).get("PermissionRequest") or []
-commands = [h.get("command", "") for g in groups for h in (g.get("hooks") or [])]
-sys.exit(0 if any("hc-permission" in c and "hook-worker" in c for c in commands) else 1)
-' "$claude_settings"
-}
-
-if ! has_permission_hook; then
-  printf '注意: %s に PermissionRequest hook（hc-permission hook-worker）がありません。\n' "$claude_settings" >&2
-  printf '      手動で開いたセッションの権限確認は自動判定されず、すべて監督役かあなたに回ります。\n' >&2
-  printf '      追記手順: docs/herdr-core-orchestration.md の「~/.claude/settings.json への hook の追加」\n' >&2
-fi
 
 if exists "$name"; then
   printf '監督役は起動済みです: %s\n' "$name"
@@ -154,15 +129,6 @@ else
   exists "$name" || die "監督役を起動できませんでした（hc ls で確認してください）"
   printf '起動しました: %s\n' "$name"
   show_in_herdr_app
-fi
-
-if exists "$watch_name"; then
-  printf 'watcher は起動済みです: %s\n' "$watch_name"
-else
-  # 監督役の子にし、監督役が終われば一緒に終わるようにする。子の通知は監督役へ送らない。
-  hc run --bg --parent "$name" --no-notify --name "$watch_name" --label role=supervisor-watch --cwd "$cwd" \
-    "$watcher" "$name"
-  printf '起動しました: %s\n' "$watch_name"
 fi
 
 printf '見る: Herdr app / スマホのサイドバーの %s、または hc attach %s（Ctrl+\\ で離れる）\n' "$name" "$name"

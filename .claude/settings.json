@@ -63,18 +63,6 @@
         ]
       }
     ],
-    "PermissionRequest": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.local/bin/hc-permission hook-worker",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
     "Stop": [
       {
         "hooks": [

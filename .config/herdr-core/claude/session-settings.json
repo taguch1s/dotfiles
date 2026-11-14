@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "sandbox": {
+    "enabled": false
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.local/bin/hc-permission\" hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

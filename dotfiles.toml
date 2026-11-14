@@ -35,7 +35,7 @@ mode = "link"
 executable = true
 
 [[config]]
-name = "herdr-core 権限判断ヘルパー（hook とポリシー）"
+name = "herdr-core 事故よけ hook（PreToolUse）"
 source = ".local/bin/hc-permission"
 target = ".local/bin/hc-permission"
 mode = "link"
@@ -49,9 +49,9 @@ mode = "link"
 executable = true
 
 [[config]]
-name = "herdr-core 監督役へ権限待ちを知らせる watcher"
-source = ".local/bin/hc-supervisor-watch"
-target = ".local/bin/hc-supervisor-watch"
+name = "herdr-core の Claude Code 起動（dev ディストリでだけ権限確認なし）"
+source = ".local/bin/hc-claude"
+target = ".local/bin/hc-claude"
 mode = "link"
 executable = true
 
@@ -68,21 +68,15 @@ target = ".config/herdr-core/templates/claude-worker.md"
 mode = "link"
 
 [[config]]
-name = "herdr-core 監督役の settings"
-source = ".config/herdr-core/claude/supervisor-settings.json"
-target = ".config/herdr-core/claude/supervisor-settings.json"
+name = "herdr-core の Claude Code settings（sandbox なし・bypassPermissions・事故よけ hook）"
+source = ".config/herdr-core/claude/session-settings.json"
+target = ".config/herdr-core/claude/session-settings.json"
 mode = "link"
 
 [[config]]
 name = "herdr-core 監督役のシステムプロンプト"
 source = ".config/herdr-core/claude/supervisor-prompt.md"
 target = ".config/herdr-core/claude/supervisor-prompt.md"
-mode = "link"
-
-[[config]]
-name = "herdr-core ワーカーの settings（sandbox の例外）"
-source = ".config/herdr-core/claude/worker-settings.json"
-target = ".config/herdr-core/claude/worker-settings.json"
 mode = "link"
 
 [[config]]

@@ -80,6 +80,13 @@ for mount_point in $mounts; do
   fi
 done
 
+if python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("skipDangerousModePermissionPrompt") is True else 1)' \
+  "$HOME/.claude/settings.json" 2>/dev/null; then
+  ok 'Claude Code: bypassPermissions の確認ダイアログを省く設定がある'
+else
+  ng "$HOME/.claude/settings.json に skipDangerousModePermissionPrompt: true がない（hc の起動が確認ダイアログで止まる）"
+fi
+
 if ((failures)); then
   printf '\n%d 件の NG があります。docs/wsl-dev-distro.md を確認してください。\n' "$failures"
   exit 1

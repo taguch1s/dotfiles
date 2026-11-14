@@ -46,6 +46,7 @@ wsl --terminate dev
   WSL 拡張は Windows 側の拡張ディレクトリにある `wslServer.sh` と、Windows 側に置いたサーバーの tarball を使うため、automount を切るとこの 2 つがないと接続できません。
 - 作業ユーザーから root になる手段を外す: `sudo`・`admin`・`docker`・`lxd` グループから外す、`/etc/sudoers.d` のユーザー個別の設定（`90-issei-nopasswd` など）を消す、root のパスワードをロックする（`su` 不可）。
 - Docker を止める（`docker.socket` など）。docker グループは root と同じ権限なので、dev では Docker を使いません。Docker が要る作業は admin で行います。
+- 作業ユーザーの `~/.claude/settings.json` に `skipDangerousModePermissionPrompt: true` を足す。hc 上のセッションは `bypassPermissions` で起動するため、初回の確認ダイアログで hc の起動が止まらないようにする（このキーは `--settings` からは効かない）。admin の設定には入れない。
 - 複製元と同じ `machine-id`・SSH ホスト鍵を作り直す。
 - Tailscale の複製されたノード情報を退避する（そのままだと admin と同じノードが 2 つになる）。
 

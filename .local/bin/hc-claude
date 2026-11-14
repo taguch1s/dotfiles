@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# hc 上の Claude Code（監督役・ワーカー）を起動する。hc のテンプレートから呼ぶ。
+# 権限確認なし（bypassPermissions・sandbox なし）で動かすので、境界になる dev ディストリ
+# （/etc/dotfiles-role が dev）でだけ起動し、それ以外（admin）では起動しない。
+# 全体像は docs/herdr-core-orchestration.md、dev の作り方は docs/wsl-dev-distro.md。
+set -euo pipefail
+
+role_file="${HC_CLAUDE_ROLE_FILE:-/etc/dotfiles-role}"
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-core/claude"
+
+die() {
+  printf 'hc-claude: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: hc-claude supervisor|worker [claude の引数...]
+
+役割のシステムプロンプトと hc 用の settings を付けて、claude を権限確認なしで起動する。
+dev ディストリ（/etc/dotfiles-role が dev）でだけ動く。
+EOF
+}
+
+role="${1:-}"
+case "$role" in
+  supervisor|worker) shift ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+distro_role="$(cat "$role_file" 2>/dev/null || true)"
+[[ "$distro_role" == dev ]] \
+  || die "dev ディストリでだけ起動します（$role_file が dev ではありません）。admin ではエージェントを動かしません。dev の作り方: docs/wsl-dev-distro.md"
+
+settings="$config_dir/session-settings.json"
+prompt="$config_dir/$role-prompt.md"
+[[ -f "$settings" && -f "$prompt" ]] || die "設定がありません: $settings / $prompt（dotfiles で make link を実行してください）"
+
+exec "${HC_CLAUDE_BIN:-claude}" --model opus --permission-mode bypassPermissions \
+  --settings "$settings" --append-system-prompt-file "$prompt" "$@"

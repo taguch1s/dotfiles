@@ -158,6 +158,24 @@ if compgen -G '/etc/ssh/ssh_host_*' >/dev/null; then
   echo 'SSH ホスト鍵を作り直しました'
 fi
 
+step 'Claude Code: bypassPermissions の確認ダイアログを出さない'
+# hc から起動するセッションは bypassPermissions で動く。初回に確認ダイアログが出ると hc の起動が止まるため、
+# ユーザー設定で省く（このキーは --settings からは効かない）。dev の手元の設定だけに入れる。
+user_home="$(getent passwd "$user" | cut -d: -f6)"
+runuser -u "$user" -- python3 - "$user_home/.claude/settings.json" <<'PYEOF'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+if settings.get("skipDangerousModePermissionPrompt") is True:
+    print(f"設定済み: {path}")
+else:
+    settings["skipDangerousModePermissionPrompt"] = True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"追加しました: {path}")
+PYEOF
+
 step 'Tailscale（複製されたノード情報を消す）'
 if command -v tailscale >/dev/null 2>&1; then
   systemctl stop tailscaled 2>/dev/null || true
