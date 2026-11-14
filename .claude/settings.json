@@ -29,6 +29,22 @@
           {
             "type": "command",
             "command": "~/.local/bin/awake-hook on"
+          },
+          {
+            "type": "command",
+            "command": "~/.local/bin/claude-context-guard",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.local/bin/claude-context-guard",
+            "timeout": 10
           }
         ]
       }

@@ -9,6 +9,7 @@ bash "$root/tests/test_hc_permission.sh"
 bash "$root/tests/test_hc_supervisor.sh"
 bash "$root/tests/test_hc_supervisor_watch.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_hc_permission_policy.py"
+PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_claude_context_guard.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/.bin/test-herdr-codex-status.py"
 git -C "$root" diff --check
 

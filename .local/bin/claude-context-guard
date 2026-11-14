@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Claude Code hook: 直近リクエストの文脈が閾値を超えたら handoff を促す。
+
+UserPromptSubmit / PostToolUse で呼ばれ、stdin の JSON から transcript_path を読む。
+文脈サイズは、トランスクリプトの最後の assistant 行の usage の
+input + cache 作成 + cache 読み込み とする。
+
+- 閾値: 環境変数 CLAUDE_CTX_GUARD_TOKENS（既定 150000）を超えたら警告する
+- 再警告: 最後に警告した値から CLAUDE_CTX_GUARD_INTERVAL（既定 50000）増えるまで黙る
+- 状態: CLAUDE_CTX_GUARD_STATE_DIR（既定 ${XDG_STATE_HOME:-~/.local/state}/claude-context-guard）
+  にセッションごとのファイルで最後に警告した値を置く
+- 失敗しても exit 0 で何も出さない（hook がセッションを止めないように）
+"""
+
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+DEFAULT_THRESHOLD = 150_000
+DEFAULT_INTERVAL = 50_000
+SUPPORTED_EVENTS = {"UserPromptSubmit", "PostToolUse"}
+USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+CHUNK_SIZE = 256 * 1024
+MAX_TAIL_BYTES = 16 * 1024 * 1024
+
+
+def context_tokens(usage):
+    """usage から文脈サイズを返す。usage として読めなければ None。"""
+    if not isinstance(usage, dict) or not any(key in usage for key in USAGE_KEYS):
+        return None
+    total = 0
+    for key in USAGE_KEYS:
+        value = usage.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        total += value
+    return total
+
+
+def iter_lines_reversed(path, chunk_size=CHUNK_SIZE, limit=MAX_TAIL_BYTES):
+    """ファイル末尾から行を逆順に返す。巨大なトランスクリプトを全部は読まない。"""
+    with open(path, "rb") as stream:
+        position = stream.seek(0, os.SEEK_END)
+        consumed = 0
+        rest = b""
+        while position > 0 and consumed < limit:
+            size = min(chunk_size, position)
+            position -= size
+            stream.seek(position)
+            rest = stream.read(size) + rest
+            consumed += size
+            lines = rest.split(b"\n")
+            rest = lines[0]
+            yield from reversed(lines[1:])
+        if position == 0 and rest:
+            yield rest
+
+
+def last_context_tokens(transcript_path):
+    """最後の assistant 行（サイドチェーンと usage が 0 の行を除く）の文脈サイズ。"""
+    for raw in iter_lines_reversed(transcript_path):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain"):
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        tokens = context_tokens(message.get("usage"))
+        if tokens:
+            return tokens
+    return None
+
+
+def positive_int(env, name, default):
+    try:
+        value = int(env.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def state_dir(env):
+    if env.get("CLAUDE_CTX_GUARD_STATE_DIR"):
+        return Path(env["CLAUDE_CTX_GUARD_STATE_DIR"])
+    base = env.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "claude-context-guard"
+
+
+def read_state(path):
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def write_state(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(f"{value}\n")
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def decide(current, threshold, interval, last_warned):
+    """(警告するか, 保存する値) を返す。保存する値が None なら状態を消す。"""
+    if current <= threshold:
+        return False, None
+    if last_warned is None or current >= last_warned + interval:
+        return True, current
+    # /compact などで文脈が減ったら、その値から interval 増えたときに知らせる。
+    return False, min(current, last_warned)
+
+
+def warning_text(current, threshold):
+    return (
+        f"[claude-context-guard] 直近リクエストの文脈が {current:,} トークンで、"
+        f"閾値 {threshold:,} を超えました。新しい作業単位を始めず、"
+        "進行中の操作を安全な区切りまで終えたら `/session-handoff` で handoff を保存してください。"
+    )
+
+
+def run(stdin_text, env):
+    """hook の出力（JSON 文字列）を返す。何も出さないときは空文字列。"""
+    payload = json.loads(stdin_text)
+    if not isinstance(payload, dict):
+        return ""
+    event = payload.get("hook_event_name")
+    session_id = payload.get("session_id")
+    transcript = payload.get("transcript_path")
+    if event not in SUPPORTED_EVENTS or payload.get("agent_id"):
+        return ""
+    if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id):
+        return ""
+    if not isinstance(transcript, str) or not transcript:
+        return ""
+
+    current = last_context_tokens(transcript)
+    if current is None:
+        return ""
+    threshold = positive_int(env, "CLAUDE_CTX_GUARD_TOKENS", DEFAULT_THRESHOLD)
+    interval = positive_int(env, "CLAUDE_CTX_GUARD_INTERVAL", DEFAULT_INTERVAL)
+    path = state_dir(env) / session_id
+    last_warned = read_state(path)
+    warn, new_state = decide(current, threshold, interval, last_warned)
+
+    if new_state is None:
+        if last_warned is not None:
+            path.unlink(missing_ok=True)
+    elif new_state != last_warned:
+        # 保存できないと毎回警告してしまうので、保存に失敗したら警告しない（例外で抜ける）。
+        write_state(path, new_state)
+    if not warn:
+        return ""
+    output = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": warning_text(current, threshold)}}
+    return json.dumps(output, ensure_ascii=False)
+
+
+def main():
+    try:
+        output = run(sys.stdin.read(), os.environ)
+    except Exception:
+        return 0
+    if output:
+        try:
+            sys.stdout.write(output + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

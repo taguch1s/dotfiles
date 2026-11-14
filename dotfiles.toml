@@ -247,6 +247,13 @@ source = ".claude/settings.json"
 target = ".claude/settings.json"
 mode = "copy-if-missing"
 
+[[config]]
+name = "Claude 文脈予算 hook"
+source = ".local/bin/claude-context-guard"
+target = ".local/bin/claude-context-guard"
+mode = "link"
+executable = true
+
 # Claude Code は ~/.claude/skills を読むため、同じ source を両方へリンクする。
 # codex-conversation-audit は ~/.codex のログに依存するので Claude へは配置しない。
 
