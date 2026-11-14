@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""Claude Code のトランスクリプトから、セッションごとのトークン効率指標（L0〜L2）を集計する。
+
+- L0: トークン種類別の合計と、重み付きコスト（input 換算のトークン数）。
+- L1: リクエスト数、文脈サイズ（平均・最大・最後・十分位の推移）、家賃率
+  （cache 読み込みの重み付きコスト ÷ 総コスト）、再読倍率
+  （cache 読み込み ÷ (input + cache 作成)）、文脈の急減（compact / clear の痕跡）。
+- L2: 200 バイト以上のツール結果ごとに、直前 400kB までのツール結果履歴に対する
+  条件付き圧縮長（lzma preset=1）を「新しい情報量」とみなし、新情報率を出す。
+  粗い近似なので、絶対値ではなく同じ方法で測った値どうしの比較に使う。
+
+集計の単位（scope）は main（本体）、sidechain（本体ファイル内の isSidechain 行）、
+subagents（<session>/subagents/*.jsonl）と、それらを合わせた total。
+assistant 行は 1 リクエストが複数行に分かれるので requestId で重複を除く（後の行を採用）。
+
+重みは既定値 < 設定ファイル < --weights の順に上書きする。
+  設定ファイル: ${XDG_CONFIG_HOME:-~/.config}/claude-token-metrics/weights.json
+  形式: {"weights": {"input": 1, "cache_creation_5m": 1.25, ...}}（一部のキーだけでよい。
+  "weights" 以外のキーは無視するので、推定の根拠などを併記してよい）
+
+使い方:
+  claude-token-metrics session [--weights k=v,...] <transcript.jsonl>   1 行の JSON を出す
+  claude-token-metrics record [--foreground]   SessionEnd hook 用（stdin の JSON を読む）
+  claude-token-metrics report [--since YYYY-MM-DD] [--json]
+記録先: ${XDG_DATA_HOME:-~/.local/share}/claude-token-metrics/sessions.jsonl
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import lzma
+import math
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+SCHEMA = "claude-token-metrics/v1"
+DEFAULT_WEIGHTS = {"input": 1, "cache_creation_5m": 1.25, "cache_creation_1h": 2,
+                   "cache_read": 0.1, "output": 5}
+TOKEN_KEYS = ("input", "cache_creation_5m", "cache_creation_1h", "cache_read", "output", "thinking")
+
+WINDOW_BYTES = 400_000  # 新情報率の条件にするツール結果履歴の窓幅
+MIN_BYTES = 200  # これより短いツール結果は新情報率を測らない（履歴には入れる）
+LOW_RATE = 0.05  # 新情報率がこれ未満のツール呼び出しを low_new_info に挙げる
+LOW_LIMIT = 20
+DROP_RATIO = 0.5  # 文脈がこの割合未満に減り、かつ
+DROP_MIN_TOKENS = 1000  # この数以上減ったら急減とみなす
+SYNTHETIC_MODEL = "<synthetic>"
+LZMA_FILTERS = [{"id": lzma.FILTER_LZMA2, "preset": 1}]
+ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+
+
+# ---- 設定と保存先 ----------------------------------------------------------
+
+def config_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "claude-token-metrics" / "weights.json"
+
+
+def data_dir() -> Path:
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "claude-token-metrics"
+
+
+def sessions_path() -> Path:
+    return data_dir() / "sessions.jsonl"
+
+
+def _weight_value(key: object, value: object) -> float:
+    if key not in DEFAULT_WEIGHTS:
+        raise ValueError(f"未知の重み: {key}（{', '.join(DEFAULT_WEIGHTS)} のいずれか）")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"重み {key} は 0 以上の数値にしてください: {value!r}")
+    return value
+
+
+def parse_weights_arg(text: str) -> dict:
+    """`input=1,output=5` 形式の --weights を辞書にする。"""
+    result = {}
+    for item in filter(None, (part.strip() for part in text.split(","))):
+        key, sep, raw = item.partition("=")
+        if not sep:
+            raise ValueError(f"--weights は key=value の形で指定してください: {item}")
+        try:
+            value = float(raw)
+        except ValueError:
+            raise ValueError(f"重み {key} は 0 以上の数値にしてください: {raw!r}") from None
+        result[key.strip()] = _weight_value(key.strip(), value)
+    return result
+
+
+def load_weights(cli_value: str | None = None, path: Path | None = None) -> tuple[dict, str]:
+    """重みを既定値 < 設定ファイル < --weights の順で決め、(重み, 出所) を返す。"""
+    weights, source = dict(DEFAULT_WEIGHTS), "default"
+    path = config_path() if path is None else path
+    if path.is_file():
+        data = json.loads(path.read_text())
+        overrides = data.get("weights") if isinstance(data, dict) else None
+        if not isinstance(overrides, dict):
+            raise ValueError(f"{path}: {{\"weights\": {{...}}}} の形にしてください")
+        weights.update({key: _weight_value(key, value) for key, value in overrides.items()})
+        source = str(path)
+    if cli_value:
+        weights.update(parse_weights_arg(cli_value))
+        source = "--weights"
+    return weights, source
+
+
+# ---- 新情報量 -------------------------------------------------------------
+
+def compressed_size(data: bytes) -> int:
+    if not data:
+        return 0
+    return len(lzma.compress(data, format=lzma.FORMAT_RAW, filters=LZMA_FILTERS))
+
+
+class ToolHistory:
+    """直前 window バイトまでのツール結果を条件にした、条件付き圧縮長を求める。"""
+
+    def __init__(self, window: int = WINDOW_BYTES):
+        self.window = window
+        self.buffer = b""
+        self._size: int | None = 0  # compressed_size(self.buffer) のキャッシュ
+
+    def novel_bytes(self, data: bytes) -> int:
+        base = compressed_size(self.buffer) if self._size is None else self._size
+        joint = compressed_size(self.buffer + data)
+        self.add(data, joint)
+        return max(0, joint - base)
+
+    def add(self, data: bytes, joint: int | None = None) -> None:
+        combined = self.buffer + data
+        self.buffer = combined[-self.window:]
+        self._size = joint if joint is not None and len(combined) <= self.window else None
+
+
+def command_key(name: str, tool_input: object) -> str:
+    """低新情報率の一覧をまとめるキー。Bash はコマンドの先頭語（環境変数の代入は飛ばす）。"""
+    if name != "Bash" or not isinstance(tool_input, dict):
+        return name
+    for word in str(tool_input.get("command", "")).split():
+        if not ENV_ASSIGNMENT.fullmatch(word):
+            return f"Bash:{os.path.basename(word) or word}"
+    return "Bash"
+
+
+# ---- トランスクリプトの読み込み -----------------------------------------------
+
+def _number(value: object) -> int | float:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def normalize_usage(usage: dict, model: str) -> dict:
+    cache_creation = _number(usage.get("cache_creation_input_tokens"))
+    detail = usage.get("cache_creation")
+    one_hour = _number(detail.get("ephemeral_1h_input_tokens")) if isinstance(detail, dict) else 0
+    one_hour = min(one_hour, cache_creation)  # 内訳がなければ全量を 5m とみなす
+    output_detail = usage.get("output_tokens_details")
+    request = {
+        "model": model,
+        "input": _number(usage.get("input_tokens")),
+        "cache_creation_5m": cache_creation - one_hour,
+        "cache_creation_1h": one_hour,
+        "cache_read": _number(usage.get("cache_read_input_tokens")),
+        "output": _number(usage.get("output_tokens")),
+        "thinking": _number(output_detail.get("thinking_tokens")) if isinstance(output_detail, dict) else 0,
+    }
+    request["context"] = request["input"] + cache_creation + request["cache_read"]
+    return request
+
+
+def result_bytes(content: object) -> bytes:
+    if isinstance(content, str):
+        return content.encode()
+    if isinstance(content, list):
+        texts = [item.get("text", "") for item in content
+                 if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)]
+        return "\n".join(texts).encode()
+    return b""
+
+
+class Stream:
+    """1 つの会話の流れ（本体、本体内の sidechain、サブエージェントの 1 ファイル）。"""
+
+    def __init__(self, tools: dict):
+        self.requests: list[dict] = []
+        self.request_index: dict[str, int] = {}
+        self.tool_results: list[tuple[str, bytes]] = []
+        self.compact_boundaries = 0
+        self.tools = tools  # tool_use_id -> (name, input)。同じファイル内で共有する
+
+
+class Transcript:
+    def __init__(self):
+        self.skipped = {"broken_lines": 0, "no_usage": 0, "synthetic": 0}
+        self.versions: set[str] = set()
+        self.version: str | None = None
+        self.session_id: str | None = None
+        self.timestamps: list[str] = []
+
+    def read(self, path: Path, *, split_sidechain: bool) -> tuple[Stream, Stream]:
+        """1 ファイルを読み、(本体, sidechain) の Stream を返す。split しないときは本体だけに入れる。"""
+        tools: dict = {}
+        main, side = Stream(tools), Stream(tools)
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                if not raw.strip():
+                    continue
+                try:
+                    line = json.loads(raw)
+                except json.JSONDecodeError:
+                    line = None
+                if not isinstance(line, dict):
+                    self.skipped["broken_lines"] += 1
+                    continue
+                self._meta(line, record_session=split_sidechain)
+                stream = side if split_sidechain and line.get("isSidechain") else main
+                self._line(line, stream, tools)
+        return main, side
+
+    def _meta(self, line: dict, *, record_session: bool) -> None:
+        if isinstance(line.get("version"), str):
+            self.versions.add(line["version"])
+            if record_session:
+                self.version = line["version"]
+        if record_session:
+            if self.session_id is None and isinstance(line.get("sessionId"), str):
+                self.session_id = line["sessionId"]
+            if isinstance(line.get("timestamp"), str):
+                self.timestamps.append(line["timestamp"])
+
+    def _line(self, line: dict, stream: Stream, tools: dict) -> None:
+        kind, message = line.get("type"), line.get("message")
+        message = message if isinstance(message, dict) else {}
+        content = message.get("content")
+        blocks = [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
+        if kind == "system" and line.get("subtype") == "compact_boundary":
+            stream.compact_boundaries += 1
+        elif kind == "assistant":
+            for block in blocks:
+                if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                    tools[block["id"]] = (str(block.get("name", "unknown")), block.get("input"))
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                self.skipped["no_usage"] += 1
+                return
+            model = str(message.get("model", "unknown"))
+            if model == SYNTHETIC_MODEL:
+                self.skipped["synthetic"] += 1  # API を呼んでいない合成メッセージ（中断・エラー表示など）
+                return
+            request = normalize_usage(usage, model)
+            key = line.get("requestId") or message.get("id")
+            if isinstance(key, str) and key in stream.request_index:
+                stream.requests[stream.request_index[key]] = request  # 同じリクエストは後の行を採用する
+                return
+            if isinstance(key, str):
+                stream.request_index[key] = len(stream.requests)
+            stream.requests.append(request)
+        elif kind == "user":
+            for block in blocks:
+                if block.get("type") == "tool_result":
+                    stream.tool_results.append((str(block.get("tool_use_id", "")),
+                                                result_bytes(block.get("content"))))
+
+
+# ---- 指標の計算 -------------------------------------------------------------
+
+def l0(requests: list[dict], weights: dict) -> dict:
+    tokens = {key: sum(request[key] for request in requests) for key in TOKEN_KEYS}
+    tokens["cache_creation"] = tokens["cache_creation_5m"] + tokens["cache_creation_1h"]
+    cost = sum(weight * tokens[key] for key, weight in weights.items())
+    return {"tokens": tokens, "weighted_cost": cost}
+
+
+def rates(tokens: dict, cost: float, weights: dict) -> tuple[float | None, float | None]:
+    """(家賃率, 再読倍率) を返す。"""
+    rent = weights["cache_read"] * tokens["cache_read"] / cost if cost else None
+    fresh = tokens["input"] + tokens["cache_creation"]
+    return rent, (tokens["cache_read"] / fresh if fresh else None)
+
+
+def l1(streams: list[Stream], base: dict, weights: dict) -> dict:
+    contexts, drops, index = [], [], 0
+    for stream in streams:
+        previous = None
+        for request in stream.requests:
+            current = request["context"]
+            if previous is not None and current < previous * DROP_RATIO and previous - current >= DROP_MIN_TOKENS:
+                drops.append({"request_index": index, "from": previous, "to": current})
+            contexts.append(current)
+            previous, index = current, index + 1
+    count = len(contexts)
+    deciles = []
+    for bucket in range(10):
+        part = contexts[bucket * count // 10:(bucket + 1) * count // 10]
+        deciles.append(sum(part) / len(part) if part else None)
+    rent, reread = rates(base["tokens"], base["weighted_cost"], weights)
+    return {
+        "requests": count,
+        "context": {"mean": sum(contexts) / count if count else None, "max": max(contexts, default=None),
+                    "last": contexts[-1] if contexts else None, "deciles": deciles},
+        "rent_rate": rent,
+        "reread_ratio": reread,
+        "drops": drops,
+        "drop_rule": {"ratio_below": DROP_RATIO, "min_tokens": DROP_MIN_TOKENS},
+        "compact_boundaries": sum(stream.compact_boundaries for stream in streams),
+    }
+
+
+def _rate(novel: int, raw: int) -> float | None:
+    return novel / raw if raw else None
+
+
+def _low_list(low: dict) -> list[dict]:
+    items = sorted(low.items(), key=lambda item: (-item[1]["raw_bytes"], item[0]))
+    return [{"key": key, **value} for key, value in items[:LOW_LIMIT]]
+
+
+def l2(streams: list[Stream]) -> dict:
+    by_tool: dict[str, dict] = {}
+    low: dict[str, dict] = {}
+    for stream in streams:
+        history = ToolHistory()
+        for tool_id, data in stream.tool_results:
+            if len(data) < MIN_BYTES:
+                history.add(data)
+                continue
+            novel = history.novel_bytes(data)
+            name, tool_input = stream.tools.get(tool_id, ("unknown", None))
+            entry = by_tool.setdefault(name, {"count": 0, "raw_bytes": 0, "novel_bytes": 0})
+            entry["count"] += 1
+            entry["raw_bytes"] += len(data)
+            entry["novel_bytes"] += novel
+            if novel / len(data) < LOW_RATE:
+                item = low.setdefault(command_key(name, tool_input), {"count": 0, "raw_bytes": 0, "novel_bytes": 0})
+                item["count"] += 1
+                item["raw_bytes"] += len(data)
+                item["novel_bytes"] += novel
+    for entry in by_tool.values():
+        entry["new_info_rate"] = _rate(entry["novel_bytes"], entry["raw_bytes"])
+    raw = sum(entry["raw_bytes"] for entry in by_tool.values())
+    novel = sum(entry["novel_bytes"] for entry in by_tool.values())
+    return {
+        "window_bytes": WINDOW_BYTES, "min_bytes": MIN_BYTES, "low_threshold": LOW_RATE,
+        "tool_results": sum(entry["count"] for entry in by_tool.values()),
+        "raw_bytes": raw, "novel_bytes": novel, "new_info_rate": _rate(novel, raw),
+        "by_tool": dict(sorted(by_tool.items())), "low_new_info": _low_list(low),
+    }
+
+
+def scope_metrics(streams: list[Stream], weights: dict) -> dict:
+    requests = [request for stream in streams for request in stream.requests]
+    base = l0(requests, weights)
+    by_model = {}
+    for model in sorted({request["model"] for request in requests}):
+        subset = [request for request in requests if request["model"] == model]
+        model_l0 = l0(subset, weights)
+        by_model[model] = {"requests": len(subset), **model_l0}
+    return {"L0": base, "L1": l1(streams, base, weights), "L2": l2(streams), "by_model": by_model}
+
+
+def total_metrics(scopes: list[dict], all_requests: list[dict], weights: dict) -> dict:
+    base = l0(all_requests, weights)
+    rent, reread = rates(base["tokens"], base["weighted_cost"], weights)
+    low: dict[str, dict] = {}
+    for scope in scopes:
+        for item in scope["L2"]["low_new_info"]:
+            merged = low.setdefault(item["key"], {"count": 0, "raw_bytes": 0, "novel_bytes": 0})
+            for key in merged:
+                merged[key] += item[key]
+    raw = sum(scope["L2"]["raw_bytes"] for scope in scopes)
+    novel = sum(scope["L2"]["novel_bytes"] for scope in scopes)
+    return {"requests": len(all_requests), **base, "rent_rate": rent, "reread_ratio": reread,
+            "tool_results": sum(scope["L2"]["tool_results"] for scope in scopes),
+            "raw_bytes": raw, "novel_bytes": novel, "new_info_rate": _rate(novel, raw),
+            "low_new_info": _low_list(low)}
+
+
+def session_metrics(transcript_path: str | Path, weights: dict, weights_source: str) -> dict:
+    """1 セッション分の指標を求める。出力の形は SCHEMA（claude-token-metrics/v1）。"""
+    path = Path(transcript_path)
+    transcript = Transcript()
+    main, side = transcript.read(path, split_sidechain=True)
+    files = sorted((path.parent / path.stem / "subagents").glob("*.jsonl"))
+    subagents = [transcript.read(file, split_sidechain=False)[0] for file in files]
+
+    scopes = {"main": scope_metrics([main], weights), "sidechain": scope_metrics([side], weights),
+              "subagents": {"files": len(files), **scope_metrics(subagents, weights)}}
+    all_requests = [request for stream in (main, side, *subagents) for request in stream.requests]
+    return {
+        "schema": SCHEMA,
+        "session_id": transcript.session_id or path.stem,
+        "transcript_path": str(path),
+        "version": transcript.version,
+        "versions": sorted(transcript.versions),
+        "started_at": min(transcript.timestamps, default=None),
+        "ended_at": max(transcript.timestamps, default=None),
+        "weights": weights,
+        "weights_source": weights_source,
+        "skipped": transcript.skipped,
+        **scopes,
+        "total": total_metrics(list(scopes.values()), all_requests, weights),
+    }
+
+
+# ---- サブコマンド -----------------------------------------------------------
+
+def command_session(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    try:
+        weights, source = load_weights(args.weights)
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
+    if not Path(args.transcript).is_file():
+        print(f"claude-token-metrics: トランスクリプトがありません: {args.transcript}", file=sys.stderr)
+        return 1
+    print(json.dumps(session_metrics(args.transcript, weights, source), ensure_ascii=False))
+    return 0
+
+
+def record_foreground(raw: str) -> None:
+    payload = json.loads(raw or "{}")
+    if not isinstance(payload, dict):
+        raise ValueError("hook の入力が JSON オブジェクトではありません")
+    transcript = payload.get("transcript_path")
+    if not isinstance(transcript, str) or not Path(transcript).is_file():
+        raise ValueError(f"transcript_path がありません: {transcript!r}")
+    weights, source = load_weights()
+    metrics = session_metrics(transcript, weights, source)
+    if isinstance(payload.get("session_id"), str):
+        metrics["session_id"] = payload["session_id"]
+    metrics.update({"recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                    "reason": payload.get("reason"), "cwd": payload.get("cwd")})
+    path = sessions_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(metrics, ensure_ascii=False) + "\n")
+
+
+def record_detached(raw: str) -> None:
+    """集計を切り離した子プロセスに任せ、hook はすぐ返す（セッションの終了を待たせない）。"""
+    log = data_dir() / "record.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a") as output:
+        child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "record", "--foreground"],
+                                 stdin=subprocess.PIPE, stdout=output, stderr=output,
+                                 start_new_session=True, text=True)
+    child.stdin.write(raw)
+    child.stdin.close()
+
+
+def command_record(args: argparse.Namespace) -> int:
+    # hook から呼ばれるので、どんな失敗でも exit 0 で返す。
+    try:
+        raw = sys.stdin.read()
+        (record_foreground if args.foreground else record_detached)(raw)
+    except Exception as error:  # noqa: BLE001 - セッションを妨げないため全て握りつぶす
+        stamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        print(f"{stamp} claude-token-metrics record: {error}", file=sys.stderr)
+    return 0
+
+
+def load_records(path: Path) -> list[dict]:
+    """sessions.jsonl を読み、同じ session_id は後に記録したものを採用する。"""
+    latest: dict[str, dict] = {}
+    if not path.is_file():
+        return []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get("session_id"), str):
+            latest.pop(record["session_id"], None)
+            latest[record["session_id"]] = record
+    return list(latest.values())
+
+
+def report_row(record: dict) -> dict:
+    total = record.get("total") or {}
+    context = ((record.get("main") or {}).get("L1") or {}).get("context") or {}
+    return {
+        "session_id": record["session_id"],
+        "started_at": record.get("started_at"),
+        "recorded_at": record.get("recorded_at"),
+        "cwd": record.get("cwd"),
+        "requests": total.get("requests"),
+        "weighted_cost": total.get("weighted_cost"),
+        "rent_rate": total.get("rent_rate"),
+        "context_max": context.get("max"),
+        "new_info_rate": total.get("new_info_rate"),
+        "low_new_info_top": [item.get("key") for item in (total.get("low_new_info") or [])[:3]],
+    }
+
+
+def _percent(value: object) -> str:
+    return f"{value * 100:.1f}%" if isinstance(value, (int, float)) else "-"
+
+
+def _count(value: object) -> str:
+    return f"{value:,.0f}" if isinstance(value, (int, float)) else "-"
+
+
+def command_report(args: argparse.Namespace) -> int:
+    rows = [report_row(record) for record in load_records(sessions_path())]
+    if args.since:
+        rows = [row for row in rows if (row["started_at"] or row["recorded_at"] or "")[:10] >= args.since]
+    rows.sort(key=lambda row: row["started_at"] or row["recorded_at"] or "")
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False))
+        return 0
+    header = ("started(UTC)", "session", "req", "cost", "rent", "ctx_max", "new_info", "low_new_info_top")
+    lines = [header]
+    for row in rows:
+        lines.append(((row["started_at"] or "-")[:16].replace("T", " "), row["session_id"][:8],
+                      _count(row["requests"]), _count(row["weighted_cost"]), _percent(row["rent_rate"]),
+                      _count(row["context_max"]), _percent(row["new_info_rate"]),
+                      ", ".join(row["low_new_info_top"]) or "-"))
+    widths = [max(len(line[column]) for line in lines) for column in range(len(header) - 1)]
+    for line in lines:
+        print("  ".join(cell.ljust(width) for cell, width in zip(line, widths)) + "  " + line[-1])
+    return 0
+
+
+def since_date(value: str) -> str:
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError
+        dt.date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"YYYY-MM-DD で指定してください: {value}") from None
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="claude-token-metrics", description=__doc__.splitlines()[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    session = commands.add_parser("session", help="1 セッションの指標を 1 行の JSON で出す")
+    session.add_argument("--weights", help="重みの上書き（例: input=1,output=5）")
+    session.add_argument("transcript")
+    record = commands.add_parser("record", help="SessionEnd hook 用。stdin の transcript_path を集計して追記する")
+    record.add_argument("--foreground", action="store_true", help="切り離さずにその場で集計する")
+    report = commands.add_parser("report", help="記録したセッションの一覧を出す")
+    report.add_argument("--since", type=since_date, help="この日（UTC）以降に始まったセッションだけ出す")
+    report.add_argument("--json", action="store_true", help="表ではなく JSON の配列で出す")
+    args = parser.parse_args(argv)
+    if args.command == "session":
+        return command_session(args, session)
+    if args.command == "record":
+        return command_record(args)
+    return command_report(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
