@@ -87,4 +87,13 @@ Update this one handoff at session start, after every Unit commit/review, before
 ## Next-session prompt
 ```
 
+## 権限と制約の書き方
+
+handoff は commit・merge・push・PR などの可否を決める正本ではない。可否はリポジトリの `AGENTS.md`（と、その回のユーザーの明示指示）で決まる。
+
+- 恒久的な可否（例: 「main へマージしてよい」）をユーザーから聞いたら、handoff だけに書かず、先にリポジトリの `AGENTS.md` へ保存する。handoff には「`AGENTS.md` の『commit と main への反映』に従う」と参照だけを書く。
+- 制約（「commit しない」「merge しない」など）を handoff に書くときは、出典（ユーザーの発言、日付、範囲）と解除条件を必ず添える。出典のない制約を書かない。エージェントの推測や慎重さから来る方針は、制約ではなく `Open questions` に「確認事項」として書く。
+- `Next-session prompt` に停止条件を書く場合も同じ。出典のない「commit はまだしない」のような禁止を prompt に入れない。
+- 再開時は、handoff の制約とリポジトリの `AGENTS.md` を突き合わせる。食い違えば `AGENTS.md` を優先し、handoff を直す。
+
 生ログ、長い diff、secret、token、個人情報は残さない。次セッション用 prompt には絶対 worktree path、handoff path、親 Issue / PR、最初に読む正本、最初の状態確認 command、現在 Unit の exact next action、停止条件を含める。保存後に path、Issue / PR、branch、commit、check 結果を実データと照合する。
