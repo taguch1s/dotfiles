@@ -70,6 +70,7 @@
 !/.local/bin/awake-keeper
 !/.local/bin/claude-context-guard
 !/.local/bin/claude-token-metrics
+!/.local/bin/claude-statusline
 !/.local/libexec/
 !/.local/libexec/agent-browser-guard.ps1
 !/.codex/

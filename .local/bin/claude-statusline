@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Claude Code の statusline。文脈サイズと Pro プランの使用率を 1 行で出し、使用率の変化を記録する。
+
+表示: `ctx 182k | 5h 54% | 7d 8%`
+- ctx: transcript_path の最後のリクエスト（本体、合成メッセージを除く）の
+  input + cache 作成 + cache 読み込み。claude-token-metrics の文脈サイズと同じ定義。
+- 5h / 7d: stdin の rate_limits.five_hour / seven_day の used_percentage。
+
+rate_limits の used_percentage が前回の記録から変わったときだけ、
+${XDG_DATA_HOME:-~/.local/share}/claude-token-metrics/ratelimit.jsonl に 1 行追記する。
+  {"ts": ..., "session_id": ..., "five_hour": {"used_percentage", "resets_at"}, "seven_day": {...}}
+`claude-token-metrics calibrate` がこの記録からトークン種類ごとの重みを推定する。
+
+statusline を壊さないため、どんな入力でも 1 行を出して exit 0 で終わる。
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import fcntl
+import json
+import math
+import os
+import sys
+from pathlib import Path
+
+SYNTHETIC_MODEL = "<synthetic>"
+TAIL_CHUNK = 256 * 1024  # トランスクリプトを末尾から読む単位
+TAIL_LIMIT = 16 * 1024 * 1024  # これより前は探さない（巨大なツール結果が続く場合の上限）
+WINDOWS = ("five_hour", "seven_day")
+
+
+def records_path() -> Path:
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "claude-token-metrics" / "ratelimit.jsonl"
+
+
+def _number(value: object) -> int | float:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def line_context(raw: bytes) -> int | None:
+    """assistant 行なら文脈サイズを返す。対象外の行は None。"""
+    if b'"usage"' not in raw:
+        return None
+    try:
+        line = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(line, dict) or line.get("type") != "assistant" or line.get("isSidechain"):
+        return None
+    message = line.get("message")
+    if not isinstance(message, dict) or message.get("model") == SYNTHETIC_MODEL:
+        return None
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    return (_number(usage.get("input_tokens")) + _number(usage.get("cache_creation_input_tokens"))
+            + _number(usage.get("cache_read_input_tokens")))
+
+
+def last_context(path: Path) -> int | None:
+    """トランスクリプトを末尾から読み、最後のリクエストの文脈サイズを返す。"""
+    with path.open("rb") as handle:
+        end = handle.seek(0, os.SEEK_END)
+        position, tail = end, b""
+        while position > 0 and end - position < TAIL_LIMIT:
+            step = min(TAIL_CHUNK, position)
+            position -= step
+            handle.seek(position)
+            tail = handle.read(step) + tail
+            lines = tail.split(b"\n")
+            # 先頭は行の途中かもしれないので、ファイルの先頭に達するまでは次の周回に回す。
+            complete = lines if position == 0 else lines[1:]
+            for raw in reversed(complete):
+                context = line_context(raw)
+                if context is not None:
+                    return context
+            tail = b"" if position == 0 else lines[0]
+    return None
+
+
+def snapshot(rate_limits: object) -> dict | None:
+    """記録する使用率。used_percentage が 1 つもなければ None。"""
+    if not isinstance(rate_limits, dict):
+        return None
+    result = {}
+    for key in WINDOWS:
+        window = rate_limits.get(key)
+        if isinstance(window, dict) and _is_number(window.get("used_percentage")):
+            result[key] = {"used_percentage": window["used_percentage"], "resets_at": window.get("resets_at")}
+        else:
+            result[key] = None
+    return result if any(result.values()) else None
+
+
+def _percentages(record: object) -> tuple | None:
+    if not isinstance(record, dict):
+        return None
+    windows = (record.get(key) for key in WINDOWS)
+    return tuple(window.get("used_percentage") if isinstance(window, dict) else None for window in windows)
+
+
+def last_record(handle) -> object:
+    end = handle.seek(0, os.SEEK_END)
+    handle.seek(max(0, end - 64 * 1024))
+    lines = [line for line in handle.read().split(b"\n") if line.strip()]
+    if not lines:
+        return None
+    try:
+        return json.loads(lines[-1])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def record(payload: dict, current: dict) -> None:
+    """使用率が前回の記録と違うときだけ追記する。複数セッションから同時に呼ばれるので排他する。"""
+    path = records_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        if _percentages(last_record(handle)) == _percentages(current):
+            return
+        entry = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"),
+                 "session_id": payload.get("session_id"), **current}
+        handle.seek(0, os.SEEK_END)
+        handle.write((json.dumps(entry, ensure_ascii=False) + "\n").encode())
+
+
+def format_tokens(value: int | None) -> str:
+    if value is None:
+        return "-"
+    if value < 1000:
+        return str(value)
+    if value < 1_000_000:
+        return f"{round(value / 1000)}k"
+    return f"{value / 1_000_000:.1f}M"
+
+
+def format_percent(window: dict | None) -> str:
+    return f"{window['used_percentage']:.0f}%" if window else "-"
+
+
+def render(payload: object) -> str:
+    payload = payload if isinstance(payload, dict) else {}
+    context = None
+    transcript = payload.get("transcript_path")
+    if isinstance(transcript, str) and transcript:
+        try:
+            context = last_context(Path(transcript))
+        except OSError:
+            context = None
+    current = snapshot(payload.get("rate_limits"))
+    if current is not None:
+        try:
+            record(payload, current)
+        except OSError as error:
+            print(f"claude-statusline: 記録できません: {error}", file=sys.stderr)
+    windows = current or {}
+    return f"ctx {format_tokens(context)} | 5h {format_percent(windows.get('five_hour'))}" \
+           f" | 7d {format_percent(windows.get('seven_day'))}"
+
+
+def main() -> int:
+    try:
+        raw = sys.stdin.read()
+        try:
+            payload = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            payload = {}
+        line = render(payload)
+    except Exception as error:  # noqa: BLE001 - statusline を壊さないため全て握りつぶす
+        print(f"claude-statusline: {error}", file=sys.stderr)
+        line = "ctx - | 5h - | 7d -"
+    print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

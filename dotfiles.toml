@@ -365,6 +365,13 @@ mode = "link"
 executable = true
 
 [[config]]
+name = "Claude statusline（文脈サイズと使用率の表示、使用率の記録）"
+source = ".local/bin/claude-statusline"
+target = ".local/bin/claude-statusline"
+mode = "link"
+executable = true
+
+[[config]]
 name = "スリープ抑止ループ"
 source = ".local/bin/awake-keeper"
 target = ".local/bin/awake-keeper"

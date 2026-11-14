@@ -22,12 +22,16 @@ assistant 行は 1 リクエストが複数行に分かれるので requestId �
   claude-token-metrics session [--weights k=v,...] <transcript.jsonl>   1 行の JSON を出す
   claude-token-metrics record [--foreground]   SessionEnd hook 用（stdin の JSON を読む）
   claude-token-metrics report [--since YYYY-MM-DD] [--json]
+  claude-token-metrics calibrate [--since YYYY-MM-DD] [--json] [--write]
+      claude-statusline が記録した使用率の変化から、トークン種類ごとの重みを推定する
 記録先: ${XDG_DATA_HOME:-~/.local/share}/claude-token-metrics/sessions.jsonl
+       ${XDG_DATA_HOME:-~/.local/share}/claude-token-metrics/ratelimit.jsonl（statusline が書く）
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime as dt
 import json
 import lzma
@@ -254,6 +258,7 @@ class Transcript:
                 return
             request = normalize_usage(usage, model)
             key = line.get("requestId") or message.get("id")
+            request.update(timestamp=line.get("timestamp"), request_id=key if isinstance(key, str) else None)
             if isinstance(key, str) and key in stream.request_index:
                 stream.requests[stream.request_index[key]] = request  # 同じリクエストは後の行を採用する
                 return
@@ -525,6 +530,342 @@ def command_report(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- 重みの推定（calibrate） --------------------------------------------------
+#
+# claude-statusline は rate_limits.five_hour.used_percentage が変わるたびに ratelimit.jsonl へ記録する。
+# 同じ resets_at を持つ連続した 2 つの記録の間を 1 区間とし、その区間に全プロジェクト
+# （サブエージェント込み）で発生したトークンを種類別に合計する。Δused_percentage を目的変数、
+# 種類別トークンを説明変数として切片なしの非負最小二乗で係数を求め、input を 1 とした相対値にする。
+
+CALIBRATE_SCHEMA = "claude-token-metrics/calibrate/v1"
+FEATURES = ("input", "cache_creation_5m", "cache_creation_1h", "cache_read", "output")
+MIN_INTERVALS = 30
+RESET_TOLERANCE = 60  # resets_at がこの秒数以内の差なら同じ 5 時間枠とみなす
+FAMILIES = ("opus", "sonnet", "haiku")
+CALIBRATE_NOTE = ("同じ枠を claude.ai web や他の端末で使った分はローカルのログに出ないため、"
+                  "推定のノイズになる。used_percentage の刻みが粗いほど 1 区間の誤差は大きい。")
+
+
+def ratelimit_path() -> Path:
+    return data_dir() / "ratelimit.jsonl"
+
+
+def projects_dir() -> Path:
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    return Path(base) / "projects"
+
+
+def epoch(value: object) -> float | None:
+    """ISO 8601 の文字列か Unix 時刻（秒またはミリ秒）を Unix 秒にする。読めなければ None。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        return number / 1000 if number > 1e12 else number
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return epoch(float(value))
+    except ValueError:
+        pass
+    try:
+        moment = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.timezone.utc)
+    return moment.timestamp()
+
+
+def load_ratelimit_records(path: Path, since: str | None = None) -> list[dict]:
+    """ratelimit.jsonl を読み、5 時間枠の使用率を持つ記録を時刻順に {ts, pct, reset} で返す。"""
+    records = []
+    if not path.is_file():
+        return records
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            line = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        window = line.get("five_hour") if isinstance(line, dict) else None
+        moment = epoch(line.get("ts")) if isinstance(line, dict) else None
+        if moment is None or not isinstance(window, dict):
+            continue
+        percent = window.get("used_percentage")
+        if isinstance(percent, bool) or not isinstance(percent, (int, float)) or not math.isfinite(percent):
+            continue
+        if since and dt.datetime.fromtimestamp(moment, dt.timezone.utc).date().isoformat() < since:
+            continue
+        records.append({"ts": moment, "pct": percent, "reset": epoch(window.get("resets_at"))})
+    records.sort(key=lambda record: record["ts"])
+    return records
+
+
+def build_intervals(records: list[dict], min_delta: float = 0) -> tuple[list[dict], dict]:
+    """同じ枠の連続した 2 記録を 1 区間にする。枠の切り替わりと使用率の減少は除く。
+
+    min_delta > 0 なら、同じ枠の中で Δ がその値以上になるまで連続した区間をつなげる
+    （used_percentage の刻みが粗いとき、1 区間あたりの丸め誤差を小さくするため）。"""
+    intervals, skipped = [], {"window_change": 0, "negative_delta": 0}
+    start = records[0] if records else None
+    for before, after in zip(records, records[1:]):
+        if before["reset"] is None or after["reset"] is None \
+                or abs(before["reset"] - after["reset"]) > RESET_TOLERANCE:
+            skipped["window_change"] += 1
+            start = after
+            continue
+        if after["pct"] < before["pct"]:
+            skipped["negative_delta"] += 1
+            start = after
+            continue
+        delta = after["pct"] - start["pct"]
+        if delta < min_delta:
+            continue
+        intervals.append({"start": start["ts"], "end": after["ts"], "delta": delta, "tokens": {}})
+        start = after
+    return intervals, skipped
+
+
+def model_family(model: str) -> str:
+    name = model.lower()
+    return next((family for family in FAMILIES if family in name), "other")
+
+
+def attribute_tokens(intervals: list[dict], projects: Path) -> dict:
+    """全トランスクリプトのリクエストを、時刻で区間に振り分けてモデル系統・種類別に足す。"""
+    counts = {"files": 0, "requests": 0, "duplicate_requests": 0}
+    if not intervals or not projects.is_dir():
+        return counts
+    first, last = intervals[0]["start"], intervals[-1]["end"]
+    ends = [interval["end"] for interval in intervals]
+    seen: set[str] = set()
+    for file in sorted(projects.rglob("*.jsonl")):
+        try:
+            if file.stat().st_mtime < first:
+                continue  # 最初の記録より前に書き終わったファイルには、区間内のリクエストがない
+            stream = Transcript().read(file, split_sidechain=False)[0]
+        except OSError:
+            continue
+        counts["files"] += 1
+        for request in stream.requests:
+            moment = epoch(request.get("timestamp"))
+            if moment is None or not first < moment <= last:
+                continue
+            key = request.get("request_id")
+            if key in seen:
+                counts["duplicate_requests"] += 1  # 再開したセッションなどで別ファイルに同じリクエストがある
+                continue
+            if key:
+                seen.add(key)
+            interval = intervals[bisect.bisect_left(ends, moment)]
+            if moment <= interval["start"]:
+                continue  # 区間に入らない（枠の切り替わりなどで除いた区間の中）
+            bucket = interval["tokens"].setdefault(model_family(request["model"]), dict.fromkeys(FEATURES, 0))
+            for feature in FEATURES:
+                bucket[feature] += request[feature]
+            counts["requests"] += 1
+    return counts
+
+
+def _solve(matrix: list[list[float]], vector: list[float]) -> list[float] | None:
+    """ガウスの消去法（部分ピボット）。特異なら None。"""
+    size = len(vector)
+    rows = [list(row) + [value] for row, value in zip(matrix, vector)]
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda index: abs(rows[index][column]))
+        if abs(rows[pivot][column]) < 1e-10:
+            return None
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        for index in range(column + 1, size):
+            factor = rows[index][column] / rows[column][column]
+            rows[index] = [a - factor * b for a, b in zip(rows[index], rows[column])]
+    solution = [0.0] * size
+    for index in reversed(range(size)):
+        known = sum(rows[index][j] * solution[j] for j in range(index + 1, size))
+        solution[index] = (rows[index][size] - known) / rows[index][index]
+    return solution
+
+
+def nnls(columns: list[list[float]], target: list[float]) -> list[float]:
+    """非負最小二乗。説明変数が高々 5 個なので、すべての台（部分集合）で最小二乗を解き、
+    係数が非負の解のうち残差が最小のものを選ぶ（NNLS の最適解は、その台での最小二乗解なので厳密）。"""
+    size = len(columns)
+    norms = [math.sqrt(sum(value * value for value in column)) for column in columns]
+    scaled = [[value / norm for value in column] if norm else column for column, norm in zip(columns, norms)]
+    gram = [[sum(a * b for a, b in zip(left, right)) for right in scaled] for left in scaled]
+    moment = [sum(a * b for a, b in zip(column, target)) for column in scaled]
+    total = sum(value * value for value in target)
+    best, best_residual = [0.0] * size, total
+    for mask in range(1, 1 << size):
+        support = [index for index in range(size) if mask >> index & 1]
+        if not all(norms[index] for index in support):
+            continue
+        solution = _solve([[gram[i][j] for j in support] for i in support], [moment[i] for i in support])
+        if solution is None or min(solution) < 0:
+            continue
+        residual = total - sum(value * moment[index] for value, index in zip(solution, support))
+        if residual < best_residual - 1e-12 * max(total, 1.0):
+            best_residual, best = residual, [0.0] * size
+            for value, index in zip(solution, support):
+                best[index] = value
+    return [value / norm if norm else 0.0 for value, norm in zip(best, norms)]
+
+
+def _significant(value: float) -> float:
+    return float(f"{value:.4g}")
+
+
+def fit_weights(rows: list[tuple[dict, float]], min_intervals: int) -> dict:
+    """区間ごとの (種類別トークン, Δ使用率) から重みを推定する。区間数が足りなければ推定しない。"""
+    result = {"status": "insufficient_data", "intervals": len(rows), "weights": None,
+              "percent_per_mtok": None, "r2": None}
+    if not rows or len(rows) < min_intervals:
+        return result
+    used = [feature for feature in FEATURES if any(tokens[feature] for tokens, _ in rows)]
+    target = [delta for _, delta in rows]
+    coefficients = dict(zip(used, nnls([[tokens[feature] for tokens, _ in rows] for feature in used], target)))
+    predicted = [sum(value * tokens[feature] for feature, value in coefficients.items()) for tokens, _ in rows]
+    mean = sum(target) / len(target)
+    spread = sum((value - mean) ** 2 for value in target)
+    residual = sum((value - guess) ** 2 for value, guess in zip(target, predicted))
+    base = coefficients.get("input", 0)
+    result.update(
+        status="ok",
+        weights={feature: _significant(coefficients[feature] / base) if feature in coefficients else None
+                 for feature in FEATURES} if base > 0 else None,
+        percent_per_mtok={feature: coefficients[feature] * 1e6 if feature in coefficients else None
+                          for feature in FEATURES},
+        r2=1 - residual / spread if spread else None,  # 切片なしだが、平均まわりの決定係数（保守的な値）
+    )
+    return result
+
+
+def calibrate(ratelimit: Path, projects: Path, since: str | None, min_intervals: int,
+              min_delta: float = 0) -> dict:
+    records = load_ratelimit_records(ratelimit, since)
+    intervals, skipped = build_intervals(records, min_delta)
+    counts = attribute_tokens(intervals, projects)
+    skipped.update(no_tokens=0, duplicate_requests=counts["duplicate_requests"])
+    rows, families = [], {}
+    for interval in intervals:
+        buckets = {family: tokens for family, tokens in interval["tokens"].items() if any(tokens.values())}
+        if not buckets:
+            skipped["no_tokens"] += 1  # ローカルで使っていない区間（他の端末の分）は情報を持たない
+            continue
+        rows.append(({feature: sum(tokens[feature] for tokens in buckets.values()) for feature in FEATURES},
+                     interval["delta"]))
+        # モデル系統別の推定には、その系統だけを使った区間を使う。
+        for family in buckets:
+            families.setdefault(family, [])
+        if len(buckets) == 1:
+            (family, tokens), = buckets.items()
+            families[family].append((tokens, interval["delta"]))
+    return {
+        "schema": CALIBRATE_SCHEMA,
+        **fit_weights(rows, min_intervals),
+        "min_intervals": min_intervals,
+        "min_delta": min_delta,
+        "records": len(records),
+        "since": since,
+        "files": counts["files"],
+        "requests": counts["requests"],
+        "skipped": skipped,
+        "by_model": {family: fit_weights(subset, min_intervals) for family, subset in sorted(families.items())},
+        "note": CALIBRATE_NOTE,
+    }
+
+
+def _weights_text(weights: dict) -> str:
+    return ", ".join(f"{key} {value:.4g}" for key, value in weights.items() if value is not None)
+
+
+def _fit_text(fit: dict, min_intervals: int) -> str:
+    if fit["status"] != "ok":
+        return f"データ不足: 区間 {fit['intervals']}（{min_intervals} 以上必要）。推定しません"
+    if not fit["weights"]:
+        return f"区間 {fit['intervals']}: input の係数が 0 のため、input = 1 の相対値を出せません"
+    r2 = "-" if fit["r2"] is None else f"{fit['r2']:.3f}"
+    return f"重み（input = 1）: {_weights_text(fit['weights'])}、決定係数 {r2}"
+
+
+def print_calibration(result: dict) -> None:
+    skipped = result["skipped"]
+    print(f"記録 {result['records']}、区間 {result['intervals']}（枠の切り替わり {skipped['window_change']}、"
+          f"使用率の減少 {skipped['negative_delta']}、ローカルのトークンなし {skipped['no_tokens']} を除外）、"
+          f"リクエスト {result['requests']}、ファイル {result['files']}")
+    print(_fit_text(result, result["min_intervals"]))
+    if result["status"] == "ok":
+        print(f"使用率（% / 100 万トークン）: {_weights_text(result['percent_per_mtok'])}")
+    for family, fit in result["by_model"].items():
+        print(f"  {family}: {_fit_text(fit, result['min_intervals'])}")
+    print(f"注意: {result['note']}")
+
+
+def write_calibration(result: dict, path: Path) -> None:
+    """推定した重みを設定ファイルに書く。"weights" 以外のキーは残し、推定の根拠を "calibration" に入れる。"""
+    if result["status"] != "ok" or not result["weights"]:
+        raise ValueError(f"データ不足（区間 {result['intervals']}）または input の係数が 0 のため、書き出しません")
+    data: dict = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            raise ValueError(f"{path} が JSON として読めないため、上書きしません") from None
+        data = loaded if isinstance(loaded, dict) else {}
+    data["weights"] = {key: value for key, value in result["weights"].items() if value is not None}
+    data["calibration"] = {
+        "source": "claude-token-metrics calibrate",
+        "estimated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "since": result["since"], "min_delta": result["min_delta"],
+        "intervals": result["intervals"], "r2": result["r2"],
+        "percent_per_mtok": result["percent_per_mtok"], "note": result["note"],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    os.replace(temporary, path)
+
+
+def command_calibrate(args: argparse.Namespace) -> int:
+    ratelimit = Path(args.ratelimit) if args.ratelimit else ratelimit_path()
+    projects = Path(args.projects) if args.projects else projects_dir()
+    result = calibrate(ratelimit, projects, args.since, args.min_intervals, args.min_delta)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print_calibration(result)
+    if args.write:
+        try:
+            write_calibration(result, config_path())
+        except (ValueError, OSError) as error:
+            print(f"claude-token-metrics: {error}", file=sys.stderr)
+            return 1
+        print(f"{config_path()} に重みを書き出しました", file=sys.stderr)
+    return 0
+
+
+def positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        number = 0
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"1 以上の整数で指定してください: {value}")
+    return number
+
+
+def non_negative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        number = -1.0
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError(f"0 以上の数値で指定してください: {value}")
+    return number
+
+
 def since_date(value: str) -> str:
     try:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
@@ -546,11 +887,26 @@ def main(argv: list[str] | None = None) -> int:
     report = commands.add_parser("report", help="記録したセッションの一覧を出す")
     report.add_argument("--since", type=since_date, help="この日（UTC）以降に始まったセッションだけ出す")
     report.add_argument("--json", action="store_true", help="表ではなく JSON の配列で出す")
+    calibrate_parser = commands.add_parser(
+        "calibrate", help="statusline が記録した使用率の変化から、トークン種類ごとの重みを推定する")
+    calibrate_parser.add_argument("--since", type=since_date, help="この日（UTC）以降の記録だけ使う")
+    calibrate_parser.add_argument("--min-intervals", type=positive_int, default=MIN_INTERVALS,
+                                  help=f"推定に必要な区間数（既定 {MIN_INTERVALS}）")
+    calibrate_parser.add_argument("--min-delta", type=non_negative_float, default=0,
+                                  help="同じ枠の中で Δ使用率がこの値以上になるまで区間をつなげる"
+                                       "（刻みが粗いときの丸め誤差対策。既定 0 = 連続した 2 記録ごと）")
+    calibrate_parser.add_argument("--json", action="store_true", help="結果を JSON で出す")
+    calibrate_parser.add_argument("--write", action="store_true",
+                                  help="推定した重みで設定ファイル（weights.json）の weights を置き換える（既定では書かない）")
+    calibrate_parser.add_argument("--ratelimit", help="使用率の記録（既定: <データ>/ratelimit.jsonl）")
+    calibrate_parser.add_argument("--projects", help="トランスクリプトの場所（既定: ~/.claude/projects）")
     args = parser.parse_args(argv)
     if args.command == "session":
         return command_session(args, session)
     if args.command == "record":
         return command_record(args)
+    if args.command == "calibrate":
+        return command_calibrate(args)
     return command_report(args)
 
 
