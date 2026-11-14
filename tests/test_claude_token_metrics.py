@@ -3,8 +3,10 @@
 トランスクリプトは合成 fixture を一時ディレクトリに書き出して使う。
 """
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import random
@@ -295,6 +297,256 @@ class HookSettingsTest(unittest.TestCase):
         matches = [hook for hook in hooks if "claude-token-metrics record" in hook["command"]]
         self.assertEqual(len(matches), 1)
         self.assertGreater(matches[0].get("timeout", 0), 0)
+
+
+# ---- calibrate --------------------------------------------------------------
+
+# 合成データの「真の」重み（input = 1 の相対値）。既定値と違う値にして、既定値を返していないことも確かめる。
+TRUE_WEIGHTS = {"input": 1.0, "cache_creation_5m": 1.5, "cache_creation_1h": 2.5, "cache_read": 0.08, "output": 4.0}
+PERCENT_PER_INPUT = 4e-6  # input 1 トークンあたりの使用率（%）
+T0 = 1_750_000_000.0  # 2025-06-15。ファイルの mtime より十分前にする
+WINDOW = 5 * 3600
+
+
+def iso(epoch, *, z=False):
+    text = METRICS.dt.datetime.fromtimestamp(epoch, METRICS.dt.timezone.utc).isoformat(timespec="milliseconds")
+    return text.replace("+00:00", "Z") if z else text
+
+
+def calibration_request(request_id, epoch, model, tokens):
+    use = {"input_tokens": tokens["input"],
+           "cache_creation_input_tokens": tokens["cache_creation_5m"] + tokens["cache_creation_1h"],
+           "cache_creation": {"ephemeral_5m_input_tokens": tokens["cache_creation_5m"],
+                              "ephemeral_1h_input_tokens": tokens["cache_creation_1h"]},
+           "cache_read_input_tokens": tokens["cache_read"], "output_tokens": tokens["output"]}
+    return {"type": "assistant", "requestId": request_id, "sessionId": "cal", "timestamp": iso(epoch, z=True),
+            "message": {"id": f"msg_{request_id}", "model": model, "role": "assistant", "content": [], "usage": use}}
+
+
+def ratelimit_record(epoch, percent, reset):
+    return {"ts": iso(epoch), "session_id": "cal",
+            "five_hour": {"used_percentage": percent, "resets_at": reset},
+            "seven_day": {"used_percentage": 3, "resets_at": reset + 6 * 86_400}}
+
+
+class Synthetic:
+    """既知の重みから使用率を生成し、ratelimit.jsonl とトランスクリプト群を書き出す。"""
+
+    def __init__(self, root, seed=20):
+        self.random = random.Random(seed)
+        self.projects = root / "projects"
+        self.ratelimit = root / "data" / "claude-token-metrics" / "ratelimit.jsonl"
+        self.files = [self.projects / "-home-a" / "s1.jsonl",
+                      self.projects / "-home-a" / "s1" / "subagents" / "agent-1.jsonl",
+                      self.projects / "-home-b" / "s2.jsonl"]
+        self.lines = {file: [] for file in self.files}
+        self.records = []
+        self.count = 0
+        self.clock = T0
+
+    def tokens(self):
+        r = self.random
+        return {"input": r.randint(200, 6000), "cache_creation_5m": r.randint(0, 20000),
+                "cache_creation_1h": r.randint(0, 20000), "cache_read": r.randint(10_000, 300_000),
+                "output": r.randint(100, 5000)}
+
+    def request(self, epoch, model, tokens=None):
+        tokens = tokens or self.tokens()
+        self.count += 1
+        line = calibration_request(f"req_{self.count}", epoch, model, tokens)
+        file = self.files[self.count % len(self.files)]
+        self.lines[file].extend([line, line])  # 1 リクエストが 2 行に分かれる
+        return tokens
+
+    def window(self, intervals, *, model="claude-opus-4-1", scale=1.0, noise=0.01, start_percent=1.0):
+        reset = self.clock + WINDOW
+        percent = start_percent
+        self.records.append(ratelimit_record(self.clock, percent, reset))
+        for _ in range(intervals):
+            delta = 0.0
+            for step in range(self.random.randint(1, 3)):
+                tokens = self.request(self.clock + 10 + step * 20, model)
+                delta += PERCENT_PER_INPUT * scale * sum(TRUE_WEIGHTS[key] * tokens[key] for key in TRUE_WEIGHTS)
+            percent += delta * (1 + noise * self.random.uniform(-1, 1))
+            self.clock += 90
+            self.records.append(ratelimit_record(self.clock, round(percent, 4), reset))
+        # 枠の切り替わりの直前に大きなリクエストを置く。区間に入れると推定が崩れる。
+        self.request(self.clock + 30, model, {key: 5_000_000 for key in TRUE_WEIGHTS})
+        self.clock += 600
+        return self
+
+    def write(self):
+        # 枠の外（最初の記録より前）のリクエストは数えない。
+        self.request(T0 - 100, "claude-opus-4-1", {key: 9_000_000 for key in TRUE_WEIGHTS})
+        for file, lines in self.lines.items():
+            write_jsonl(file, lines)
+        write_jsonl(self.ratelimit, [json.dumps(record) for record in self.records])
+        return self
+
+
+class CalibrateCase(FixtureCase):
+    def calibrate(self, *args):
+        result = self.run_cli("calibrate", "--projects", str(self.root / "projects"), *args)
+        return result
+
+    def calibrate_json(self, *args):
+        result = self.calibrate("--json", *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def assert_recovers(self, weights):
+        for key, expected in TRUE_WEIGHTS.items():
+            with self.subTest(key=key):
+                self.assertLessEqual(abs(weights[key] - expected) / expected, 0.10, weights)
+
+
+class CalibrateTest(CalibrateCase):
+    def test_recovers_known_weights_within_ten_percent(self):
+        Synthetic(self.root).window(40).write()
+        data = self.calibrate_json()
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["intervals"], 40)
+        self.assertEqual(data["min_intervals"], 30)
+        self.assertEqual(data["weights"]["input"], 1)
+        self.assert_recovers(data["weights"])
+        self.assertGreater(data["r2"], 0.95)
+        self.assertAlmostEqual(data["percent_per_mtok"]["input"], PERCENT_PER_INPUT * 1e6, delta=0.4)
+
+    def test_intervals_across_windows_and_reset_boundaries(self):
+        Synthetic(self.root).window(20).window(20, start_percent=0.5).write()
+        data = self.calibrate_json()
+        self.assertEqual(data["intervals"], 40)
+        self.assertEqual(data["skipped"]["window_change"], 1)
+        self.assert_recovers(data["weights"])
+
+    def test_insufficient_intervals_do_not_estimate(self):
+        Synthetic(self.root).window(12).write()
+        data = self.calibrate_json()
+        self.assertEqual(data["status"], "insufficient_data")
+        self.assertEqual(data["intervals"], 12)
+        self.assertIsNone(data["weights"])
+        text = self.calibrate()
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("データ不足", text.stdout)
+        self.assertIn("12", text.stdout)
+        self.assertEqual(self.calibrate_json("--min-intervals", "10")["status"], "ok")
+
+    def test_no_records(self):
+        data = self.calibrate_json()
+        self.assertEqual((data["status"], data["intervals"], data["records"]), ("insufficient_data", 0, 0))
+
+    def test_since_filters_records(self):
+        Synthetic(self.root).window(40).write()
+        self.assertEqual(self.calibrate_json("--since", "2025-06-15")["intervals"], 40)
+        self.assertEqual(self.calibrate_json("--since", "2025-06-16")["intervals"], 0)
+        self.assertEqual(self.calibrate("--since", "6/16").returncode, 2)
+
+    def test_text_output_shows_weights(self):
+        Synthetic(self.root).window(40).write()
+        result = self.calibrate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("区間 40", result.stdout)
+        self.assertIn("cache_read", result.stdout)
+        self.assertIn("決定係数", result.stdout)
+
+    def test_by_model_splits_only_with_enough_data(self):
+        Synthetic(self.root).window(35, model="claude-opus-4-1").window(
+            35, model="claude-sonnet-4-5", scale=0.2).window(5, model="claude-haiku-4-5", scale=0.05).write()
+        data = self.calibrate_json()
+        by_model = data["by_model"]
+        self.assertEqual(sorted(by_model), ["haiku", "opus", "sonnet"])
+        self.assertEqual((by_model["opus"]["status"], by_model["opus"]["intervals"]), ("ok", 35))
+        self.assertEqual(by_model["sonnet"]["status"], "ok")
+        self.assertEqual((by_model["haiku"]["status"], by_model["haiku"]["intervals"]), ("insufficient_data", 5))
+        self.assertIsNone(by_model["haiku"]["weights"])
+        self.assert_recovers(by_model["opus"]["weights"])
+        self.assert_recovers(by_model["sonnet"]["weights"])
+        ratio = by_model["sonnet"]["percent_per_mtok"]["output"] / by_model["opus"]["percent_per_mtok"]["output"]
+        self.assertAlmostEqual(ratio, 0.2, delta=0.02)
+
+    def test_duplicate_request_across_files_is_counted_once(self):
+        synthetic = Synthetic(self.root).window(40)
+        # 再開したセッションのように、同じ requestId の行が別ファイルにもある場合。
+        copied = [line for line in synthetic.lines[synthetic.files[0]][:20]]
+        synthetic.lines[self.root / "projects" / "-home-c" / "resumed.jsonl"] = copied
+        synthetic.write()
+        self.assert_recovers(self.calibrate_json()["weights"])
+
+
+class IntervalTest(unittest.TestCase):
+    @staticmethod
+    def records(*items):
+        return [{"ts": float(ts), "pct": pct, "reset": reset} for ts, pct, reset in items]
+
+    def test_consecutive_records_in_same_window(self):
+        records = self.records((0, 1, 100), (10, 2, 100), (20, 2, 130), (30, 1, 100), (40, 5, 9000), (50, 6, 9000))
+        intervals, skipped = METRICS.build_intervals(records)
+        # resets_at の 60 秒以内の揺れは同じ枠、減少と枠の切り替わりは区間にしない。
+        self.assertEqual([(i["start"], i["end"], i["delta"]) for i in intervals],
+                         [(0, 10, 1), (10, 20, 0), (40, 50, 1)])
+        self.assertEqual(skipped, {"window_change": 1, "negative_delta": 1})
+
+    def test_min_delta_merges_until_threshold(self):
+        records = self.records((0, 1, 100), (10, 2, 100), (20, 3, 100), (30, 4, 100), (40, 5, 100),
+                               (50, 6, 900), (60, 9, 900))
+        intervals, _ = METRICS.build_intervals(records, min_delta=2)
+        self.assertEqual([(i["start"], i["end"], i["delta"]) for i in intervals],
+                         [(0, 20, 2), (20, 40, 2), (50, 60, 3)])
+
+    def test_cli_rejects_negative_min_delta(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            METRICS.main(["calibrate", "--min-delta", "-1"])
+
+
+class CalibrateWriteTest(CalibrateCase):
+    def config(self):
+        return self.root / "config" / "claude-token-metrics" / "weights.json"
+
+    def test_does_not_write_by_default(self):
+        Synthetic(self.root).window(40).write()
+        self.calibrate_json()
+        self.assertFalse(self.config().exists())
+
+    def test_write_saves_weights_and_basis(self):
+        Synthetic(self.root).window(40).write()
+        self.config().parent.mkdir(parents=True)
+        self.config().write_text(json.dumps({"weights": {"output": 9}, "memo": "keep"}))
+        result = self.calibrate("--write")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = json.loads(self.config().read_text())
+        self.assertEqual(saved["memo"], "keep")
+        self.assertEqual(saved["weights"]["input"], 1)
+        self.assert_recovers(saved["weights"])
+        self.assertEqual(saved["calibration"]["intervals"], 40)
+        self.assertIn("r2", saved["calibration"])
+        weights, source = METRICS.load_weights(path=self.config())
+        self.assertEqual(source, str(self.config()))
+        self.assertEqual(weights, saved["weights"])
+
+    def test_write_refuses_without_estimate(self):
+        Synthetic(self.root).window(5).write()
+        result = self.calibrate("--write")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("データ不足", result.stdout + result.stderr)
+        self.assertFalse(self.config().exists())
+
+
+class NnlsTest(unittest.TestCase):
+    def test_exact_solution(self):
+        columns = [[1, 0, 1, 2], [0, 1, 1, 1]]
+        y = [2, 3, 5, 7]
+        self.assertEqual([round(value, 9) for value in METRICS.nnls(columns, y)], [2, 3])
+
+    def test_negative_coefficient_is_clamped_to_zero(self):
+        # 制約なしの最小二乗では y = c1 - c2（2 列目が -1）になる。非負なら c2 = 0、c1 = 平均 2/3。
+        columns = [[1, 1, 1], [1, 0, 0]]
+        y = [0, 1, 1]
+        solution = METRICS.nnls(columns, y)
+        self.assertEqual(solution[1], 0)
+        self.assertAlmostEqual(solution[0], 2 / 3)
+
+    def test_all_zero_target(self):
+        self.assertEqual(METRICS.nnls([[1, 2], [3, 4]], [0, 0]), [0, 0])
 
 
 if __name__ == "__main__":

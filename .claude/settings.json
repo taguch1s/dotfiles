@@ -22,6 +22,10 @@
       ]
     }
   },
+  "statusLine": {
+    "type": "command",
+    "command": "~/.local/bin/claude-statusline"
+  },
   "hooks": {
     "UserPromptSubmit": [
       {
