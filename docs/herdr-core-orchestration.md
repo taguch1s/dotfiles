@@ -116,7 +116,9 @@ hc-supervisor stop       # 止める（ワーカーは止まらない）
 hc attach supervisor     # 端末から見る場合。Ctrl+\ で離れる（止まらない）
 ```
 
-初回は監督役の cwd（既定は `$HOME`、`--cwd` で変更）でフォルダ信頼のダイアログが出ることがあります。Herdr app かスマホ、または `hc attach supervisor` で答えてください。`~/.claude/settings.json` に hook がなければ、`hc-supervisor` が注意を表示します。
+初回は監督役の cwd（既定は `$HOME`、`--cwd` で変更）でフォルダ信頼のダイアログが出ます。**既定で「No, exit」が選ばれている**ので、Herdr app かスマホ、または `hc attach supervisor` で開き、↓ で「Yes, I trust this folder」を選んでから Enter を押してください。ダイアログが出ている間は最初の依頼文が届きませんが、役割はシステムプロンプトで渡しているので、そのまま待機状態になります。`~/.claude/settings.json` に hook がなければ、`hc-supervisor` が注意を表示します。
+
+Herdr app の端末での貼り付けは **Ctrl+Shift+V**（または右クリック）です。Ctrl+V はシェルにそのまま送られ、zsh では「次のキーを文字として入れる」になるので、続けて Enter を押すと `command not found: ^M` になります。
 
 ### 4. 使い方
 
@@ -164,9 +166,14 @@ Tailscale SSH で WSL に入り、`hc attach supervisor` で同じ terminal を�
 ## 確認状況
 
 - ポリシーの判定とラベルの解釈は `tests/test_hc_permission_policy.py`、hook の入出力と `hc-permission` のガード・監査ログは `tests/test_hc_permission.sh`、watcher は `tests/test_hc_supervisor_watch.sh`、起動スクリプトは `tests/test_hc_supervisor.sh` で、偽の `hc` を使って検証しています（`make check` で実行）。
-- 次の点は hc を導入した環境で実機確認が必要です。実装はどれも形が違っても動くよう寛容にしてありますが、前提が外れていれば直します。
+- 実機で確認済み（hc 0.1.21、2026-11-14）:
+  - `hc get --json` は最上位に `address`、`name`、`parent`（なしは `null`）、`state`（`live` / `finished`）、`labels`（辞書）、`status`（報告前は `null`）、`cwd` と `foreground.cwd` を持つ。`hc ls --json` は `{"terminals": [...]}`
+  - `hc-supervisor` で監督役（`role=supervisor`、親なし）と watcher（監督役の子）が起動する
+  - Claude Code の trust ダイアログは `❯ No, exit` / `Yes, I trust this folder` で、No が既定。`hc-permission trust` は ↓ で Yes に動かし、画面で確かめてから Enter を送る
+  - 初回の trust ダイアログ中は `hc run` が最初の依頼文を届けられず待つ（`first_message.sent: false`）。`hc-supervisor` は `--timeout 20` で待ちを切り上げる
+- 次の点は実機確認が必要です。実装はどれも形が違っても動くよう寛容にしてありますが、前提が外れていれば直します。
   - `hc events --json` の 1 行の形（watcher はアドレスらしい値を拾い、拾えなければ `hc ls --json` で全体を見直す）
-  - `hc get --json` / `hc ls --json` の形、特に `labels`（辞書・`k=v` の配列・`{key, value}` の配列を受け付ける）と、最上位の `state`（live / finished）
+  - 権限ダイアログの選択肢の形（`❯ 1. Yes` と番号なしの `❯ Yes` の両方を受け付ける）
   - PermissionRequest hook に `HC_TERMINAL_ID` が引き継がれること、`--settings` で渡した監督役の PreToolUse hook が `~/.claude/settings.json` の hook と併合されて動くこと
   - Claude Code が hc の terminal 内で `blocked (permission)` を報告すること、親への通知と watcher の `hc send` が監督役に届くこと（監督役が作業中・自分のダイアログで止まっているときを含む）
   - `hc run` のテンプレートに渡した最初の依頼文が送られること、`--keep` の監督役が herdr-core の再起動後にどうなるか

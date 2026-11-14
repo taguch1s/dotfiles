@@ -122,8 +122,12 @@ fi
 if exists "$name"; then
   printf '監督役は起動済みです: %s\n' "$name"
 else
-  hc run --bg --no-parent --keep --name "$name" --label role=supervisor --cwd "$cwd" \
-    claude-supervisor '監督を開始してください。'
+  # 初回は trust ダイアログで最初の依頼文が届かず、hc run が届くまで待ち続ける（実機 2026-11-14）。
+  # --timeout で待ちを切り上げる（terminal は動いたまま）。役割はシステムプロンプトで渡すので、
+  # 依頼文が届かなくても監督役は待機状態になる。
+  hc run --bg --timeout 20 --no-parent --keep --name "$name" --label role=supervisor --cwd "$cwd" \
+    claude-supervisor '監督を開始してください。' || true
+  exists "$name" || die "監督役を起動できませんでした（hc ls で確認してください）"
   printf '起動しました: %s\n' "$name"
 fi
 
@@ -137,4 +141,5 @@ else
 fi
 
 printf '見る: Herdr app / スマホのサイドバーの %s、または hc attach %s（Ctrl+\\ で離れる）\n' "$name" "$name"
-printf '初回はフォルダ信頼（trust）のダイアログが出ることがあります。hc read %s で確認してください。\n' "$name"
+printf '初回はフォルダ信頼（trust）のダイアログが出ます。既定は「No, exit」なので、↓ で「Yes, I trust this folder」を選んでから Enter。\n'
+printf '確認: hc read %s\n' "$name"

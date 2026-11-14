@@ -832,10 +832,14 @@ def read_pending(address: str) -> dict | None:
 
 
 PERMISSION_DIALOG = re.compile(r"Do you want to|Would you like to")
-SELECTED_YES = re.compile(r"^\s*❯\s*1\.\s*Yes\s*$", re.MULTILINE)
+# 選択肢の番号（「1.」）は Claude Code の版によって付かないことがある。
+SELECTED_YES = re.compile(r"^\s*❯\s*(1\.\s*)?Yes\s*$", re.MULTILINE)
 TRUST_DIALOG = re.compile(r"trust (the files in )?this folder|Is this a project you created or one you trust",
                           re.IGNORECASE)
-SELECTED_TRUST_YES = re.compile(r"^\s*❯\s*1\.\s*Yes", re.MULTILINE)
+SELECTED_TRUST_YES = re.compile(r"^\s*❯\s*(\d+\.\s*)?Yes\b", re.MULTILINE)
+# 実機（2026-11-14）では「❯ No, exit / Yes, I trust this folder」で、No が既定で選ばれている。
+SELECTED_TRUST_NO = re.compile(r"^\s*❯\s*(\d+\.\s*)?No\b", re.MULTILINE)
+TRUST_YES_BELOW = re.compile(r"^\s*❯\s*(\d+\.\s*)?No\b.*\n\s*(\d+\.\s*)?Yes\b", re.MULTILINE)
 
 
 def _normalize(text: str) -> str:
@@ -917,8 +921,15 @@ def operate(action: str, target: str, reason: str) -> int:
             return refuse("trust は監督役が起動したワーカー（直接の子）にだけ答えられます")
         if not TRUST_DIALOG.search(screen):
             return refuse("フォルダ信頼（trust）のダイアログが画面にありません")
+        if not SELECTED_TRUST_YES.search(screen) and SELECTED_TRUST_NO.search(screen) \
+                and TRUST_YES_BELOW.search(screen):
+            # No が選ばれていて、すぐ下が Yes なら 1 つ下へ動かし、画面で確かめてから決定する。
+            hc("keys", target, "down")
+            time.sleep(0.3)
+            screen = hc("read", target, "--lines", "0")
+            entry["screen"] = "\n".join(line.rstrip() for line in screen.splitlines()[-15:])
         if not SELECTED_TRUST_YES.search(screen):
-            return refuse("trust ダイアログで「1. Yes」が選択されていません。画面を確認してください")
+            return refuse("trust ダイアログで Yes が選択されていません。画面を確認してください")
         hc("keys", target, "enter")
         record({**entry, "outcome": "trusted"})
         print(f"trusted: {address}")

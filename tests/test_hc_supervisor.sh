@@ -49,7 +49,7 @@ echo '{}' >"$fixture/settings.json"
 reset
 "$launcher" >/dev/null 2>"$fixture/err"
 home="$fixture/home"
-expected_supervisor="run --bg --no-parent --keep --name supervisor --label role=supervisor --cwd $home claude-supervisor 監督を開始してください。"
+expected_supervisor="run --bg --timeout 20 --no-parent --keep --name supervisor --label role=supervisor --cwd $home claude-supervisor 監督を開始してください。"
 expected_watch="run --bg --parent supervisor --no-notify --name supervisor-watch --label role=supervisor-watch --cwd $home $fixture/bin/hc-supervisor-watch supervisor"
 if [[ "$(runs)" == "$expected_supervisor"$'\n'"$expected_watch" ]]; then
   ok 'start: 監督役（role=supervisor、親なし、keep）と、その子の watcher を起動する'

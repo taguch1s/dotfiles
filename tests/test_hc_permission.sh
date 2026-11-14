@@ -47,8 +47,15 @@ else:
                       "labels": labels, "cwd": "/w", "status": status}))
 ' "$2"
     ;;
-  read) printf '%s\n' "$MOCK_HC_SCREEN" ;;
-  keys|wait|send) ;;
+  read)
+    if [[ -n "${MOCK_HC_SCREEN_AFTER_DOWN:-}" && -e "$MOCK_HC_LOG.down" ]]; then
+      printf '%s\n' "$MOCK_HC_SCREEN_AFTER_DOWN"
+    else
+      printf '%s\n' "$MOCK_HC_SCREEN"
+    fi
+    ;;
+  keys) [[ "${3:-}" != down ]] || touch "$MOCK_HC_LOG.down" ;;
+  wait|send) ;;
   *) echo "unexpected hc command: $*" >&2; exit 1 ;;
 esac
 EOF
@@ -158,8 +165,8 @@ expect_refusal() {
   : >"$MOCK_HC_LOG"
   if "$@" >/dev/null 2>"$fixture/err"; then
     ng "$name: 拒否されるべき操作が成功した"
-  elif grep -qE '^(keys|send)' "$MOCK_HC_LOG"; then
-    ng "$name: 拒否したのにキーを送った"
+  elif grep -qE '^(keys \S+ (enter|esc)|send)' "$MOCK_HC_LOG"; then
+    ng "$name: 拒否したのに決定キーを送った"
   elif [[ "$(last_outcome)" != refused:* ]]; then
     ng "$name: 拒否が記録されていない"
   else
@@ -179,6 +186,15 @@ if env HC_TERMINAL_ID=t1 "$helper" approve t2 --reason 'プレビュー環境の
   ok 'approve: 監督役が承認でき、Enter を送り、記録し、保留要求を消す'
 else
   ng "approve が期待どおりでない: $(<"$fixture/err")"
+fi
+
+make_pending
+: >"$MOCK_HC_LOG"
+if env HC_TERMINAL_ID=t1 MOCK_HC_SCREEN="${dialog/❯ 1. Yes/❯ Yes}" "$helper" approve t2 --reason x >/dev/null 2>"$fixture/err" \
+  && grep -qx 'keys t2 enter' "$MOCK_HC_LOG"; then
+  ok 'approve: 番号のない「❯ Yes」にも答えられる'
+else
+  ng "approve: 番号のない Yes で失敗: $(<"$fixture/err")"
 fi
 
 expect_refusal 'approve: 保留要求がなければ拒否' env HC_TERMINAL_ID=t1 "$helper" approve t2 --reason x
@@ -244,6 +260,23 @@ if env HC_TERMINAL_ID=t1 MOCK_HC_STATE='' MOCK_HC_KIND='' MOCK_HC_SCREEN="$trust
 else
   ng "trust が期待どおりでない: $(<"$fixture/err")"
 fi
+# 実機（Claude Code、2026-11-14）の trust ダイアログ。No が既定で選ばれ、番号がない。
+real_trust=$' Quick safety check: Is this a project you created or one you trust?\n ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel'
+real_trust_yes=$' Quick safety check: Is this a project you created or one you trust?\n   No, exit\n ❯ Yes, I trust this folder\n Enter to confirm · Esc to cancel'
+: >"$MOCK_HC_LOG"; rm -f "$MOCK_HC_LOG.down"
+if env HC_TERMINAL_ID=t1 MOCK_HC_STATE='' MOCK_HC_KIND='' MOCK_HC_SCREEN="$real_trust" MOCK_HC_SCREEN_AFTER_DOWN="$real_trust_yes" \
+  "$helper" trust t2 --reason '依頼した worktree' >/dev/null 2>"$fixture/err" \
+  && [[ "$(grep -E '^keys' "$MOCK_HC_LOG")" == $'keys t2 down\nkeys t2 enter' ]] && [[ "$(last_outcome)" == trusted ]]; then
+  ok 'trust: 実機の形（No が既定）では ↓ で Yes に動かし、確かめてから Enter'
+else
+  ng "trust（実機の形）が期待どおりでない: $(<"$fixture/err") $(cat "$MOCK_HC_LOG")"
+fi
+rm -f "$MOCK_HC_LOG.down"
+expect_refusal 'trust: ↓ の後も Yes が選ばれていなければ Enter しない' \
+  env HC_TERMINAL_ID=t1 MOCK_HC_SCREEN="$real_trust" MOCK_HC_SCREEN_AFTER_DOWN="$real_trust" "$helper" trust t2 --reason x
+grep -qx 'keys t2 enter' "$MOCK_HC_LOG" && ng 'trust: 確かめずに Enter した'
+rm -f "$MOCK_HC_LOG.down"
+
 expect_refusal 'trust: trust ダイアログでなければ拒否' env HC_TERMINAL_ID=t1 "$helper" trust t2 --reason x
 expect_refusal 'trust: 監督役以外は拒否' \
   env HC_TERMINAL_ID=t9 MOCK_HC_SCREEN="$trust_screen" "$helper" trust t2 --reason x
