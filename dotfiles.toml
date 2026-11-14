@@ -358,6 +358,13 @@ mode = "link"
 executable = true
 
 [[config]]
+name = "Claude トークン効率指標の集計（SessionEnd hook から記録）"
+source = ".local/bin/claude-token-metrics"
+target = ".local/bin/claude-token-metrics"
+mode = "link"
+executable = true
+
+[[config]]
 name = "スリープ抑止ループ"
 source = ".local/bin/awake-keeper"
 target = ".local/bin/awake-keeper"

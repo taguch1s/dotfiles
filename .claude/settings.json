@@ -87,6 +87,11 @@
           {
             "type": "command",
             "command": "~/.local/bin/awake-hook off"
+          },
+          {
+            "type": "command",
+            "command": "~/.local/bin/claude-token-metrics record || true",
+            "timeout": 10
           }
         ]
       }
