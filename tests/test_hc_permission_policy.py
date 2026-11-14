@@ -121,9 +121,11 @@ class PolicyTest(unittest.TestCase):
             "mkdir /etc/foo",
             "echo $(sudo whoami)",
             "hc send t1 --force 'yes'",
+            "hc label t3 role=supervisor",
+            "hc run --label role=supervisor claude",
         ])
 
-    def test_unclear_commands_are_left_to_the_orchestrator(self):
+    def test_unclear_commands_are_left_to_the_supervisor(self):
         self.assert_all("ask", [
             "curl https://example.com",
             "docker compose up -d",
@@ -168,8 +170,8 @@ class PolicyTest(unittest.TestCase):
                                   home=str(self.home))
         self.assertNotEqual(verdict.decision, "allow")
 
-    def test_orchestrator_guard_patterns(self):
-        rules = [pattern for pattern, _ in POLICY.ORCHESTRATOR_BASH_RULES]
+    def test_supervisor_guard_patterns(self):
+        rules = [pattern for pattern, _ in POLICY.SUPERVISOR_BASH_RULES]
 
         def blocked(command):
             return any(re.search(pattern, command) for pattern in rules)
@@ -177,10 +179,21 @@ class PolicyTest(unittest.TestCase):
         self.assertTrue(blocked("hc keys t3 enter"))
         self.assertTrue(blocked("hc --json keys t3 enter"))
         self.assertTrue(blocked("hc send t3 --force 'y'"))
-        self.assertTrue(blocked("rm ~/.local/state/hc-orchestrator/pending/t3.json"))
+        self.assertTrue(blocked("rm ~/.local/state/hc-supervisor/pending/t3.json"))
         self.assertFalse(blocked("hc-permission approve t3 --reason 'test'"))
         self.assertFalse(blocked("hc send t3 'please continue'"))
-        self.assertFalse(blocked("hc run --bg --name issue-12 claude-worker 'x'"))
+        self.assertFalse(blocked("hc run --bg --outlive-parent --label role=worker --name issue-12 claude-worker 'x'"))
+
+
+class LabelParsingTest(unittest.TestCase):
+    """hc get --json のラベルの形は実機未確認なので、想定される形をすべて受け付ける。"""
+
+    def test_label_shapes(self):
+        for raw in ({"role": "supervisor"}, ["role=supervisor"], [{"key": "role", "value": "supervisor"}]):
+            info = POLICY.parse_terminal({"address": "t1", "labels": raw})
+            self.assertTrue(POLICY.is_supervisor(info), raw)
+        self.assertFalse(POLICY.is_supervisor(POLICY.parse_terminal({"address": "t1"})))
+        self.assertTrue(POLICY.is_worker(POLICY.parse_terminal({"terminal": {"labels": {"role": "worker"}}})))
 
 
 class RoleConfigTest(unittest.TestCase):
@@ -188,25 +201,35 @@ class RoleConfigTest(unittest.TestCase):
 
     ROOT = SCRIPT.parents[2]
 
+    def command(self, role):
+        template = (self.ROOT / ".config/herdr-core/templates" / f"claude-{role}.md").read_text()
+        return re.search(r"^command: (.+)$", template, re.MULTILINE).group(1)
+
     def test_templates_point_to_existing_role_files(self):
-        for role in ("orchestrator", "worker"):
-            template = (self.ROOT / ".config/herdr-core/templates" / f"claude-{role}.md").read_text()
-            command = re.search(r"^command: (.+)$", template, re.MULTILINE).group(1)
-            for flag in ("--settings", "--append-system-prompt-file"):
+        for role, flags in (("supervisor", ("--settings", "--append-system-prompt-file")),
+                            ("worker", ("--append-system-prompt-file",))):
+            command = self.command(role)
+            for flag in flags:
                 match = re.search(rf'{flag} "\$HOME/([^"]+)"', command)
                 self.assertIsNotNone(match, f"{role}: {flag} がない")
                 self.assertTrue((self.ROOT / match.group(1)).is_file(), match.group(1))
 
-    def test_role_settings_call_the_right_hooks(self):
-        base = self.ROOT / ".config/herdr-core/claude"
-        worker = json.loads((base / "worker-settings.json").read_text())
-        orchestrator = json.loads((base / "orchestrator-settings.json").read_text())
-        self.assertIn("hook-worker", worker["hooks"]["PermissionRequest"][0]["hooks"][0]["command"])
-        guard = orchestrator["hooks"]["PreToolUse"][0]
+    def test_worker_uses_the_user_permission_mode(self):
+        # 手動セッションと同じ扱いにするため、ワーカーでも permission mode を強制しない。
+        self.assertNotIn("--permission-mode", self.command("worker"))
+
+    def test_supervisor_settings_guard_raw_keys(self):
+        supervisor = json.loads((self.ROOT / ".config/herdr-core/claude/supervisor-settings.json").read_text())
+        guard = supervisor["hooks"]["PreToolUse"][0]
         self.assertIn("Bash", guard["matcher"])
-        self.assertIn("hook-orchestrator", guard["hooks"][0]["command"])
+        self.assertIn("hook-supervisor", guard["hooks"][0]["command"])
         # 生の hc keys は自動許可しない（hook で拒否する対象）。
-        self.assertFalse(any("hc keys" in rule for rule in orchestrator["permissions"]["allow"]))
+        self.assertFalse(any("hc keys" in rule for rule in supervisor["permissions"]["allow"]))
+
+    def test_default_user_settings_install_the_permission_hook(self):
+        settings = json.loads((self.ROOT / ".claude/settings.json").read_text())
+        commands = [h["command"] for g in settings["hooks"]["PermissionRequest"] for h in g["hooks"]]
+        self.assertTrue(any("hc-permission" in c and "hook-worker" in c for c in commands))
 
 
 if __name__ == "__main__":

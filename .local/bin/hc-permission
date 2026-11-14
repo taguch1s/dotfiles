@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""herdr-core (hc) 上の Claude Code ワーカーの権限確認を判断・代行する。
+"""herdr-core (hc) 上の Claude Code セッションの権限確認を判断・代行する。
 
 1 つのスクリプトに、判断ルール（ポリシー）と、それを使う 3 つの入口をまとめる。
 ルールを 1 か所に置き、hook と承認ヘルパーで同じ判定を使うため。
 
-  hook-worker        ワーカーの PermissionRequest hook。明確に無害なら allow、
-                     明確に危険なら deny。どちらでもなければ保留要求を保存し、
-                     決定を返さずに通常の権限ダイアログへ回す。
-  hook-orchestrator  オーケストレーターの PreToolUse hook。生の `hc keys` や
+  hook-worker        全 Claude Code セッションの PermissionRequest hook
+                     （~/.claude/settings.json に入れる）。hc の外と監督役自身では
+                     何もしない。明確に無害なら allow、明確に危険なら deny
+                     （監督役が起動したワーカー以外では deny せずユーザー判断へ回す）。
+                     どちらでもなければ保留要求を保存し、通常の権限ダイアログへ回す。
+  hook-supervisor    監督役の PreToolUse hook。生の `hc keys` や
                      `hc send --force` を拒否し、このヘルパー経由に限定する。
   show / approve / deny / escalate / trust
-                     オーケストレーターが、子のダイアログに答えるための操作。
-                     approve は保留要求を危険ルールと再照合し、当たれば拒否する。
+                     監督役（ラベル role=supervisor の terminal）が、他のセッションの
+                     ダイアログに答えるための操作。approve は保留要求を危険ルールと
+                     再照合し、当たれば拒否する。
 
 全体像は docs/herdr-core-orchestration.md を参照。
 """
@@ -89,6 +92,7 @@ DANGER_PATTERNS: list[tuple[str, str]] = [
     (r"(^|[\s;&|(`])(mkfs(\.\w+)?|shutdown|reboot|poweroff|halt|fdisk|parted)\b", "システム操作"),
     (r"\bdd\b[^;&|\n]*\bof=/dev/", "デバイスへの書き込み"),
     (r"\bcrontab\s+-r\b", "crontab の削除"),
+    (r"\bhc\b[^;&|\n]*\brole=supervisor\b", "監督役ラベル（role=supervisor）の付与"),
     (r"\bchmod\b[^;&|\n]*\b777\b", "chmod 777"),
     (rf"\brm\b{_SEG}\s(/|/\*|~|~/|~/\*|\$HOME|\$HOME/|\$\{{HOME\}}|\.\.?/?)(?=\s|$|;|&|\|)",
      "ルート・ホーム・カレントディレクトリ全体の削除"),
@@ -133,7 +137,7 @@ class Paths:
         self.home = os.path.realpath(home or os.path.expanduser("~"))
         self.project = os.path.realpath(project_dir)
         self.cwd = os.path.realpath(cwd or project_dir)
-        # ホームやルートで起動したワーカーは「worktree 内」を定義できない。
+        # ホームやルートで起動したセッションは「worktree 内」を定義できない。
         self.project_is_usable = self.project not in ("/", self.home)
 
     def resolve(self, raw: str) -> str | None:
@@ -339,7 +343,7 @@ class BashClassifier:
                 return Verdict(ALLOW, f"go {sub}")
             return Verdict(ASK, f"go {sub}")
         if name in ("hc-permission",):
-            return Verdict(DENY, "ワーカーは hc-permission を使わない")
+            return Verdict(DENY, "監督役以外は hc-permission を使わない")
         return Verdict(ASK, f"判定ルールにないコマンド: {name}")
 
     def _writes(self, targets: list[str], label: str) -> Verdict:
@@ -612,7 +616,7 @@ def classify(tool_name: str, tool_input: dict, project_dir: str, cwd: str | None
 
 def state_dir() -> Path:
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    path = Path(base) / "hc-orchestrator"
+    path = Path(base) / "hc-supervisor"
     path.mkdir(parents=True, exist_ok=True)
     os.chmod(path, 0o700)
     return path
@@ -642,62 +646,73 @@ def record(entry: dict) -> None:
 
 
 def hook_worker() -> int:
-    """PermissionRequest hook。ask のときは何も出力しない（ダイアログへ回す）。"""
+    """PermissionRequest hook。ask のときは何も出力しない（ダイアログへ回す）。
+
+    ~/.claude/settings.json に入れて全セッションで動かす前提なので、hc の外
+    （HC_TERMINAL_ID なし）と監督役自身では、判定も記録もせずに抜ける。
+    """
+    terminal = os.environ.get("HC_TERMINAL_ID", "")
+    if not terminal:
+        return 0
     try:
         payload = json.load(sys.stdin)
     except json.JSONDecodeError:
+        return 0
+    info = lookup_terminal(terminal)
+    if info and is_supervisor(info):
         return 0
     tool_name = str(payload.get("tool_name") or "")
     tool_input = payload.get("tool_input") or {}
     cwd = payload.get("cwd")
     project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or cwd or os.getcwd()
     verdict = classify(tool_name, tool_input, project_dir, cwd)
-    terminal = os.environ.get("HC_TERMINAL_ID", "")
+    if verdict.decision == DENY and not (info and is_worker(info)):
+        # 手動で開いたセッションはユーザーが操作している。危険ルールでも自動では拒否せず、
+        # ダイアログに残してユーザーに判断させる（監督役の approve は再照合で必ず拒否される）。
+        verdict = Verdict(ASK, f"危険ルールに該当（手動セッションのためユーザー判断）: {verdict.reason}")
 
     record({"action": f"hook-{verdict.decision}", "actor": "hook", "terminal": terminal,
             "tool_name": tool_name, "tool_input": _truncate(tool_input), "reason": verdict.reason})
 
-    pending = pending_path(terminal) if terminal else None
+    pending = pending_path(terminal)
     if verdict.decision == ASK:
-        if pending:
-            content = {
-                "terminal": terminal,
-                "created_at": time.time(),
-                "tool_name": tool_name,
-                "tool_input": tool_input,
-                "cwd": cwd,
-                "project_dir": project_dir,
-                "reason": verdict.reason,
-            }
-            handle, temporary = tempfile.mkstemp(dir=pending.parent, prefix=".pending-")
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                json.dump(content, stream, ensure_ascii=False, indent=2)
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, pending)
+        content = {
+            "terminal": terminal,
+            "created_at": time.time(),
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "cwd": cwd,
+            "project_dir": project_dir,
+            "reason": verdict.reason,
+        }
+        handle, temporary = tempfile.mkstemp(dir=pending.parent, prefix=".pending-")
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(content, stream, ensure_ascii=False, indent=2)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, pending)
         return 0
 
-    if pending and pending.exists():
-        pending.unlink()
+    pending.unlink(missing_ok=True)
     decision: dict = {"behavior": verdict.decision}
     if verdict.decision == DENY:
         decision["message"] = (
             f"hc-permission のポリシーで拒否しました: {verdict.reason}。"
-            "同じ操作を別のコマンドに書き換えて回避せず、方針を変えるか親に hc send で相談してください。")
+            "同じ操作を別のコマンドに書き換えて回避せず、方針を変えるか監督役（親）に hc send で相談してください。")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}},
                      ensure_ascii=False))
     return 0
 
 
-ORCHESTRATOR_BASH_RULES: list[tuple[str, str]] = [
+SUPERVISOR_BASH_RULES: list[tuple[str, str]] = [
     (r"\bhc\b(\s+--?[\w-]+(=\S+)?)*\s+keys\b", "hc keys で直接キーを送らず、hc-permission を使ってください"),
     (r"\bhc\b[^;&|\n]*\bsend\b[^;&|\n]*\s--force\b",
      "hc send --force で権限ダイアログを迂回しないでください。hc-permission を使ってください"),
-    (r"hc-orchestrator/(pending|decisions)", "保留要求・監査ログを直接操作しないでください"),
+    (r"hc-supervisor/(pending|decisions)", "保留要求・監査ログを直接操作しないでください"),
 ]
 
 
-def hook_orchestrator() -> int:
-    """PreToolUse hook。違反時は deny を返す。"""
+def hook_supervisor() -> int:
+    """監督役の PreToolUse hook。違反時は deny を返す。"""
     try:
         payload = json.load(sys.stdin)
     except json.JSONDecodeError:
@@ -707,7 +722,7 @@ def hook_orchestrator() -> int:
     reason = None
     if tool_name == "Bash":
         command = str(tool_input.get("command") or "")
-        for pattern, message in ORCHESTRATOR_BASH_RULES:
+        for pattern, message in SUPERVISOR_BASH_RULES:
             if re.search(pattern, command):
                 reason = message
                 break
@@ -727,7 +742,7 @@ def hook_orchestrator() -> int:
 
 
 # ---------------------------------------------------------------------------
-# オーケストレーター用の操作
+# 監督役用の操作
 # ---------------------------------------------------------------------------
 
 
@@ -742,20 +757,67 @@ def hc(*args: str) -> str:
     return result.stdout
 
 
-def terminal_info(target: str) -> dict:
-    data = json.loads(hc("get", target, "--json"))
+SUPERVISOR_ROLE = "supervisor"
+WORKER_ROLE = "worker"
+
+
+def parse_labels(raw: object) -> dict[str, str]:
+    """hc のラベルを {key: value} にする。JSON の形は実機未確認なので複数の形を受け付ける。"""
+    labels: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            labels[str(key)] = "" if value is None else str(value)
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str) and "=" in item:
+                key, value = item.split("=", 1)
+                labels[key] = value
+            elif isinstance(item, dict) and "key" in item:
+                labels[str(item["key"])] = str(item.get("value") or "")
+    return labels
+
+
+def parse_terminal(data: object, target: str = "") -> dict:
+    """`hc get --json` の結果を、このヘルパーが使う項目に絞る。"""
     if isinstance(data, dict) and "address" not in data:
         for key in ("terminal", "result"):
             if isinstance(data.get(key), dict):
                 data = data[key]
                 break
+    if not isinstance(data, dict):
+        data = {}
     status = data.get("status") or {}
+    parent = data.get("parent")
+    foreground = data.get("foreground") or {}
     return {
-        "address": data.get("address") or target,
-        "parent": data.get("parent") or "",
-        "state": status.get("state") or "",
-        "kind": status.get("kind") or "",
+        "address": str(data.get("address") or target),
+        "name": str(data.get("name") or ""),
+        "parent": str((parent.get("address") if isinstance(parent, dict) else parent) or ""),
+        "state": str(status.get("state") or "") if isinstance(status, dict) else "",
+        "kind": str(status.get("kind") or "") if isinstance(status, dict) else "",
+        "cwd": str((foreground.get("cwd") if isinstance(foreground, dict) else "") or data.get("cwd") or ""),
+        "labels": parse_labels(data.get("labels")),
     }
+
+
+def terminal_info(target: str) -> dict:
+    return parse_terminal(json.loads(hc("get", target, "--json")), target)
+
+
+def lookup_terminal(target: str) -> dict | None:
+    """hook 用。hc が使えなければ None（ポリシー判定だけで進める）。"""
+    try:
+        return terminal_info(target)
+    except (Refused, OSError, json.JSONDecodeError):
+        return None
+
+
+def is_supervisor(info: dict) -> bool:
+    return info["labels"].get("role") == SUPERVISOR_ROLE
+
+
+def is_worker(info: dict) -> bool:
+    return info["labels"].get("role") == WORKER_ROLE
 
 
 def read_pending(address: str) -> dict | None:
@@ -815,7 +877,9 @@ def operate(action: str, target: str, reason: str) -> int:
     pending = read_pending(address)
 
     if action == "show":
-        print(f"terminal: {address}\nparent: {info['parent'] or '-'}\n"
+        labels = " ".join(f"{k}={v}" for k, v in sorted(info["labels"].items())) or "-"
+        print(f"terminal: {address}（{info['name'] or '-'}）\ncwd: {info['cwd'] or '-'}\n"
+              f"parent: {info['parent'] or '-'}\nlabels: {labels}\n"
               f"status: {info['state'] or 'none'}{' (' + info['kind'] + ')' if info['kind'] else ''}")
         print(describe(pending))
         print("--- 画面末尾")
@@ -841,11 +905,16 @@ def operate(action: str, target: str, reason: str) -> int:
         return 0
 
     if not caller:
-        return refuse("hc の terminal 内（オーケストレーター）から実行してください")
-    if info["parent"] != caller:
-        return refuse(f"直接の親だけが答えられます（対象の親: {info['parent'] or 'なし'}、呼び出し元: {caller}）")
+        return refuse("hc の terminal 内（監督役）から実行してください")
+    supervisor = terminal_info(caller)
+    if not is_supervisor(supervisor):
+        return refuse(f"監督役（ラベル role={SUPERVISOR_ROLE}）の terminal だけが答えられます（呼び出し元: {caller}）")
+    if address in (caller, supervisor["address"]):
+        return refuse("監督役自身のダイアログには答えられません")
 
     if action == "trust":
+        if info["parent"] not in (caller, supervisor["address"]):
+            return refuse("trust は監督役が起動したワーカー（直接の子）にだけ答えられます")
         if not TRUST_DIALOG.search(screen):
             return refuse("フォルダ信頼（trust）のダイアログが画面にありません")
         if not SELECTED_TRUST_YES.search(screen):
@@ -861,10 +930,10 @@ def operate(action: str, target: str, reason: str) -> int:
         return refuse(f"権限待ちではありません（kind: {info['kind'] or 'なし'}）。質問ならユーザーに確認してください")
     if not PERMISSION_DIALOG.search(screen):
         return refuse("Claude Code の権限ダイアログが画面にありません。hc-permission show で確認してください")
+    if not pending:
+        return refuse("保留要求がありません（hook を通っていない）。escalate してユーザーに回してください")
 
     if action == "approve":
-        if not pending:
-            return refuse("保留要求がありません（hook を通っていない）。escalate してユーザーに回してください")
         age = time.time() - float(pending.get("created_at") or 0)
         if age > PENDING_MAX_AGE_SECONDS:
             return refuse("保留要求が古すぎます。escalate してユーザーに回してください")
@@ -885,10 +954,9 @@ def operate(action: str, target: str, reason: str) -> int:
 
     # deny
     hc("keys", target, "esc")
-    if pending:
-        Path(pending["_path"]).unlink(missing_ok=True)
+    Path(pending["_path"]).unlink(missing_ok=True)
     subprocess.run(["hc", "wait", target, "--timeout", "30"], capture_output=True, check=False)
-    sent = subprocess.run(["hc", "send", target, "--if", "idle", f"オーケストレーターが却下しました: {reason}"],
+    sent = subprocess.run(["hc", "send", target, "--if", "idle", f"監督役が却下しました: {reason}"],
                           capture_output=True, text=True, check=False)
     if sent.returncode != 0:
         return refuse("ダイアログは閉じましたが、却下理由を送れませんでした。hc-permission show で確認してください")
@@ -903,10 +971,10 @@ def operate(action: str, target: str, reason: str) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="hc-permission",
-        description="herdr-core 上の Claude Code ワーカーの権限確認を判断・代行する。")
+        description="herdr-core 上の Claude Code セッションの権限確認を判断・代行する。")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("hook-worker", help="ワーカーの PermissionRequest hook（stdin に hook 入力）")
-    sub.add_parser("hook-orchestrator", help="オーケストレーターの PreToolUse hook")
+    sub.add_parser("hook-worker", help="全セッションの PermissionRequest hook（stdin に hook 入力）")
+    sub.add_parser("hook-supervisor", help="監督役の PreToolUse hook")
     classify_parser = sub.add_parser("classify", help="tool 入力 JSON（stdin）を判定して表示する")
     classify_parser.add_argument("--project-dir", required=True)
     classify_parser.add_argument("--cwd")
@@ -914,7 +982,7 @@ def main(argv: list[str]) -> int:
     show.add_argument("terminal")
     for name, text in (
         ("approve", "保留要求を危険ルールと再照合し、問題なければ「1. Yes」を選ぶ"),
-        ("deny", "Esc でダイアログを閉じ、却下理由をワーカーへ送る"),
+        ("deny", "Esc でダイアログを閉じ、却下理由をセッションへ送る"),
         ("escalate", "ユーザー判断へ回したことを記録する（キーは送らない）"),
         ("trust", "初回起動時のフォルダ信頼ダイアログに「1. Yes」で答える"),
     ):
@@ -925,8 +993,8 @@ def main(argv: list[str]) -> int:
 
     if args.command == "hook-worker":
         return hook_worker()
-    if args.command == "hook-orchestrator":
-        return hook_orchestrator()
+    if args.command == "hook-supervisor":
+        return hook_supervisor()
     if args.command == "classify":
         payload = json.load(sys.stdin)
         verdict = classify(payload.get("tool_name", ""), payload.get("tool_input") or {},

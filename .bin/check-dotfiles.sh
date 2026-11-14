@@ -6,7 +6,8 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 "$root/.bin/doctor-agent-terminal.sh" --worktree-safe
 bash "$root/tests/test_herdr_codex_orchestrate.sh"
 bash "$root/tests/test_hc_permission.sh"
-bash "$root/tests/test_hc_orch.sh"
+bash "$root/tests/test_hc_supervisor.sh"
+bash "$root/tests/test_hc_supervisor_watch.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_hc_permission_policy.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/.bin/test-herdr-codex-status.py"
 git -C "$root" diff --check

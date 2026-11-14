@@ -32,5 +32,6 @@ python3 "$root/.bin/manage-dotfiles-configs.py" doctor "${doctor_args[@]}" || fa
 python3 -m py_compile "$root/.local/bin/herdr-codex-status"
 bash -n "$root/.local/bin/herdr-codex-orchestrate"
 python3 -m py_compile "$root/.local/bin/hc-permission"
-bash -n "$root/.local/bin/hc-orch"
+python3 -m py_compile "$root/.local/bin/hc-supervisor-watch"
+bash -n "$root/.local/bin/hc-supervisor"
 exit "$failures"

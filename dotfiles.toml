@@ -42,16 +42,23 @@ mode = "link"
 executable = true
 
 [[config]]
-name = "herdr-core オーケストレーター起動"
-source = ".local/bin/hc-orch"
-target = ".local/bin/hc-orch"
+name = "herdr-core 監督役の起動"
+source = ".local/bin/hc-supervisor"
+target = ".local/bin/hc-supervisor"
 mode = "link"
 executable = true
 
 [[config]]
-name = "herdr-core オーケストレーターテンプレート"
-source = ".config/herdr-core/templates/claude-orchestrator.md"
-target = ".config/herdr-core/templates/claude-orchestrator.md"
+name = "herdr-core 監督役へ権限待ちを知らせる watcher"
+source = ".local/bin/hc-supervisor-watch"
+target = ".local/bin/hc-supervisor-watch"
+mode = "link"
+executable = true
+
+[[config]]
+name = "herdr-core 監督役テンプレート"
+source = ".config/herdr-core/templates/claude-supervisor.md"
+target = ".config/herdr-core/templates/claude-supervisor.md"
 mode = "link"
 
 [[config]]
@@ -61,21 +68,15 @@ target = ".config/herdr-core/templates/claude-worker.md"
 mode = "link"
 
 [[config]]
-name = "herdr-core オーケストレーターの settings"
-source = ".config/herdr-core/claude/orchestrator-settings.json"
-target = ".config/herdr-core/claude/orchestrator-settings.json"
+name = "herdr-core 監督役の settings"
+source = ".config/herdr-core/claude/supervisor-settings.json"
+target = ".config/herdr-core/claude/supervisor-settings.json"
 mode = "link"
 
 [[config]]
-name = "herdr-core オーケストレーターのシステムプロンプト"
-source = ".config/herdr-core/claude/orchestrator-prompt.md"
-target = ".config/herdr-core/claude/orchestrator-prompt.md"
-mode = "link"
-
-[[config]]
-name = "herdr-core ワーカーの settings"
-source = ".config/herdr-core/claude/worker-settings.json"
-target = ".config/herdr-core/claude/worker-settings.json"
+name = "herdr-core 監督役のシステムプロンプト"
+source = ".config/herdr-core/claude/supervisor-prompt.md"
+target = ".config/herdr-core/claude/supervisor-prompt.md"
 mode = "link"
 
 [[config]]

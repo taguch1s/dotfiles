@@ -72,7 +72,7 @@ make wsl        # /etc/wsl.conf と Windows 側 ~/.wslconfig を書き込むた�
 make wsl-slim   # Docker を必要時起動にし、Ubuntu Pro・snapd など常駐不要なサービスを止める（sudo）
 make dev-mode   # スタートメニューに「Dev Mode」「Normal Mode」を作る
 make remote-access # スマホから遠隔操作中のスリープ抑止サービスを有効化する（docs/remote-access.md）
-# Herdr app / スマホから Claude Code を指揮する構成は docs/herdr-core-orchestration.md
+# Herdr app / スマホの Claude Code を監督役が見張る構成（hc-supervisor）は docs/herdr-core-orchestration.md
 make doctor     # コマンド、リンク、ステータススクリプトを検証
 make diff       # コピー管理の Codex 設定とローカル設定の差分を表示
 make check      # PR・コミット前の検査（bootstrap 後は commit 時にも自動実行）

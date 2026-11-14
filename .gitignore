@@ -61,7 +61,8 @@
 !/.local/bin/herdr-codex-status
 !/.local/bin/herdr-codex-orchestrate
 !/.local/bin/hc-permission
-!/.local/bin/hc-orch
+!/.local/bin/hc-supervisor
+!/.local/bin/hc-supervisor-watch
 !/.local/bin/codex-worktree
 !/.local/bin/claude-worktree
 !/.local/bin/agent-browser-guard

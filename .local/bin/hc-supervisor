@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# herdr-core 上に監督役の Claude Code と、権限待ちを監督役へ知らせる watcher を常駐させる。
+# Herdr app・スマホ・端末のどこからでも同じ 1 行で使う。全体像は docs/herdr-core-orchestration.md
+set -euo pipefail
+
+name=supervisor
+watch_name=supervisor-watch
+claude_settings="${HC_SUPERVISOR_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+
+usage() {
+  cat <<'EOF'
+Usage: hc-supervisor [start] [--cwd DIR]
+       hc-supervisor status | stop
+
+start   監督役（名前 supervisor、ラベル role=supervisor）と watcher（supervisor-watch）を起動する。
+        既に監督役がいれば起動せず、watcher が欠けていれば watcher だけ起動する。
+        --cwd の既定は $HOME。
+status  監督役と watcher の状態を表示する。
+stop    watcher と監督役を止める。監督役が起動したワーカーは止まらない（--outlive-parent）。
+EOF
+}
+
+die() {
+  printf 'hc-supervisor: %s\n' "$*" >&2
+  exit 1
+}
+
+# 生きている terminal があるか。hc get は終了済みも返しうるので、最上位の state が
+# finished なら無いものとみなす（status.state とは別の、live / finished の値）。
+exists() {
+  local json
+  json="$(hc get "$1" --json 2>/dev/null)" || return 1
+  python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+    sys.exit(0)
+if isinstance(data, dict) and isinstance(data.get("terminal"), dict):
+    data = data["terminal"]
+sys.exit(1 if isinstance(data, dict) and data.get("state") == "finished" else 0)
+' "$json"
+}
+
+command="start"
+if (($#)) && [[ "$1" != -* ]]; then
+  command="$1"
+  shift
+fi
+cwd="$HOME"
+while (($#)); do
+  case "$1" in
+    --cwd)
+      (($# >= 2)) || die '--cwd にディレクトリを指定してください'
+      cwd="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+command -v hc >/dev/null 2>&1 || die 'hc が PATH にありません（herdr-core を導入してください）'
+
+case "$command" in
+  status)
+    for terminal in "$name" "$watch_name"; do
+      if exists "$terminal"; then
+        hc get "$terminal"
+      else
+        printf '%s: 起動していません\n' "$terminal"
+      fi
+    done
+    exit 0
+    ;;
+  stop)
+    for terminal in "$watch_name" "$name"; do
+      if exists "$terminal"; then
+        hc kill "$terminal" >/dev/null && printf '止めました: %s\n' "$terminal"
+      fi
+    done
+    exit 0
+    ;;
+  start) ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+command -v hc-permission >/dev/null 2>&1 \
+  || die 'hc-permission が PATH にありません（dotfiles で make link を実行してください）'
+watcher="$(command -v hc-supervisor-watch)" \
+  || die 'hc-supervisor-watch が PATH にありません（dotfiles で make link を実行してください）'
+[[ -d "$cwd" ]] || die "ディレクトリがありません: $cwd"
+
+has_permission_hook() {
+  python3 -c '
+import json, sys
+try:
+    settings = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    sys.exit(1)
+groups = (settings.get("hooks") or {}).get("PermissionRequest") or []
+commands = [h.get("command", "") for g in groups for h in (g.get("hooks") or [])]
+sys.exit(0 if any("hc-permission" in c and "hook-worker" in c for c in commands) else 1)
+' "$claude_settings"
+}
+
+if ! has_permission_hook; then
+  printf '注意: %s に PermissionRequest hook（hc-permission hook-worker）がありません。\n' "$claude_settings" >&2
+  printf '      手動で開いたセッションの権限確認は自動判定されず、すべて監督役かあなたに回ります。\n' >&2
+  printf '      追記手順: docs/herdr-core-orchestration.md の「~/.claude/settings.json への hook の追加」\n' >&2
+fi
+
+if exists "$name"; then
+  printf '監督役は起動済みです: %s\n' "$name"
+else
+  hc run --bg --no-parent --keep --name "$name" --label role=supervisor --cwd "$cwd" \
+    claude-supervisor '監督を開始してください。'
+  printf '起動しました: %s\n' "$name"
+fi
+
+if exists "$watch_name"; then
+  printf 'watcher は起動済みです: %s\n' "$watch_name"
+else
+  # 監督役の子にし、監督役が終われば一緒に終わるようにする。子の通知は監督役へ送らない。
+  hc run --bg --parent "$name" --no-notify --name "$watch_name" --label role=supervisor-watch --cwd "$cwd" \
+    "$watcher" "$name"
+  printf '起動しました: %s\n' "$watch_name"
+fi
+
+printf '見る: Herdr app / スマホのサイドバーの %s、または hc attach %s（Ctrl+\\ で離れる）\n' "$name" "$name"
+printf '初回はフォルダ信頼（trust）のダイアログが出ることがあります。hc read %s で確認してください。\n' "$name"

@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""hc 上の全 terminal を見張り、権限待ち（blocked/permission）を監督役へ知らせる。
+
+hc の `blocked` 通知は直接の親にしか届かない。ユーザーが Herdr app やスマホで
+手動で開いたセッションには親がないので、`hc events` を見張って監督役へ
+`hc send` で転送する。
+
+- events はきっかけとしてだけ使う。JSON の形は実機未確認なので、行の中から
+  terminal のアドレスらしい値を拾い、状態は `hc get --json` で確かめる。
+  アドレスが拾えない行では `hc ls --json` で全体を見直す。
+- 監督役自身と、監督役の直接の子（hc が親へ直接通知する）は知らせない。
+- 同じ権限待ちは 1 度だけ知らせる。blocked でなくなったら忘れる。
+- 送れなかった通知（監督役が自分のダイアログで止まっている等）は後で再送する。
+
+使い方: hc-supervisor-watch <監督役の terminal>（通常は hc-supervisor が起動する）
+全体像は docs/herdr-core-orchestration.md を参照。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import time
+
+ADDRESS = re.compile(r"^(?:[a-z0-9_-]{1,32}/)?t\d+[a-z0-9]*$")
+ADDRESS_KEYS = {"address", "terminal", "id", "target", "parent"}
+RETRY_SECONDS = float(os.environ.get("HC_SUPERVISOR_WATCH_RETRY") or 30)
+RESTART_SECONDS = 5
+
+
+def log(message: str) -> None:
+    print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
+
+
+def hc_json(*args: str) -> object | None:
+    try:
+        result = subprocess.run(["hc", *args, "--json"], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def addresses_in(data: object) -> list[str]:
+    """JSON の中から terminal のアドレスらしい値を、出てきた順に重複なく集める。"""
+    found: list[str] = []
+
+    def walk(node: object, key: str = "") -> None:
+        if isinstance(node, dict):
+            for child_key, child in node.items():
+                walk(child, str(child_key))
+        elif isinstance(node, list):
+            for child in node:
+                walk(child, key)
+        elif isinstance(node, str) and key in ADDRESS_KEYS and ADDRESS.match(node) and node not in found:
+            found.append(node)
+
+    walk(data)
+    return found
+
+
+def parse_terminal(data: object, target: str) -> dict:
+    if isinstance(data, dict) and "address" not in data:
+        for key in ("terminal", "result"):
+            if isinstance(data.get(key), dict):
+                data = data[key]
+                break
+    if not isinstance(data, dict):
+        data = {}
+    status = data.get("status") if isinstance(data.get("status"), dict) else {}
+    parent = data.get("parent")
+    foreground = data.get("foreground") if isinstance(data.get("foreground"), dict) else {}
+    return {
+        "address": str(data.get("address") or target),
+        "name": str(data.get("name") or ""),
+        "parent": str((parent.get("address") if isinstance(parent, dict) else parent) or ""),
+        "state": str(status.get("state") or ""),
+        "kind": str(status.get("kind") or ""),
+        "cwd": str(foreground.get("cwd") or data.get("cwd") or ""),
+    }
+
+
+class Watcher:
+    def __init__(self, supervisor: str):
+        info = hc_json("get", supervisor)
+        self.supervisor = parse_terminal(info, supervisor)["address"] if info else supervisor
+        self.supervisor_names = {supervisor, self.supervisor}
+        self.notified: set[str] = set()
+        self.unsent: dict[str, str] = {}
+
+    def message(self, info: dict) -> str:
+        address = info["address"]
+        where = f"{info['name'] or '-'} ({info['cwd'] or '?'})"
+        return (f"<hc-watch>{address} {where} is blocked (permission). "
+                f"hc-permission show {address}</hc-watch>")
+
+    def check(self, address: str) -> None:
+        if address in self.supervisor_names:
+            return
+        data = hc_json("get", address)
+        if data is None:
+            self.notified.discard(address)
+            self.unsent.pop(address, None)
+            return
+        info = parse_terminal(data, address)
+        address = info["address"]
+        if address in self.supervisor_names:
+            return
+        blocked = info["state"] == "blocked" and info["kind"] == "permission"
+        if not blocked:
+            self.notified.discard(address)
+            self.unsent.pop(address, None)
+            return
+        if info["parent"] in self.supervisor_names:
+            return  # 直接の子は hc が親へ通知する
+        if address in self.notified or address in self.unsent:
+            return
+        self.unsent[address] = self.message(info)
+        self.flush()
+
+    def flush(self) -> None:
+        for address, text in list(self.unsent.items()):
+            try:
+                result = subprocess.run(["hc", "send", self.supervisor, text],
+                                        capture_output=True, text=True, timeout=120, check=False)
+                sent = result.returncode == 0
+                detail = result.stderr.strip()
+            except (OSError, subprocess.SubprocessError) as error:
+                sent, detail = False, str(error)
+            if sent:
+                del self.unsent[address]
+                self.notified.add(address)
+                log(f"notified: {address}")
+            else:
+                log(f"send failed (retry later): {address}: {detail}")
+
+    def rescan(self) -> None:
+        for address in addresses_in(hc_json("ls")):
+            self.check(address)
+
+    def handle_line(self, line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        addresses = addresses_in(event)
+        if not addresses:
+            self.rescan()
+        for address in addresses:
+            self.check(address)
+        if self.unsent:
+            self.flush()
+
+    def follow(self, once: bool) -> int:
+        self.rescan()
+        while True:
+            try:
+                process = subprocess.Popen(["hc", "events", "--json"], stdout=subprocess.PIPE)
+            except OSError as error:
+                log(f"hc events を起動できません: {error}")
+                return 1
+            assert process.stdout is not None
+            descriptor = process.stdout.fileno()
+            buffer = b""
+            while True:
+                timeout = RETRY_SECONDS if self.unsent else None
+                ready, _, _ = select.select([descriptor], [], [], timeout)
+                if not ready:
+                    self.flush()
+                    continue
+                chunk = os.read(descriptor, 65536)
+                if not chunk:
+                    break
+                buffer += chunk
+                *lines, buffer = buffer.split(b"\n")
+                for line in lines:
+                    self.handle_line(line.decode("utf-8", "replace"))
+            if buffer:
+                self.handle_line(buffer.decode("utf-8", "replace"))
+            process.wait()
+            if once:
+                return 0
+            log(f"hc events が終了しました（{process.returncode}）。{RESTART_SECONDS} 秒後に再接続します")
+            time.sleep(RESTART_SECONDS)
+            self.rescan()
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="hc-supervisor-watch",
+                                     description="hc 上の権限待ちを監督役へ知らせる。")
+    parser.add_argument("supervisor", help="監督役の terminal（t7 や名前）")
+    parser.add_argument("--once", action="store_true", help="hc events が終わったら再接続せずに終わる（テスト用）")
+    args = parser.parse_args(argv)
+    log(f"watching for {args.supervisor}")
+    return Watcher(args.supervisor).follow(args.once)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
