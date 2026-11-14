@@ -45,7 +45,7 @@ terminal() {
   python3 -c '
 import json, sys
 address, state, kind, parent = (sys.argv[1:] + ["", ""])[:4]
-status = {"state": state}
+status = None if state == "-" else {"state": state}
 if kind:
     status["kind"] = kind
 print(json.dumps({"address": address, "name": "n-" + address, "parent": parent or None,
@@ -53,8 +53,8 @@ print(json.dumps({"address": address, "name": "n-" + address, "parent": parent o
 ' "$@" >"$fixture/terminals/$1.json"
 }
 
-terminal t1 working
-terminal t3 blocked permission          # 手動セッション: 起動時の見直しで知らせる
+terminal t1 -                           # 監督役は起動途中（状態の報告前）: まだ送らない
+terminal t3 blocked permission          # 手動セッション: 監督役が報告し始めたら知らせる
 terminal t4 blocked permission t1       # 監督役の子: hc が親へ通知するので知らせない
 terminal t5 blocked question            # 権限待ちではない
 terminal t6 idle
@@ -72,6 +72,7 @@ wait_get() {
   echo "timeout waiting for get $1" >&2
 }
 t() { bash -c 'source "$0"; terminal "$@"' "$dir/terminal.sh" "$@"; }
+t t1 idle
 echo '{"event":"status","terminal":{"address":"t3","status":{"state":"blocked","kind":"permission"}}}'
 wait_get t3 2
 t t3 idle
@@ -116,5 +117,7 @@ grep -q $'^t1\t<hc-watch>t3 n-t3 (/repo/t3) is blocked (permission). hc-permissi
 [[ "$(count t1)" == 0 ]] && ok '監督役自身は知らせない' || ng 't1 を知らせた'
 [[ "$(count t6)" == 1 ]] && ok 'アドレスのない event では全体を見直す' || ng "t6 の通知回数: $(count t6)"
 [[ "$(count t7)" == 1 ]] && ok '送れなかった通知は後で再送する' || ng "t7 の通知回数: $(count t7)"
+grep -q 'supervisor not ready' "$fixture/watch.log" && ok '監督役が状態を報告するまでは送らない' || ng '起動途中の監督役に送った'
+
 
 exit "$failures"

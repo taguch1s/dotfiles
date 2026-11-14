@@ -853,6 +853,11 @@ def pending_matches_screen(pending: dict, screen: str) -> bool:
     flat = _normalize(screen)
     if pending.get("tool_name") == "Bash":
         needle = _normalize(str(tool_input.get("command") or ""))[:40]
+    elif tool_input.get("url"):
+        # WebFetch。画面では末尾に / が付いて表示される（実機 2026-11-14）。
+        needle = _normalize(str(tool_input["url"]).rstrip("/"))[:80]
+    elif tool_input.get("query"):
+        needle = _normalize(str(tool_input["query"]))[:40]
     else:
         raw = str(tool_input.get("file_path") or tool_input.get("notebook_path") or tool_input.get("path") or "")
         needle = _normalize(os.path.basename(raw))

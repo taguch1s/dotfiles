@@ -127,7 +127,23 @@ class Watcher:
         self.unsent[address] = self.message(info)
         self.flush()
 
+    def supervisor_ready(self) -> bool:
+        """監督役が状態を報告するまで（起動途中・trust ダイアログ中）は送らない。
+
+        起動途中に送ると、入力欄に入っただけで送信されないことがある（実機 2026-11-14）。
+        """
+        data = hc_json("get", self.supervisor)
+        if not isinstance(data, dict):
+            return False
+        if isinstance(data.get("terminal"), dict):
+            data = data["terminal"]
+        status = data.get("status")
+        return isinstance(status, dict) and bool(status.get("state"))
+
     def flush(self) -> None:
+        if self.unsent and not self.supervisor_ready():
+            log(f"supervisor not ready (retry later): {', '.join(self.unsent)}")
+            return
         for address, text in list(self.unsent.items()):
             try:
                 result = subprocess.run(["hc", "send", self.supervisor, text],

@@ -197,6 +197,21 @@ else
   ng "approve: 番号のない Yes で失敗: $(<"$fixture/err")"
 fi
 
+# WebFetch の保留要求は URL で照合する。画面では末尾に / が付く（実機 2026-11-14）。
+python3 -c '
+import json, sys, time
+json.dump({"terminal": "t2", "created_at": time.time(), "tool_name": "WebFetch",
+           "tool_input": {"url": "https://example.com", "prompt": "title"}, "cwd": sys.argv[2], "project_dir": sys.argv[2]},
+          open(sys.argv[1], "w"))' "$state/pending/t2.json" "$project"
+fetch_dialog=$' Fetch\n Claude wants to fetch content from example.com\n url: https://example.com/\n prompt: title\n Do you want to allow Claude to fetch this content?\n ❯ 1. Yes\n   2. Yes, and don\'t ask again for example.com'
+: >"$MOCK_HC_LOG"
+if env HC_TERMINAL_ID=t1 MOCK_HC_SCREEN="$fetch_dialog" "$helper" approve t2 --reason x >/dev/null 2>"$fixture/err" \
+  && grep -qx 'keys t2 enter' "$MOCK_HC_LOG"; then
+  ok 'approve: WebFetch は URL で照合する（末尾の / の違いは無視）'
+else
+  ng "approve: WebFetch の照合に失敗: $(<"$fixture/err")"
+fi
+
 expect_refusal 'approve: 保留要求がなければ拒否' env HC_TERMINAL_ID=t1 "$helper" approve t2 --reason x
 
 make_pending
