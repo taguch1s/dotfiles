@@ -48,10 +48,12 @@ fi
 
 mounts="$(grep ' drvfs ' /etc/fstab 2>/dev/null | awk '{print $2}')"
 
-# /mnt の下に見えてよいのは、/mnt/wsl（全ディストリ共有の tmpfs）と、fstab の mount point およびその親だけ。
+# /mnt の下に見えてよいのは、/mnt/wsl（全ディストリ共有の tmpfs）、/mnt/wslg（WSLg の tmpfs とシステム領域。
+# Herdr app を dev の WSLg で使うため）、fstab の mount point およびその親だけ。
+# /mnt/wslg の中は辿らず、Windows のファイルを見せる mount（9p・drvfs・virtiofs）がないことだけを下で確かめる。
 allowed() {
   local path="$1" mount_point
-  [[ "$path" == /mnt/wsl ]] && return 0
+  [[ "$path" == /mnt/wsl || "$path" == /mnt/wslg ]] && return 0
   for mount_point in $mounts; do
     [[ "$mount_point" == "$path" || "$mount_point" == "$path"/* ]] && return 0
   done
@@ -60,7 +62,11 @@ allowed() {
 unexpected=()
 while IFS= read -r path; do
   allowed "$path" || unexpected+=("$path")
-done < <(find /mnt -mindepth 1 \( -path /mnt/wsl $(printf -- '-o -path %s ' $mounts) \) -prune -print -o -print 2>/dev/null)
+done < <(find /mnt -mindepth 1 \( -path /mnt/wsl -o -path /mnt/wslg $(printf -- '-o -path %s ' $mounts) \) -prune -print -o -print 2>/dev/null)
+while read -r _ mount_point fstype _; do
+  case "$mount_point" in /mnt/wslg|/mnt/wslg/*) ;; *) continue ;; esac
+  case "$fstype" in 9p|drvfs|virtiofs) unexpected+=("$mount_point($fstype)") ;; esac
+done </proc/self/mounts
 if ((${#unexpected[@]})); then
   ng "/mnt に想定外のものが見える: ${unexpected[*]:0:5}"
 else
