@@ -47,7 +47,7 @@ journalctl --user -u awake-keeper -f   # state: claude / ssh-tmux / idle が出�
 
 ### 手作業の設定
 
-- **Tailscale（WSL 内）**: WSL に tailscale を入れ、`sudo tailscale up --ssh` で Tailscale SSH を有効にする。スマホにも Tailscale を入れて同じ tailnet に参加させる
+- **Tailscale（WSL 内）**: tailscaled はエージェントを動かす dev ディストリに置く（[wsl-dev-distro.md](wsl-dev-distro.md) の手順 4。dev の作業ユーザーは sudo を使えないので、Windows 側から `wsl -d dev -u root -- tailscale up --ssh --hostname dev`）。admin の tailscaled は止めて tailnet から外す。スマホにも Tailscale を入れて同じ tailnet に参加させる
 - **Wake on LAN**: BIOS/UEFI で WoL を有効にし、Windows のデバイスマネージャーで NIC の「Magic Packet でのウェイク」を有効にする。外出先からマジックパケットを送る方法は環境に合わせて用意する
 - **Windows の電源設定**: スリープ方式が S3 であることを `powercfg /a` で確認する。Modern Standby（S0 低電力アイドル）の PC では、`ES_SYSTEM_REQUIRED` だけではスリープを防げない場合がある
 
@@ -56,5 +56,6 @@ journalctl --user -u awake-keeper -f   # state: claude / ssh-tmux / idle が出�
 - WSL から `powershell.exe -Command '...'` を呼ぶと、引数中の `"` が落ちる。awake-keeper は `-EncodedCommand`（UTF-16LE の base64）で渡している
 - Windows 側に常駐プロセスを置かず、毎回すぐ終わる呼び出しでアイドルタイマーをリセットしている。これにより、プロセスが残る問題が起きない
 - Claude Code の sandbox からは `/mnt` の読み取りもホスト側のプロセス一覧も見えない。動作確認は通常のターミナルで行う
+- dev ディストリ（Windows のドライブと interop がない）では `powershell.exe` を呼べないため、awake-keeper はスリープを抑止できない。dev で長い作業を任せるときは Windows の電源設定でスリープを止めておく（dev から抑止する仕組みは未対応）
 
 herdr-core（Herdr app・スマホの Herdr アプリ）でオーケストレーターを動かす構成は [herdr-core-orchestration.md](herdr-core-orchestration.md) を参照してください。

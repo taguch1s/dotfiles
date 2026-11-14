@@ -1,197 +1,192 @@
 # herdr-core で Claude Code を監督する
 
-Herdr app（GUI）とスマホアプリの実行基盤である herdr-core（`hc`）に、監督役（supervisor）の Claude Code を 1 つ常駐させる構成です。監督役は、hc 上の**すべての** Claude Code セッション（あなたが Herdr app やスマホで手動で開いたものを含む）の権限確認を代行し、頼まれればワーカーの Claude Code を起動します。
+Herdr app（GUI）とスマホアプリの実行基盤である herdr-core（`hc`）に、監督役（supervisor）の Claude Code を 1 つ常駐させ、ワーカーの Claude Code を複数動かす構成です。人が張り付かなくても、ワーカーは commit・push・PR 作成まで止まらずに進みます。
 
-TUI 版 `herdr` と herdr-core は別の実行基盤です。TUI で起動したエージェントは Herdr app にもスマホにも表示されません。既存の `herdr-codex-orchestrate`（TUI 用）はそのまま残しています。Codex セッションの監督は今回の対象外です（判断ルールは Claude Code の hook 入力に依存しない `classify` にまとめてあり、後から Codex 用の入口を足せます）。
+TUI 版 `herdr` と herdr-core は別の実行基盤です。TUI で起動したエージェントは Herdr app にもスマホにも表示されません。既存の `herdr-codex-orchestrate`（TUI 用）はそのまま残しています。
 
-## 仕組み
+経緯と判断の記録: Issue #26（#21・#25 を置き換え）。
 
-```
-あなた（PC の Herdr app / スマホの Herdr アプリ / ssh + hc attach）
-  │ 依頼・エスカレーションへの回答            │ 手動で開いた Claude Code
-  ▼                                          ▼
-supervisor（role=supervisor、親なし）      t5, t6 …（親なし）── blocked(permission)
-  ├─ supervisor-watch（子、hc events を見張る）◄────── hc events
-  │     └─ hc send supervisor "<hc-watch>t5 … is blocked (permission) …</hc-watch>"
-  └─ ワーカー（role=worker、--outlive-parent）── blocked は hc が親（supervisor）へ直接通知
-```
+## 考え方: 境界は WSL ディストリ
 
-- hc の `blocked` 通知は直接の親にしか届きません。手動セッションには親がないので、watcher（[hc-supervisor-watch](../.local/bin/hc-supervisor-watch)）が `hc events` を見張り、監督役以外の terminal が `blocked (permission)` になったら監督役へ `hc send` で知らせます。監督役の子（ワーカー）は hc が親へ直接通知するので、watcher は知らせません。
-- 監督役は「ラベル `role=supervisor` を持つ terminal」で識別します。`hc-permission` の操作は、呼び出し元（`$HC_TERMINAL_ID`）の terminal を `hc get` で確かめ、監督役でなければ拒否します。ワーカー側から監督役ラベルを付ける操作（`hc label … role=supervisor` など）はポリシーで拒否します。
-- watcher は監督役の子として起動するので、監督役を止めれば watcher も止まります。ワーカーは `--outlive-parent` で起動するので、監督役が止まっても作業を続けます。
+権限の境界を、Claude Code の sandbox（コマンドごと）ではなく WSL のディストリビューション単位に置きます。
 
-権限確認は次の 5 層で扱います。判断ルール（ポリシー）は [hc-permission](../.local/bin/hc-permission) の 1 か所にあり、1 と 3 は同じルールを使います。
+- **dev**: エージェントと日常の開発用。Windows のドライブは見えず（VS Code 用の 2 ディレクトリだけ読み取り専用）、Windows のプログラムは起動できず、作業ユーザーは root になれません。作り方は [wsl-dev-distro.md](wsl-dev-distro.md)。
+- **admin**（今の `Ubuntu-24.04`）: 秘密情報と dev の境界設定を管理します。エージェントは動かしません。
+
+境界の内側では権限確認をしません。hc 上の監督役・ワーカーは、sandbox なし・`bypassPermissions` で動きます。そのうえで、取り返しのつかない操作だけを 2 か所で止めます。
 
 | 層 | 担当 | 内容 |
 | --- | --- | --- |
-| 1 | 全セッションの `PermissionRequest` hook（コード、`~/.claude/settings.json`） | hc の外と監督役自身では何もしない。明確に無害なら allow。明確に危険なら、ワーカー（`role=worker`）では deny、手動セッションでは決定せずダイアログに残す（あなたの判断）。どちらでもなければ保留要求（ツール名と入力）を `~/.local/state/hc-supervisor/pending/<terminal>.json` に保存し、通常の権限ダイアログへ回す |
-| 2 | 監督役（LLM） | 届いた権限待ちを `hc-permission show` で読み、`approve` / `deny` / `escalate` を選ぶ |
-| 3 | `hc-permission approve`（コード） | 呼び出し元が監督役か、対象が監督役自身でないかを確かめ、保留要求を危険ルールと再照合し、当たれば承認を拒否する。保留要求がない・古い・画面のダイアログと一致しない場合も拒否する |
-| 4 | 監督役の `PreToolUse` hook（コード） | 生の `hc keys`、`hc send --force`、保留要求・監査ログの直接操作、ポリシーファイルの編集を拒否し、`hc-permission` 経由に限定する |
-| 5 | あなた | 迷うもの・取り消しにくい外部操作・手動セッションでの危険操作だけ、スマホから答えやすい形で質問が届く |
+| 1 | dev ディストリ | Windows・root・admin のファイルに届かない（境界） |
+| 2 | `PreToolUse` hook（[hc-permission](../.local/bin/hc-permission) `hook`） | 事故よけ。少数の危険操作を理由付きで deny する。allow・ask は返さず、判断を auto mode や監督役に回さない |
+| 3 | GitHub の ruleset | force push とブランチの削除をサーバー側で禁止する（下記「GitHub ruleset」） |
+
+監督役は権限確認を代行しません。仕事は、判断依頼への回答（1 つに決めて `hc send` で返す）・ワーカーの起動・受理の 3 つです（[supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md)）。
+
+### なぜ sandbox をやめたか
+
+- sandbox は「1 セッション・1 作業ディレクトリ」を前提にコマンドごとに境界を張る。複数セッションの運用では、hc の socket、共通の認証情報、`.claude/settings.json`・`.git/config` への書き込みなど、境界をまたぐことが本来の仕事なので、例外が増え続けた（`excludedCommands` はパイプでつなぐと効かない、`~/.gitconfig` と gh 認証が見えず commit・push が通らない、`.claude/settings.json` が読み取り専用で bind mount され merge が `Device or resource busy` で止まる）。
+- それで守れていたのは「作業ディレクトリの外をうっかり壊さない」ことだけで、秘密情報の持ち出し経路は開いていた。
+- 権限確認のグレーゾーンを監督役に回す設計では、監督役の文脈が積み上がり、結局ユーザーに判断を丸投げした。
+- Claude Code 公式も、無人実行ではプロセス全体を container / VM で囲うこと、auto mode は境界ではないことを示している（https://code.claude.com/docs/en/sandbox-environments）。
+
+### 採らなかった案
+
+- フック → auto mode → ユーザーの 3 段（旧方針）: 段 1 を除外形式にすると auto mode に何も回らず、絞ると auto mode の確認が大量に出る。
+- ホワイトリスト方式のフック: sandbox の例外を足し続けたのと同じ保守になる。
+- srt（sandbox-runtime）: dotfiles が管理する `.bashrc` などを無条件に書き込み禁止にし、Linux では AF_UNIX ソケットの作成を一律に禁止して hc が止まる。beta。
+- 別 Linux ユーザー: egress を制限できず、主流でもない。
+- ワーカーごとのコンテナ: hc の socket、worktree の絶対パスの mount、認証の受け渡しが重い（次点）。
+
+### 残るリスク（受け入れる）
+
+- 同一 VM・同一カーネル。悪意ある脱出は対象外。
+- egress は無制限。gh トークンのスコープも当面は限定しない（`repo`・`gist` を含む）ため、持ち出しや他リポジトリへの書き込みは技術的には可能。
+- 境界の内側にある Claude の認証情報と、作業に必要な gh 認証はエージェントから見える。
+- 同じ境界の中なので、ワーカーは hc 経由で他のセッションに干渉できる（プロンプトで禁じているだけ）。
+- WSL2 のディストリは同じ VM でネットワークを共有するため、admin の `127.0.0.1` のサービスに dev から届く。admin には localhost のサービスを置かない。
+- hook はコマンド文字列の検査なので、スクリプト経由などの回避は防げない（事故よけであり防御線ではない）。force push とブランチ削除は ruleset でも止める。
+- 秘密情報の扱いは対象外（境界の外に置き、操作だけを中継する仕組みを別に用意する）。
+
+## 構成
+
+```
+あなた（PC の Herdr app / スマホの Herdr アプリ / ssh + hc attach）
+  │ 依頼・質問への回答
+  ▼
+supervisor（dev、role=supervisor、親なし）
+  │ hc run … claude-worker（--outlive-parent）     ▲ hc send supervisor（相談・報告）
+  ▼                                               │
+ワーカー（dev、role=worker）── commit・push・PR まで止まらない
+```
 
 | ファイル | 内容 |
 | --- | --- |
-| [hc-supervisor](../.local/bin/hc-supervisor) | 監督役と watcher の起動・状態表示・停止 |
-| [hc-supervisor-watch](../.local/bin/hc-supervisor-watch) | `hc events` を見張り、権限待ちを監督役へ知らせる |
-| [hc-permission](../.local/bin/hc-permission) | ポリシー、両 hook、`show` / `approve` / `deny` / `escalate` / `trust` |
-| [templates/claude-supervisor.md](../.config/herdr-core/templates/claude-supervisor.md) / [claude-worker.md](../.config/herdr-core/templates/claude-worker.md) | `hc run` で使うテンプレート（起動コマンド） |
+| [hc-claude](../.local/bin/hc-claude) | 監督役・ワーカーの起動ラッパー。`/etc/dotfiles-role` が `dev` のときだけ `claude --model opus --permission-mode bypassPermissions --settings session-settings.json --append-system-prompt-file <role>-prompt.md` を exec し、それ以外（admin）では起動を拒否する |
+| [hc-supervisor](../.local/bin/hc-supervisor) | 監督役の起動・状態表示・停止（dev でだけ起動） |
+| [hc-permission](../.local/bin/hc-permission) | 事故よけの deny リスト（`hook` / `check`） |
+| [templates/claude-supervisor.md](../.config/herdr-core/templates/claude-supervisor.md) / [claude-worker.md](../.config/herdr-core/templates/claude-worker.md) | `hc run` のテンプレート（`command: hc-claude supervisor|worker`） |
+| [claude/session-settings.json](../.config/herdr-core/claude/session-settings.json) | hc 上のセッションの設定（`defaultMode: bypassPermissions`、`sandbox.enabled: false`、`PreToolUse` Bash → `hc-permission hook`） |
 | [claude/supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) / [worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) | 役割のシステムプロンプト |
-| [claude/supervisor-settings.json](../.config/herdr-core/claude/supervisor-settings.json) | 監督役の PreToolUse hook と許可ルール |
 
-役割は、テンプレートの `command` で `--append-system-prompt-file`（システムプロンプト）と、監督役では `--settings`（hook と許可ルール）を渡して固定します。PermissionRequest hook は手動セッションにも効かせるため、テンプレートではなく `~/.claude/settings.json` に入れます。
+- bypassPermissions・sandbox なしは **hc-claude で起動したセッション（監督役・ワーカー）だけ**です。Herdr app で手動で開いたセッションや VS Code の Claude Code は、各ディストリの `~/.claude/settings.json` のまま動きます。
+- `--settings` は user / project の設定より上、managed より下で効きます。`skipDangerousModePermissionPrompt`（bypassPermissions の初回確認を出さない）は `--settings` からは効かないため、dev の `~/.claude/settings.json` に `setup-dev-distro.sh` が入れます。
+- `permissions.blockReadsOutsideWorkingDirectories: true` を `~/.claude/settings.json` に入れている場合、どの scope からも外せません。ワーカーのファイルツール（Read など）は worktree の外で止まります（Bash は対象外）。
+- 報告先は名前の `supervisor` に固定しています。監督役を作り直しても、ワーカーの報告は新しい監督役に届きます。
 
-### 自動判定の既定ルール
+### 事故よけの deny リスト
 
-セッションを起動したディレクトリ（`CLAUDE_PROJECT_DIR`、なければ cwd）を「worktree」として判定します。
+`hc-permission check '<コマンド>'` で判定を確かめられます。ルールを変えるときは `hc-permission` を編集し、`tests/test_hc_permission.py` に例を足します。
 
-- 自動で許可: 読み取り系コマンド、Read / Glob / Grep、worktree 内のファイル編集、テスト・lint・ビルド（`pytest`、`make check`、`pnpm test`、`cargo test` など）、lockfile に沿った依存の導入（`uv sync`、`pnpm install`）、`git add` / `commit`、自分のブランチへの通常の push、`gh pr create` / `view`、`gh issue view`、`/tmp` と `$TMPDIR` への書き込み
-- 危険（ワーカーでは自動で拒否、手動セッションではあなたの判断）: `sudo`、force push、main などの既定ブランチへの push、`git reset --hard`、`git clean -f`、ブランチ・tag の削除、`gh pr merge`、リリース・パッケージ公開、`curl … | sh`、秘密情報（`~/.ssh`、`.env`、`printenv` など）へのアクセス、worktree の外への書き込み、監督役ラベルの付与
-- 監督役へ回す: それ以外（ネットワークアクセス、新しいパッケージの追加、コマンド置換を含むもの、worktree の外への `cd`、WebFetch、MCP ツールなど）
+- 止めるもの: `sudo` / `su`（パスワード待ちで止まるため）、force push、リモートのブランチ・tag の削除と mirror push、`git reset --hard`、`git clean -f`、`git branch -D`、`git stash drop|clear`、`filter-branch` などの履歴書き換え、`git config --global|--system`、`gh repo delete|archive|rename|edit`、`gh release delete`、`gh secret|variable|ssh-key|gpg-key`、`gh auth logout|refresh|switch|token|setup-git`、`gh api` の DELETE と ruleset・ブランチ保護の変更、パッケージ・イメージの公開、`rm` での `/`・`~`・`$HOME`・`.`・`..`・`*`、`curl … | sh`、システム操作、`dd of=/dev`、`crontab -r`、`chmod 777`。
+- 止めないもの: main への直接 push（dotfiles は main へ push する規約）、`gh pr merge`（ruleset で守る）、秘密情報のパターン（境界の外の話）、`hc keys` / `hc send --force`（同じ境界の中の干渉は許容）。
 
-`~/.claude/settings.json` の `permissions.allow` / `deny` は hook より先に効きます。たとえば `Bash(git push:*)` を allow にしていれば、push はダイアログにも hook にも来ません。
+拒否されたセッションにはエラーが返るだけで、止まりません。ワーカーは別の方法を取るか、監督役に相談します。
 
-ルールを変えるときは `hc-permission` を編集し、`tests/test_hc_permission_policy.py` に例を足します。
+### フォルダ信頼（trust）
 
-### sandbox との関係
+trust は git リポジトリのルートに付き、worktree はメイン checkout のルートを使います。リポジトリごとに 1 回 trust すれば、そのリポジトリの worktree では出ません。dev は admin の `~/.claude.json` を複製するので、既存のリポジトリは trust 済みです。新しいリポジトリで出たら、Herdr app かスマホで「Yes, I trust this folder」を選びます（既定は「No, exit」）。`$HOME` で起動したときの trust は保存されません。
 
-`~/.claude/settings.json` で sandbox を有効にしているので、hc 上のセッションの Bash も sandbox の中で動きます。sandbox 内の Bash は確認なしで通る（`autoAllowBashIfSandboxed`）ため、権限ダイアログは大きく減ります。worktree の外に書けないことも OS が保証するので、監督役の判断を誤っても被害が広がりません。この構成では sandbox を残す前提です。
+## 導入（dev で行う）
 
-一方、sandbox の中からは hc の core に接続できません。そこで、役割ごとの settings で必要なコマンドだけを sandbox の外で実行できるようにしています（`sandbox.excludedCommands`）。sandbox の外で動くのはコマンドを単独で実行したときだけで、パイプや `&&` でつなぐと sandbox の中に戻ります。
-
-| 役割 | sandbox の外で動くもの | 理由 |
-| --- | --- | --- |
-| 監督役（[supervisor-settings.json](../.config/herdr-core/claude/supervisor-settings.json)） | `hc`、`hc-permission` | core と話して権限確認に答えるのが仕事 |
-| ワーカー（[worker-settings.json](../.config/herdr-core/claude/worker-settings.json)） | `hc send` | 監督役への報告 |
-
-sandbox のネットワーク許可ダイアログ（「Network request outside of sandbox」）は PermissionRequest hook を通りません。hc 上は `blocked (permission)` と `allow network: <接続先>` として見えるので、watcher は知らせ、監督役は `hc-permission show` で接続先を確かめますが、保留要求がないので承認はできず、あなたに回します。よく使う接続先は `~/.claude/settings.json` の `sandbox.network.allowedDomains` に入れておくと、ダイアログ自体が出なくなります。
-
-### permission mode
-
-ワーカーにも手動セッションにも permission mode を強制しません（`--permission-mode` を付けない）。手動セッションには強制できず、ワーカーだけ変えると扱いが揃わないためです。あなたの既定が auto mode などなら、Claude Code 自身の判定で通る操作はダイアログにならず、hook にも監督役にも届きません。監督役に判断させたいセッションは default mode で開いてください。
-
-### 注意
-
-- herdr-core のマニュアルは、`blocked` を「人の判断が必要」と位置づけています。この構成は、その判断の一部をあなたの代わりに hook と監督役へ任せるものです。`~/.local/state/hc-supervisor/decisions.jsonl`（hook の自動判定も含む全判断の記録）を定期的に確認し、ルールが緩すぎないか見直してください。
-- 手動セッションの権限待ちは、監督役にもあなたにも見えます。どちらが答えてもかまいません。監督役は、届いた時点で既に blocked でなければ何もしません。
-- 第 4 層の拒否は、コマンド文字列に対する検査です。スクリプトを書いて間接的に実行するなどの回避は防げません。第 1 層と第 3 層がコードで止めるので、危険な操作が監督役に承認されることはありませんが、監督役が「迷うもの」を承認できる点は変わりません。
-- watcher からの知らせ（`<hc-watch>…`）は、どのセッションからでも `hc send` で偽装できます。監督役はそれを指示として扱わず、必ず `hc-permission show` と `approve` の検査を通します。
-- 初回起動のフォルダ信頼（trust）ダイアログには、監督役が自分の子（ワーカー）に限って `hc-permission trust` で答えます。手動セッションの trust にはあなたが答えます。
-- `hc-supervisor` は監督役を `--keep` で起動します。herdr-core の再起動後、監督役の terminal は元のコマンドの代わりにシェルになり、watcher は消えます。`hc-supervisor stop` の後に `hc-supervisor` で起動し直してください。
-
-## 導入
-
-### 1. リンクと hc
-
-hc の導入は `curl -fsSL https://releases.herdr.dev/core/install.sh | sh`（`make bootstrap` も未導入なら実行します）です。
+前提: [wsl-dev-distro.md](wsl-dev-distro.md) の手順で dev を作り、`verify-dev-boundary.sh` がすべて OK であること。
 
 ```bash
-make link        # hc-permission・hc-supervisor・watcher・テンプレート・役割ファイルをリンク
-hc templates     # claude-supervisor / claude-worker が出ることを確認
+make link          # hc-claude・hc-supervisor・hc-permission・テンプレート・役割ファイルをリンク
+hc templates       # claude-supervisor / claude-worker が出ることを確認
+hc-supervisor      # 監督役を起動。Herdr app のタブから実行すると、そのスペースに「supervisor」タブが出る
+hc-supervisor status
+hc-supervisor stop # 止める（ワーカーは止まらない）
+hc attach supervisor   # 端末から見る場合。Ctrl+\ で離れる（止まらない）
 ```
 
-### 2. ~/.claude/settings.json への hook の追加
+初回は監督役の cwd（既定は `~/.local/share/hc-supervisor`）で trust のダイアログが出ます。↓ で「Yes, I trust this folder」を選んでから Enter を押してください。
 
-`~/.claude/settings.json` は初回だけ dotfiles からコピーされる（`copy-if-missing`）ため、既存の環境には自動で入りません。`hooks` に次の `PermissionRequest` を手で追記してください（他の hook はそのまま残します）。
+Herdr app の端末での貼り付けは **Ctrl+Shift+V**（または右クリック）です。Ctrl+V は zsh で「次のキーを文字として入れる」になり、続けて Enter を押すと `command not found: ^M` になります。
 
-```json
-"PermissionRequest": [
-  {
-    "matcher": "*",
-    "hooks": [
-      {
-        "type": "command",
-        "command": "~/.local/bin/hc-permission hook-worker",
-        "timeout": 30
-      }
-    ]
-  }
-]
-```
+### 旧構成（#21・#25）からの移行
 
-追記後の確認:
+1. 各ディストリ（admin・dev）の `~/.claude/settings.json` の `hooks.PermissionRequest` から、`hc-permission hook-worker` を呼ぶエントリを消す。旧 hook 名は何もしない（no-op）ので、消し忘れても動作は壊れません。
+   ```bash
+   python3 -m json.tool ~/.claude/settings.json >/dev/null && echo OK
+   ```
+2. 古いリンクを消す（`make link` は消えたファイルのリンクを片付けません）。
+   ```bash
+   rm -f ~/.local/bin/hc-supervisor-watch \
+     ~/.config/herdr-core/claude/worker-settings.json \
+     ~/.config/herdr-core/claude/supervisor-settings.json
+   ```
+3. admin で動いている監督役と watcher を止める（admin の端末で `hc kill supervisor-watch; hc kill supervisor`）。この変更を pull した後は、admin の `hc-supervisor` とテンプレートは起動を拒否します（`/etc/dotfiles-role` がないため）。動いている監督役はそのまま動き続けますが、権限代行の仕組み（watcher・`hc-permission show` / `approve`）はなくなっています。
+4. `~/.local/state/hc-supervisor/`（旧構成の保留要求・監査ログ）は不要です。中身を見て消してかまいません。
+
+## 使い方
+
+- ワーカーを頼む: Herdr app かスマホで `supervisor` を開き、「~/mlbot-dev の Issue #12 と #13 を /issue-development-workflow で PR 作成まで進めて」のように頼みます。監督役はワーカーを `--outlive-parent` で起動し、結果を実測で確かめて報告します。
+- ワーカーが判断に迷うと `hc send supervisor` で相談が届き、監督役が 1 つに決めて返します。監督役が決められないもの（仕様・優先度、取り消しにくい外部操作、hook に止められた操作が必要なもの）だけ、監督役のタブに「【確認】…」として質問が出ます。
+- 手動セッション: Herdr app で新しいタブを開いて使えます。権限確認は `~/.claude/settings.json` のとおりで、監督役は関与しません（相談したいときは `hc send supervisor`）。
+- 監督役の作り直し: 文脈が大きくなると、監督役が `~/.local/share/hc-supervisor/handoff.md` に引き継ぎを書き、作り直しを頼んできます。`hc-supervisor stop` → `hc-supervisor` を実行すると、新しい監督役が handoff を読んで続けます。
+- `hc-supervisor` は監督役を `--keep` で起動します。herdr-core の再起動後、監督役の terminal はシェルになります。`hc-supervisor stop` の後に `hc-supervisor` で起動し直してください。
+
+## GitHub ruleset（ユーザーが設定する）
+
+force push とブランチの削除を GitHub 側で禁止します。dotfiles と mlbot-dev の両方に設定します。hook はこの変更（`gh api` の ruleset 操作）を拒否するので、admin か Web UI で行います。
+
+Web UI: リポジトリの Settings → Rules → Rulesets → New ruleset → New branch ruleset
+
+- Ruleset name: `protect-history`、Enforcement status: Active
+- Bypass list: 空
+- Target branches: Include all branches
+- Branch rules: 「Restrict deletions」と「Block force pushes」だけにチェック。「Require a pull request before merging」は付けない（dotfiles は main へ直接 push する）。
+
+gh で設定する場合（admin で実行）:
 
 ```bash
-python3 -m json.tool ~/.claude/settings.json >/dev/null && echo OK   # JSON として壊れていないこと
-# hc の外では何もしない（何も出力されなければ正しい）
-echo '{"tool_name":"Bash","tool_input":{"command":"git push --force"},"cwd":"/tmp"}' \
-  | env -u HC_TERMINAL_ID ~/.local/bin/hc-permission hook-worker
+for repo in taguch1s/dotfiles taguch1s/mlbot-dev; do
+  gh api -X POST "repos/$repo/rulesets" --input - <<'EOF'
+{
+  "name": "protect-history",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {"ref_name": {"include": ["~ALL"], "exclude": []}},
+  "rules": [{"type": "deletion"}, {"type": "non_fast_forward"}]
+}
+EOF
+done
+gh api repos/taguch1s/dotfiles/rulesets   # 確認
 ```
 
-hook は hc の外（`HC_TERMINAL_ID` がない）では何もしないので、通常の端末や VS Code の Claude Code には影響しません。
-
-### 3. 監督役の起動
-
-```bash
-hc-supervisor            # 監督役（supervisor）と watcher（supervisor-watch）を起動。Herdr app のタブから実行する
-hc-supervisor status     # 状態を見る
-hc-supervisor stop       # 止める（ワーカーは止まらない）
-hc attach supervisor     # 端末から見る場合。Ctrl+\ で離れる（止まらない）
-```
-
-初回は監督役の cwd（既定は `~/.local/share/hc-supervisor`、`--cwd` で変更）でフォルダ信頼のダイアログが出ます。**既定で「No, exit」が選ばれている**ので、Herdr app かスマホ、または `hc attach supervisor` で開き、↓ で「Yes, I trust this folder」を選んでから Enter を押してください。ダイアログが出ている間は最初の依頼文が届きませんが、役割はシステムプロンプトで渡しているので、そのまま待機状態になります。`~/.claude/settings.json` に hook がなければ、`hc-supervisor` が注意を表示します。
-
-Herdr app の端末での貼り付けは **Ctrl+Shift+V**（または右クリック）です。Ctrl+V はシェルにそのまま送られ、zsh では「次のキーを文字として入れる」になるので、続けて Enter を押すと `command not found: ^M` になります。
-
-### 4. 使い方
-
-- 監督役の表示: Herdr app は terminal のラベル `herdr.space` / `herdr.tab` でスペースとタブに配置します（文書化されていない仕組みを実機で確認）。`hc-supervisor` を Herdr app のタブから実行すると、そのスペースに「supervisor」タブとして出し、左下の Agents にも watcher と一緒に並びます。Herdr app の外から起動した場合は表示されないので、`hc attach supervisor` で見るか、Herdr app のタブで `hc-supervisor stop` → `hc-supervisor` で起動し直します。
-- 手動セッション: これまでどおり Herdr app で横に新しいタブを開き、Claude Code に実装を頼むだけです。権限待ちになると、無害なものは hook が自動で許可し、判断が要るものは監督役に届き、迷うものは監督役のタブで「【確認】…」としてあなたに質問が出ます。危険ルールに当たるものと、sandbox のネットワーク許可は、そのタブのダイアログにあなたが答えます。`~` で開くと毎回フォルダ信頼のダイアログが出るので、リポジトリや worktree のディレクトリで開きます。
-- ワーカーを頼む: Herdr app かスマホで `supervisor` を開き、「~/mlbot-dev の Issue #12 と #13 を /issue-development-workflow で PR 作成まで進めて」のように頼みます。監督役は `role=worker` のワーカーを `--outlive-parent` で起動し、結果を確かめて報告します。
+全ブランチで削除を禁止すると、マージ済みの作業ブランチもリモートから消せなくなります。消したいときは ruleset の Target を `main` などに絞るか、一時的に無効にします。PR の「Automatically delete head branches」も効かなくなります。
 
 ## 外出先から操作する
 
-herdr-core の terminal は、どのクライアント（Herdr app、スマホアプリ、`hc attach`）からつないでも同じものを操作できます。PC の Herdr app で動かしているセッションを、外出先からそのまま引き継げます。
-
-### スマホアプリ（Herdr、iPhone / iPad / Android）
-
-スマホアプリは SSH で各マシンの herdr-core に直接つなぎます。Herdr のアカウントや中継サーバーはありません。この環境では、既存の [スマホからの遠隔操作](remote-access.md) の経路をそのまま使えます。
+herdr-core の terminal は、どのクライアント（Herdr app、スマホアプリ、`hc attach`）からつないでも同じものを操作できます。
 
 ```
-スマホ（Herdr アプリ）──Tailscale SSH──> WSL（tailscaled）──> herdr-core ──> supervisor / 各セッション
+スマホ（Herdr アプリ）──Tailscale SSH──> dev（tailscaled）──> herdr-core ──> supervisor / ワーカー
 ```
 
-1. WSL で `sudo tailscale up --ssh` 済みであること（[remote-access.md](remote-access.md) の手作業の設定）
+1. dev で `tailscale up --ssh --hostname dev` 済みであること（[wsl-dev-distro.md](wsl-dev-distro.md) の手順 4、root 作業は `wsl -d dev -u root`）
 2. スマホにも Tailscale を入れ、同じ tailnet に参加する
-3. Herdr アプリで WSL のマシン（Tailscale のデバイス一覧から選べる）を追加する
+3. Herdr アプリで `dev` のマシンを追加する
 
-スマホからは、どのエージェントが待っているかの確認、本物の端末を開いての操作、テキスト・スクリーンショット・音声での返信ができます。スマホで見ても PC 側の画面サイズは変わりません。
+スマホアプリが使えない場合は、Tailscale SSH で dev に入り、`hc attach supervisor` で操作できます（Ctrl+\ で離れる）。
 
-### Windows の Herdr app から WSL のセッションを見る
-
-Windows 版 Herdr app のローカル core は Windows 側にあります。WSL で動くセッションを同じサイドバーに出すには、WSL をマシンとして追加します（SSH サーバーは不要です）。
-
-```powershell
-hc machine add --via 'wsl.exe -d Ubuntu -e sh -c' --name wsl
-```
-
-監督役は自分のマシンの herdr-core の terminal だけを見張ります。スマホは WSL の herdr-core へ直接つなぐため、監督役も監督されるセッションも WSL 側（`--on wsl` または WSL のシェル）で動かします。
-
-### スマホアプリが使えない場合
-
-Tailscale SSH で WSL に入り、`hc attach supervisor` で同じ terminal を操作できます（Ctrl+\ で離れる）。
+Windows 版 Herdr app から見る場合は、dev をマシンとして追加します（`hc machine add --via 'wsl.exe -d dev -e sh -c' --name dev`）。dev の WSLg で Herdr app を起動する場合は不要です。
 
 ### 動かし続けるための条件
 
-- PC がスリープすると止まります。スリープ抑止は [remote-access.md](remote-access.md) の awake-keeper が担当しますが、判定対象は「Claude 作業中」と「SSH 経由の tmux」です。hc の terminal で Claude が作業している間は awake-hook のマーカーで抑止されます。
-- WSL がアイドル停止しないよう、`loginctl enable-linger` を有効にしておきます（`make remote-access` が設定します）。
+- PC がスリープすると止まります。awake-keeper（[remote-access.md](remote-access.md)）は Windows の `powershell.exe` を呼ぶため、Windows のドライブと interop がない dev では動きません。dev で長い作業を任せるときは、Windows の電源設定でスリープを止めておいてください（dev から抑止する仕組みは未対応）。
+- WSL がアイドル停止しないよう、dev でも `loginctl enable-linger` を有効にしておきます（admin から複製されていれば有効のまま）。
 - herdr-core は PC の再起動後に未完了の作業を再開しません。
 
 ## 確認状況
 
-- ポリシーの判定とラベルの解釈は `tests/test_hc_permission_policy.py`、hook の入出力と `hc-permission` のガード・監査ログは `tests/test_hc_permission.sh`、watcher は `tests/test_hc_supervisor_watch.sh`、起動スクリプトは `tests/test_hc_supervisor.sh` で、偽の `hc` を使って検証しています（`make check` で実行）。
-- 実機で確認済み（hc 0.1.21、2026-11-14）:
-  - `hc get --json` は最上位に `address`、`name`、`parent`（なしは `null`）、`state`（`live` / `finished`）、`labels`（辞書）、`status`（報告前は `null`）、`cwd` と `foreground.cwd` を持つ。`hc ls --json` は `{"terminals": [...]}`
-  - `hc-supervisor` で監督役（`role=supervisor`、親なし）と watcher（監督役の子）が起動する
-  - Claude Code の trust ダイアログは `❯ No, exit` / `Yes, I trust this folder` で、No が既定。`hc-permission trust` は ↓ で Yes に動かし、画面で確かめてから Enter を送る
-  - 初回の trust ダイアログ中は `hc run` が最初の依頼文を届けられず待つ（`first_message.sent: false`）。`hc-supervisor` は `--timeout 20` で待ちを切り上げる
-- 端から端まで実機で確認済み（2026-11-14）: 手動で開いたセッションの WebFetch が権限待ちになる → hook が保留要求を保存 → watcher が監督役へ通知 → 監督役が `hc-permission show` / `approve` で承認 → セッションの WebFetch が成功、`decisions.jsonl` に記録。
-- 次の点は実機確認が必要です。実装はどれも形が違っても動くよう寛容にしてありますが、前提が外れていれば直します。
-  - `hc events --json` の 1 行の形（watcher はアドレスらしい値を拾い、拾えなければ `hc ls --json` で全体を見直す）
-  - 権限ダイアログの選択肢の形（`❯ 1. Yes` と番号なしの `❯ Yes` の両方を受け付ける）
-- 実機で確認済み（続き）: Claude Code は hc に状態を報告し、権限待ちは `blocked (permission)` と `msg`（`approve Fetch: …`、`allow network: …`）で見える。watcher は手動セッションの権限待ちを監督役に知らせる。WebFetch など通常のツール権限では hook に `HC_TERMINAL_ID` が引き継がれ、保留要求が保存される。`$HOME` のフォルダ信頼は保存されないため、監督役の既定の cwd は `~/.local/share/hc-supervisor`
-  - PermissionRequest hook に `HC_TERMINAL_ID` が引き継がれること、`--settings` で渡した監督役の PreToolUse hook が `~/.claude/settings.json` の hook と併合されて動くこと
-  - Claude Code が hc の terminal 内で `blocked (permission)` を報告すること、親への通知と watcher の `hc send` が監督役に届くこと（監督役が作業中・自分のダイアログで止まっているときを含む）
-  - `hc run` のテンプレートに渡した最初の依頼文が送られること、`--keep` の監督役が herdr-core の再起動後にどうなるか
-  - `hc-permission approve` / `deny` / `trust` の Enter / Esc が、実際のダイアログで意図した選択肢になること
-  - スマホアプリからの接続
+- テスト（`make check` で実行）: 事故よけのルールと hook の入出力は `tests/test_hc_permission.py`、起動ラッパーの role 判定と引数は `tests/test_hc_claude.sh`、`hc-supervisor` は `tests/test_hc_supervisor.sh`（偽の `hc` を使用）。
+- 実機で確認済み（hc 0.1.21、2026-11-14、旧構成で確認したもの）: `hc get --json` の形、Herdr app のラベル `herdr.space` / `herdr.tab` による配置、trust ダイアログ中は `hc run` の最初の依頼文が届かない（`first_message.sent: false`）こと。
+- dev の境界（sbx-test、2026-11-14）: [wsl-dev-distro.md](wsl-dev-distro.md) の「確認済みのこと」。
+- dev での実機確認が必要なもの（#26 の最後の受け入れ条件）:
+  - ワーカーが commit・push・PR まで止まらずに進む（bypassPermissions の初回確認が出ない、テンプレートの依頼文が `hc-claude` の引数として claude に渡る）
+  - `.claude/settings.json` を含む merge が通る
+  - 事故よけの hook が効く（例: ワーカーで `git push --force` が理由付きで拒否される）
+  - 判断依頼に監督役が自分で回答する
+  - スマホ（Tailscale SSH）から dev の hc に届く
