@@ -229,6 +229,13 @@ mode = "manual"
 reason = "sudo が必要"
 
 [[config]]
+name = "WSL dev ディストリ（エージェントの境界）"
+source = "wsl/dev/setup-dev-distro.sh"
+target = "/etc/dotfiles-role"
+mode = "manual"
+reason = "dev の中で root が実行する。手順は docs/wsl-dev-distro.md"
+
+[[config]]
 name = "WSL (Windows)"
 source = "windows/.wslconfig"
 target = "%UserProfile%\\.wslconfig"
