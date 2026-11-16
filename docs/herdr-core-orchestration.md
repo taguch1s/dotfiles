@@ -72,7 +72,7 @@ supervisor（dev、role=supervisor、親なし）
 
 | ファイル | 内容 |
 | --- | --- |
-| [hc-claude](../.local/bin/hc-claude) | 監督役・ワーカーの起動ラッパー。`/etc/dotfiles-role` が `dev` のときだけ `claude --model opus --permission-mode bypassPermissions --settings session-settings.json --append-system-prompt-file <role>-prompt.md` を exec し、それ以外（admin）では起動を拒否する |
+| [hc-claude](../.local/bin/hc-claude) | 監督役・ワーカーの起動ラッパー。`/etc/dotfiles-role` が `dev` のときだけ `claude --model opus --effort <high|medium> --permission-mode bypassPermissions --settings session-settings.json --append-system-prompt-file <role>-prompt.md` を exec し（effort は監督役 high・ワーカー medium）、それ以外（admin）では起動を拒否する |
 | [hc-supervisor](../.local/bin/hc-supervisor) | 監督役の起動・状態表示・停止（dev でだけ起動） |
 | [hc-permission](../.local/bin/hc-permission) | 事故よけの deny リスト（`hook` / `check`） |
 | [templates/claude-supervisor.md](../.config/herdr-core/templates/claude-supervisor.md) / [claude-worker.md](../.config/herdr-core/templates/claude-worker.md) | `hc run` のテンプレート（`command: hc-claude supervisor|worker`） |

@@ -37,5 +37,12 @@ settings="$config_dir/session-settings.json"
 prompt="$config_dir/$role-prompt.md"
 [[ -f "$settings" && -f "$prompt" ]] || die "設定がありません: $settings / $prompt（dotfiles で make link を実行してください）"
 
-exec "${HC_CLAUDE_BIN:-claude}" --model opus --permission-mode bypassPermissions \
+# effort: 監督役は判断の質を優先して high、ワーカーは量をこなすので medium。
+# ~/.claude/settings.json の effortLevel に左右されないよう明示する。
+case "$role" in
+  supervisor) effort=high ;;
+  worker) effort=medium ;;
+esac
+
+exec "${HC_CLAUDE_BIN:-claude}" --model opus --effort "$effort" --permission-mode bypassPermissions \
   --settings "$settings" --append-system-prompt-file "$prompt" "$@"

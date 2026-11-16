@@ -25,11 +25,11 @@ args() { tr '\037' ' ' <"$fixture/bin/args"; }
 
 echo dev >"$HC_CLAUDE_ROLE_FILE"
 "$launcher" worker '依頼文'
-expected="--model opus --permission-mode bypassPermissions --settings $config/session-settings.json --append-system-prompt-file $config/worker-prompt.md 依頼文"
-[[ "$(args)" == "$expected" ]] && ok 'dev: ワーカーを bypassPermissions・hc 用 settings・役割のプロンプトで起動する' \
+expected="--model opus --effort medium --permission-mode bypassPermissions --settings $config/session-settings.json --append-system-prompt-file $config/worker-prompt.md 依頼文"
+[[ "$(args)" == "$expected" ]] && ok 'dev: ワーカーを effort medium・bypassPermissions・hc 用 settings・役割のプロンプトで起動する' \
   || ng "ワーカーの引数が違う: $(args)"
 "$launcher" supervisor
-[[ "$(args)" == *"--append-system-prompt-file $config/supervisor-prompt.md" ]] && ok 'dev: 監督役は監督役のプロンプトで起動する' \
+[[ "$(args)" == "--model opus --effort high "*"--append-system-prompt-file $config/supervisor-prompt.md" ]] && ok 'dev: 監督役は effort high・監督役のプロンプトで起動する' \
   || ng "監督役の引数が違う: $(args)"
 
 rm -f "$fixture/bin/args"
