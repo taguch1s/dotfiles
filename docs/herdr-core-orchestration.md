@@ -21,7 +21,17 @@ TUI 版 `herdr` と herdr-core は別の実行基盤です。TUI で起動した
 | 2 | `PreToolUse` hook（[hc-permission](../.local/bin/hc-permission) `hook`） | 事故よけ。少数の危険操作を理由付きで deny する。allow・ask は返さず、判断を auto mode や監督役に回さない |
 | 3 | GitHub の ruleset | force push とブランチの削除をサーバー側で禁止する（下記「GitHub ruleset」） |
 
-監督役は権限確認を代行しません。仕事は、判断依頼への回答（1 つに決めて `hc send` で返す）・ワーカーの起動・受理の 3 つです（[supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md)）。
+監督役は権限確認を代行しません。仕事は、判断と記録（仕様・設計を含めて 1 つに決めて `hc send` で返し、判断記録に残す）・ワーカーの起動・受理の 3 つです（[supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md)）。
+
+### 判断は監督役が決め、ユーザーは後から直す
+
+権限確認がなくなったので、作業が止まるのは判断待ちのときだけです。そこでユーザーに事前承認を求めず、監督役が決めて進めさせ、決めたことを記録してユーザーが後から確かめて直す形にしています。
+
+- ワーカーは仕様・設計の判断もユーザーに聞かず、`hc send supervisor` で相談します（skill の「ユーザーに確認する」も監督役への相談に読み替える）。
+- 監督役は 1 つに決め、`~/.local/share/hc-supervisor/decisions.md` に `D-YYYYMMDD-HHMM` の ID で記録してから返します。記録には相談・決定・理由・退けた案・影響と直し方を書き、Issue から外れる判断や推測で決めた判断には「要確認: あり」を付けます。
+- ワーカーは PR 本文の「監督役の判断」の節に ID と決定を書きます。監督役は完了報告にも判断の一覧を付けます。
+- 直したいときは、監督役に「D-… は ○○ に直して」と頼みます。監督役は記録に訂正を追記し、動いているワーカーに伝えるか、直しのワーカーを起動します。
+- ユーザーに回るのは、取り消しにくい外部操作（デプロイ、課金、外部サービスへの書き込みなど）と、事故よけ hook に止められた操作が必要なものだけです。
 
 ### なぜ sandbox をやめたか
 
@@ -122,7 +132,7 @@ Herdr app の端末での貼り付けは **Ctrl+Shift+V**（または右クリ�
 ## 使い方
 
 - ワーカーを頼む: Herdr app かスマホで `supervisor` を開き、「~/mlbot-dev の Issue #12 と #13 を /issue-development-workflow で PR 作成まで進めて」のように頼みます。監督役はワーカーを `--outlive-parent` で起動し、結果を実測で確かめて報告します。
-- ワーカーが判断に迷うと `hc send supervisor` で相談が届き、監督役が 1 つに決めて返します。監督役が決められないもの（仕様・優先度、取り消しにくい外部操作、hook に止められた操作が必要なもの）だけ、監督役のタブに「【確認】…」として質問が出ます。
+- ワーカーが判断に迷うと `hc send supervisor` で相談が届き、監督役が仕様・設計を含めて 1 つに決めて返し、`~/.local/share/hc-supervisor/decisions.md` に記録します。後から見るときは監督役に「判断記録を見せて」と頼むか、ファイルを直接開きます。取り消しにくい外部操作と hook に止められた操作が必要なものだけ、監督役のタブに「【確認】…」として質問が出ます。
 - 手動セッション: Herdr app で新しいタブを開いて使えます。権限確認は `~/.claude/settings.json` のとおりで、監督役は関与しません（相談したいときは `hc send supervisor`）。
 - 監督役の作り直し: 文脈が大きくなると、監督役が `~/.local/share/hc-supervisor/handoff.md` に引き継ぎを書き、作り直しを頼んできます。`hc-supervisor stop` → `hc-supervisor` を実行すると、新しい監督役が handoff を読んで続けます。
 - `hc-supervisor` は監督役を `--keep` で起動します。herdr-core の再起動後、監督役の terminal はシェルになります。`hc-supervisor stop` の後に `hc-supervisor` で起動し直してください。
@@ -188,5 +198,5 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
   - ワーカーが commit・push・PR まで止まらずに進む（bypassPermissions の初回確認が出ない、テンプレートの依頼文が `hc-claude` の引数として claude に渡る）
   - `.claude/settings.json` を含む merge が通る
   - 事故よけの hook が効く（例: ワーカーで `git push --force` が理由付きで拒否される）
-  - 判断依頼に監督役が自分で回答する
+  - 仕様・設計の判断依頼に監督役が自分で回答し、`~/.local/share/hc-supervisor/decisions.md` に記録する
   - スマホ（Tailscale SSH）から dev の hc に届く
