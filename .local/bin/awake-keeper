@@ -1,19 +1,31 @@
 #!/bin/bash
-# Windows のアイドルスリープを条件付きで抑止する常駐ループ (systemd user service)
-# 条件: Claude が作業中 (~/.cache/awake/busy-* が BUSY_TTL 分以内に更新) または SSH 経由の tmux クライアントが attach 中
-# 条件を満たす間、毎分 SetThreadExecutionState(ES_SYSTEM_REQUIRED) を一回呼んでアイドルタイマーをリセットする
+# Windows のアイドルスリープを抑止すべきかを判定し、~/.cache/awake/state に書く常駐ループ (systemd user service)
+# dev ディストリは interop 無効で powershell.exe を呼べないため、実際の抑止は Windows 側の
+# windows/awake-watcher.ps1 が state を読んで SetThreadExecutionState を保持する。
+# state の中身: 抑止理由 (claude / claude-tool / ssh など。空なら抑止しない)。毎ループ書き直すので mtime が生存確認を兼ねる。
 DIR=$HOME/.cache/awake
-BUSY_TTL=${BUSY_TTL:-60}
-PS=${AWAKE_PS:-/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe}
-# WSL interop は引数内の " を落とすため、スクリプトは UTF-16LE base64 で渡す
-ENC=$(printf '%s' '(Add-Type -Name P -Namespace W -PassThru -MemberDefinition "[DllImport(""kernel32.dll"")] public static extern uint SetThreadExecutionState(uint f);")::SetThreadExecutionState(1) | Out-Null' | iconv -t UTF-16LE | base64 -w0)
+BUSY_TTL=${BUSY_TTL:-30}   # 分。Esc 中断では Stop hook が走らずマーカーが残るため、期限で打ち切る
+INTERVAL=${INTERVAL:-30}   # 秒
 
+# hook が置く作業中マーカー (UserPromptSubmit / PreToolUse で更新、Stop で削除)
 claude_busy() {
   [ -n "$(find "$DIR" -maxdepth 1 -name 'busy-*' -mmin -"$BUSY_TTL" 2>/dev/null)" ]
 }
 
-# クライアントの環境変数に SSH_CONNECTION があるか、祖先に sshd/tailscaled がいれば SSH 経由
-ssh_attached() {
+# Claude が Bash ツールでコマンド実行中 (claude の直下にシェルがいる)。長時間コマンドでマーカーが古くなっても抑止を続ける
+claude_tool() {
+  ps -eo pid=,ppid=,comm= | awk '
+    { comm[$1]=$3; parent[$1]=$2 }
+    END { for (p in comm) if (comm[p] ~ /^(sh|bash|zsh)$/ && comm[parent[p]] == "claude") { found=1; exit } exit !found }'
+}
+
+# Tailscale SSH のセッション中 (tailscaled が be-child ssh を子として起動する)
+tailscale_ssh() {
+  pgrep -f 'tailscaled be-child ssh' >/dev/null
+}
+
+# SSH 経由の tmux クライアントが attach 中
+ssh_tmux() {
   local pid p
   for pid in $(tmux list-clients -F '#{client_pid}' 2>/dev/null); do
     tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep -q '^SSH_CONNECTION=' && return 0
@@ -26,15 +38,16 @@ ssh_attached() {
   return 1
 }
 
+mkdir -p "$DIR"
 prev=-
 while true; do
-  reason=
-  claude_busy && reason=claude
-  ssh_attached && reason="${reason:+$reason+}ssh-tmux"
-  if [ -n "$reason" ]; then
-    timeout 30 "$PS" -NoProfile -NonInteractive -EncodedCommand "$ENC" </dev/null >/dev/null 2>&1 \
-      || echo "SetThreadExecutionState call failed (exit $?)"
-  fi
+  r=()
+  claude_busy && r+=(claude)
+  claude_tool && r+=(claude-tool)
+  tailscale_ssh && r+=(ssh)
+  ssh_tmux && r+=(ssh-tmux)
+  reason=$(IFS=+; echo "${r[*]}")
+  printf '%s\n' "$reason" > "$DIR/state.tmp" && mv -f "$DIR/state.tmp" "$DIR/state"
   [ "$reason" != "$prev" ] && echo "state: ${reason:-idle}" && prev=$reason
-  sleep 60
+  sleep "$INTERVAL"
 done

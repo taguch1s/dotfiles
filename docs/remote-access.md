@@ -5,7 +5,8 @@
 ```
 スマホ ──(WoL で起動)──> Windows PC
 スマホ ──Tailscale SSH──> WSL (tailscaled) ──> tmux ──> Claude Code
-                                     awake-keeper ──> SetThreadExecutionState (Windows のアイドルスリープ抑止)
+                                     awake-keeper ──> ~/.cache/awake/state
+Windows: awake-watcher.ps1 ──(\\wsl.localhost で state を読む)──> SetThreadExecutionState (アイドルスリープ抑止)
 ```
 
 経緯と調査記録: https://github.com/taguch1s/dotfiles/issues/15
@@ -16,16 +17,19 @@
 |---|---|
 | `.tmux.conf` | スマホ操作向けの tmux 設定（マウス操作、長い履歴） |
 | `.local/bin/awake-hook` | Claude Code の hook。作業中は `~/.cache/awake/busy-<session_id>` を置き、終わったら消す |
-| `.local/bin/awake-keeper` | 60秒ごとに条件を調べ、成り立てば Windows のアイドルタイマーをリセットする |
+| `.local/bin/awake-keeper` | 30秒ごとに条件を調べ、抑止理由（空なら抑止しない）を `~/.cache/awake/state` に書く |
 | `.config/systemd/user/awake-keeper.service` | awake-keeper を常駐させる systemd user service |
+| `windows/awake-watcher.ps1` | Windows 側の常駐。dev が起動中で state が3分以内に更新され中身があれば `ES_CONTINUOUS \| ES_SYSTEM_REQUIRED` を保持する |
 | `.claude/settings.json` | 新規 PC 用の既定値。awake-hook を呼ぶ hook を含む |
 
-awake-keeper がスリープを抑止する条件は次のどちらかです。
+awake-keeper がスリープを抑止する条件は次のいずれかです（state に `+` 区切りで書かれる）。
 
-- Claude が作業中: マーカーが60分以内に更新されている（`UserPromptSubmit` / `PreToolUse` で更新し、`Stop` / `SessionEnd` で削除）
-- SSH 経由で tmux に attach している: クライアントの環境変数に `SSH_CONNECTION` があるか、祖先プロセスに `sshd` / `tailscaled` がいる
+- `claude`: マーカーが30分以内に更新されている（`UserPromptSubmit` / `PreToolUse` で更新し、`Stop` / `SessionEnd` で削除。Esc 中断では Stop が走らずマーカーが残るので期限で打ち切る）
+- `claude-tool`: `claude` プロセスの直下にシェルがいる（Bash ツールで長いコマンドを実行中。マーカーが古くなっても抑止を続ける）
+- `ssh`: Tailscale SSH のセッションがある（`tailscaled be-child ssh` プロセス）
+- `ssh-tmux`: SSH 経由で tmux に attach している
 
-どちらも成り立たなければ、Windows の電源設定どおり（AC で15分）にスリープします。
+いずれも成り立たなければ、Windows の電源設定どおり（AC で15分）にスリープします。
 
 ## 新しい PC でのセットアップ
 
@@ -42,8 +46,17 @@ make remote-access  # awake-keeper.service を有効化し、linger を設定
 確認方法:
 
 ```bash
-journalctl --user -u awake-keeper -f   # state: claude / ssh-tmux / idle が出る
+journalctl --user -u awake-keeper -f   # state: claude / claude-tool / ssh / idle が出る
 ```
+
+Windows 側（PowerShell。スタートアップにショートカットを作り、すぐ起動する）:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File \\wsl.localhost\dev\home\issei\dotfiles-main\windows\awake-watcher.ps1 -Mode Install
+powershell -NoProfile -ExecutionPolicy Bypass -File $env:LOCALAPPDATA\awake-watcher\awake-watcher.ps1 -Mode Status
+```
+
+スクリプトを変更したら `-Mode Install` をやり直す（`%LOCALAPPDATA%\awake-watcher` にコピーして使うため）。
 
 ### 手作業の設定
 
@@ -53,9 +66,10 @@ journalctl --user -u awake-keeper -f   # state: claude / ssh-tmux / idle が出�
 
 ## 実装上の注意
 
-- WSL から `powershell.exe -Command '...'` を呼ぶと、引数中の `"` が落ちる。awake-keeper は `-EncodedCommand`（UTF-16LE の base64）で渡している
-- Windows 側に常駐プロセスを置かず、毎回すぐ終わる呼び出しでアイドルタイマーをリセットしている。これにより、プロセスが残る問題が起きない
-- Claude Code の sandbox からは `/mnt` の読み取りもホスト側のプロセス一覧も見えない。動作確認は通常のターミナルで行う
-- dev ディストリ（Windows のドライブと interop がない）では `powershell.exe` を呼べないため、awake-keeper はスリープを抑止できない。dev で長い作業を任せるときは Windows の電源設定でスリープを止めておく（dev から抑止する仕組みは未対応）
+- dev ディストリは interop と automount が無効で `powershell.exe` を呼べない。そのため判定（WSL 側）と抑止（Windows 側）を state ファイルで分けている。以前の「WSL から powershell.exe を呼ぶ」方式は dev では exit 127 で常に失敗していた
+- awake-watcher は dev が停止中なら `\\wsl.localhost` に触れない（触るとディストリが起動する）。`wsl.exe --list --running` で確認してから読む
+- `ES_CONTINUOUS` の状態はスレッド単位なので、watcher は1プロセスで呼び続ける。プロセスが落ちれば抑止は自動で解ける
+- 確認: 管理者 PowerShell で `powercfg /requests` の SYSTEM に powershell.exe が出る
+- Claude Code の sandbox からはホスト側のプロセス一覧が見えない。動作確認は通常のターミナルで行う
 
 herdr-core（Herdr app・スマホの Herdr アプリ）でオーケストレーターを動かす構成は [herdr-core-orchestration.md](herdr-core-orchestration.md) を参照してください。
