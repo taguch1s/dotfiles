@@ -24,17 +24,25 @@ case "$1" in
       exit 0
     fi
     [[ -f "$MOCK_HC_DIR/live/$2" ]] || { echo '{"error":{"kind":"not_found"}}' >&2; exit 3; }
-    printf '{"address":"t1","name":"%s","state":"%s"}\n' "$2" "$(<"$MOCK_HC_DIR/live/$2")"
+    printf '{"address":"t9","name":"%s","state":"%s","labels":{"herdr.space":"spSUP","herdr.tab":"tbSUP"},"status":{"state":"%s"}}\n' \
+      "$2" "$(<"$MOCK_HC_DIR/live/$2")" "${MOCK_AGENT_STATE-done}"
     ;;
   run)
     shift
     while [[ "$1" == --* ]]; do
       [[ "$1" == --name ]] && echo live >"$MOCK_HC_DIR/live/$2"
-      case "$1" in --bg|--no-parent|--keep|--no-notify|--outlive-parent) shift ;; *) shift 2 ;; esac
+      case "$1" in --) break ;; --bg|--no-parent|--keep|--no-notify|--outlive-parent|--rm) shift ;; *) shift 2 ;; esac
     done
     ;;
   kill) rm -f "$MOCK_HC_DIR/live/$2" ;;
-  label) ;;
+  send)
+    # MOCK_SEND_WRITES_HANDOFF=1 なら、依頼を受けた監督役が引き継ぎを書いたことにする。
+    if [[ "${MOCK_SEND_WRITES_HANDOFF:-}" == 1 ]]; then
+      mkdir -p "$HOME/.local/share/hc-supervisor"
+      echo handoff >"$HOME/.local/share/hc-supervisor/handoff.md"
+    fi
+    ;;
+  label|wait|rm) ;;
   *) echo "unexpected hc command: $*" >&2; exit 1 ;;
 esac
 EOF
@@ -98,6 +106,72 @@ reset
 "$launcher" stop >/dev/null
 [[ "$(grep $'^kill' "$fixture/hc.log" | tr '\037' ' ')" == 'kill supervisor' ]] \
   && ok 'stop: 監督役を止める' || ng "stop が違う: $(cat "$fixture/hc.log")"
+
+# restart
+sup_handoff="$home/handoff.md"
+cmds() { grep -v $'^get\x1f' "$fixture/hc.log" | cut -d $'\x1f' -f 1 | tr '\n' ' ' || true; }
+
+rm -f "$fixture/live/"* "$sup_handoff"
+echo live >"$fixture/live/supervisor"
+reset
+MOCK_SEND_WRITES_HANDOFF=1 "$launcher" restart >/dev/null 2>"$fixture/err"
+send_line="$(grep $'^send' "$fixture/hc.log" | tr '\037' ' ')"
+label_line="$(grep $'^label' "$fixture/hc.log" | tr '\037' ' ')"
+[[ "$send_line" == 'send --wait --timeout 600 supervisor 【再起動の準備】'* ]] \
+  && ok 'restart: 動いている監督役に引き継ぎを書かせ、ターンの終わりまで待つ' || ng "restart の send が違う: $send_line"
+[[ "$(cmds)" == 'send kill wait rm run label ' ]] \
+  && ok 'restart: 引き継ぎの後に止めて、同じ名前で起動し直す' || ng "restart の順序が違う: $(cmds) / $(<"$fixture/err")"
+[[ "$(runs)" == "$expected_supervisor" ]] && ok 'restart: 起動の引数は start と同じ' || ng "restart の hc run が違う: $(runs)"
+[[ "$label_line" == 'label supervisor herdr.space=spSUP herdr.tab=tbSUP where=supervisor' ]] \
+  && ok 'restart: Herdr app の同じスペース・同じタブに出す' || ng "restart のラベルが違う: $label_line"
+
+rm -f "$sup_handoff"
+echo live >"$fixture/live/supervisor"
+reset
+if "$launcher" restart >/dev/null 2>"$fixture/err"; then ng '引き継ぎが書かれないのに作り直した'; fi
+[[ "$(cmds)" == 'send ' ]] && grep -q '監督役は止めていません' "$fixture/err" \
+  && ok 'restart: 引き継ぎが書かれなければ止めない' || ng "引き継ぎなしの扱いが違う: $(cmds) / $(<"$fixture/err")"
+
+echo live >"$fixture/live/supervisor"
+reset
+if MOCK_AGENT_STATE= MOCK_SEND_WRITES_HANDOFF=1 "$launcher" restart >/dev/null 2>"$fixture/err"; then ng 'エージェントでない terminal に作り直しを頼んだ'; fi
+[[ -z "$(cmds)" ]] && grep -q 'Claude Code が応答できる状態ではありません' "$fixture/err" \
+  && ok 'restart: 監督役の terminal がシェル（エージェントの状態なし）なら依頼を打ち込まず止めない' || ng "シェルの扱いが違う: $(cmds)"
+reset
+if MOCK_AGENT_STATE=blocked "$launcher" restart >/dev/null 2>&1; then ng 'blocked の監督役を作り直した'; fi
+[[ -z "$(cmds)" ]] && ok 'restart: ダイアログ待ち（blocked）の監督役には頼まない' || ng "blocked の扱いが違う: $(cmds)"
+
+echo old >"$sup_handoff"
+touch -d '2000-01-01' "$sup_handoff"
+reset
+if "$launcher" restart >/dev/null 2>&1; then ng '古い引き継ぎのまま作り直した'; fi
+[[ "$(cmds)" == 'send ' ]] && ok 'restart: 依頼より前の古い引き継ぎでは止めない' || ng "古い引き継ぎの扱いが違う: $(cmds)"
+
+rm -f "$sup_handoff"
+reset
+if HC_TERMINAL_ID=t9 "$launcher" restart >/dev/null 2>"$fixture/err"; then ng '監督役自身が引き継ぎなしで作り直した'; fi
+[[ -z "$(cmds)" ]] && grep -q '先に引き継ぎを' "$fixture/err" \
+  && ok 'restart（監督役自身）: 引き継ぎがなければ何もしない' || ng "監督役自身・引き継ぎなしが違う: $(cmds)"
+
+echo handoff >"$sup_handoff"
+reset
+HC_TERMINAL_ID=t9 "$launcher" restart >/dev/null 2>&1
+run_line="$(runs)"
+[[ "$run_line" == "run --bg --no-parent --rm --no-notify --name supervisor-restart -- bash -c "*'restart --handoff-ready'*" $home $home/restart.log" ]] \
+  && [[ "$(cmds)" == 'run ' ]] \
+  && ok 'restart（監督役自身）: 親のない別の terminal に切り離し、自分では止めない' || ng "監督役自身の restart が違う: $(cmds) / $run_line"
+
+echo live >"$fixture/live/supervisor"
+reset
+"$launcher" restart --handoff-ready >/dev/null 2>&1
+[[ "$(cmds)" == 'kill wait rm run label ' ]] \
+  && ok 'restart --handoff-ready: 引き継ぎを頼まずに作り直す' || ng "--handoff-ready が違う: $(cmds)"
+
+rm -f "$fixture/live/"* "$sup_handoff"
+reset
+"$launcher" restart >/dev/null 2>&1
+[[ "$(cmds)" == 'run ' && "$(runs)" == "$expected_supervisor" ]] \
+  && ok 'restart: 監督役がいなければ start と同じく起動する' || ng "監督役なしの restart が違う: $(cmds)"
 
 if "$launcher" --cwd "$fixture/missing" >/dev/null 2>&1; then ng '存在しない --cwd を受け付けた'; else ok '存在しない --cwd は拒否'; fi
 if "$launcher" bogus >/dev/null 2>&1; then ng '不明なサブコマンドを受け付けた'; else ok '不明なサブコマンドは拒否'; fi

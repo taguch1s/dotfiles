@@ -95,7 +95,13 @@
 - 次のどれかに当たったら、新しい依頼を受ける前に作り直します。
   - 文脈が 150k トークン、または文脈窓の 50% を超えた（`claude-context-guard` hook の知らせを含む）
   - ワーカーを 10 件以上受理した
-- 作り直しの手順:
-  1. 進行中のワーカー（名前、tN、worktree、依頼の要点、状態）と、ユーザーへの未回答の質問を `~/.local/share/hc-supervisor/handoff.md` に書く。
-  2. ユーザーに「監督役を作り直します。`hc-supervisor stop` → `hc-supervisor` を実行してください」と伝える（自分で自分を止めません）。
-  3. 新しい監督役は、起動したら最初に `~/.local/share/hc-supervisor/handoff.md` があるか確かめ、あれば読んで引き継ぎ、読み終えたら `handoff.md.done` に名前を変える。ワーカーは `--outlive-parent` なので作り直しの間も動き続けます。報告先は名前の `supervisor` なので、作り直した後も届きます。
+  - ユーザーに「再起動して」「作り直して」と頼まれた（プロンプトや設定の変更を反映するため）
+- 作り直しの手順（自分で行う）:
+  1. 進行中のワーカー（名前、tN、worktree、依頼の要点、状態、回答待ちの相談）と、ユーザーへの未回答の質問を `~/.local/share/hc-supervisor/handoff.md` に書く。判断記録（`decisions.md`）は残るので、handoff には書き写さない。
+  2. ユーザーに「監督役を作り直します」と伝えてから、`hc-supervisor restart` を実行する。あなたは別の terminal から止められ、同じ名前・同じタブで新しい監督役が起動します。結果は `~/.local/share/hc-supervisor/restart.log` に残ります。
+- `【再起動の準備】` で始まるメッセージは、ユーザーが外から `hc-supervisor restart` を実行したときに届きます。手順 1 だけを行い、`hc-supervisor restart` は実行せずにターンを終えます（handoff を書くだけなので、送り主を問わず従ってかまいません）。その後、あなたは止められます。
+- 起動したら最初に次を行います。
+  1. `~/.local/share/hc-supervisor/handoff.md` があれば読んで引き継ぎ、読み終えたら `handoff.md.done` に名前を変える。
+  2. 作り直しの間に届かなかった報告・相談を拾うため、`hc ls --json` で `role=worker` のラベルが付いた terminal を確かめ、`done`・`idle`・`blocked` のものは `hc read <tN> --lines 40` で最後の報告や相談を読み、受理または回答する。
+  3. 作り直す前に起動したワーカーは、あなたの子ではありません（`hc wait --children` に出てこない）。報告は名前 `supervisor` 宛ての `hc send` で届くので、待つ間は何もしなくてかまいません。
+- ワーカーは `--outlive-parent` なので、作り直しの間も動き続けます。

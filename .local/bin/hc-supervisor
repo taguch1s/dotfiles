@@ -9,13 +9,19 @@ role_file="${HC_CLAUDE_ROLE_FILE:-/etc/dotfiles-role}"
 usage() {
   cat <<'EOF'
 Usage: hc-supervisor [start] [--cwd DIR]
+       hc-supervisor restart [--cwd DIR]
        hc-supervisor status | stop
 
-start   監督役（名前 supervisor、ラベル role=supervisor）を起動する。既に監督役がいれば起動しない。
-        --cwd の既定は ~/.local/share/hc-supervisor（$HOME はフォルダ信頼が保存されず、
-        起動のたびに trust ダイアログが出るため）。
-status  監督役の状態を表示する。
-stop    監督役を止める。監督役が起動したワーカーは止まらない（--outlive-parent）。
+start    監督役（名前 supervisor、ラベル role=supervisor）を起動する。既に監督役がいれば起動しない。
+         --cwd の既定は ~/.local/share/hc-supervisor（$HOME はフォルダ信頼が保存されず、
+         起動のたびに trust ダイアログが出るため）。
+restart  監督役を作り直す（プロンプトや設定の変更を反映する）。動いている監督役に引き継ぎ
+         （~/.local/share/hc-supervisor/handoff.md）を書かせてから止め、同じ名前・同じタブで起動し直す。
+         新しい監督役は引き継ぎを読んで続ける。ワーカーは止まらない（--outlive-parent）。
+         引き継ぎが書かれなければ、何も止めずに終わる。監督役が自分で実行するときは、
+         先に引き継ぎを書いておく（別の terminal に切り離して作り直す）。
+status   監督役の状態を表示する。
+stop     監督役を止める。監督役が起動したワーカーは止まらない（--outlive-parent）。
 EOF
 }
 
@@ -24,42 +30,114 @@ die() {
   exit 1
 }
 
+# hc get --json の値を 1 つ出す。field <JSON> <キー> は最上位の項目、label <JSON> <キー> はラベル、
+# status <JSON> <キー> はエージェントの状態（status.state など。エージェントでなければ無い）。
+# 無ければ空文字。hc get は {"terminal": {...}} で包んで返すこともある。
+json_value() {
+  python3 -c '
+import json, sys
+kind, text, key = sys.argv[1:4]
+try:
+    data = json.loads(text)
+except json.JSONDecodeError:
+    sys.exit(0)
+if isinstance(data, dict) and isinstance(data.get("terminal"), dict):
+    data = data["terminal"]
+if not isinstance(data, dict):
+    sys.exit(0)
+if kind in ("label", "status"):
+    data = data.get("labels" if kind == "label" else "status")
+    if not isinstance(data, dict):
+        sys.exit(0)
+value = data.get(key)
+print(value if isinstance(value, str) else "")
+' "$1" "$2" "$3"
+}
+
 # 生きている terminal があるか。hc get は終了済みも返しうるので、最上位の state が
 # finished なら無いものとみなす（status.state とは別の、live / finished の値）。
 exists() {
   local json
   json="$(hc get "$1" --json 2>/dev/null)" || return 1
-  python3 -c '
-import json, sys
-try:
-    data = json.loads(sys.argv[1])
-except json.JSONDecodeError:
-    sys.exit(0)
-if isinstance(data, dict) and isinstance(data.get("terminal"), dict):
-    data = data["terminal"]
-sys.exit(1 if isinstance(data, dict) and data.get("state") == "finished" else 0)
-' "$json"
+  [[ "$(json_value field "$json" state)" != finished ]]
 }
 
 # Herdr app は terminal のラベル herdr.space / herdr.tab でスペースとタブに配置する（実機 2026-11-14、
 # 文書化されていない）。Herdr app のタブから起動したときは、そのスペースの新しいタブに監督役を出す。
-show_in_herdr_app() {
+caller_space() {
   [[ -n "${HC_TERMINAL_ID:-}" ]] || return 0
-  local self space tab
+  local self
   self="$(hc get "$HC_TERMINAL_ID" --json 2>/dev/null)" || return 0
-  space="$(python3 -c '
-import json, sys
-try:
-    data = json.loads(sys.argv[1])
-except json.JSONDecodeError:
-    sys.exit(0)
-labels = data.get("labels") if isinstance(data, dict) else None
-print((labels or {}).get("herdr.space", "") if isinstance(labels, dict) else "")
-' "$self")"
+  json_value label "$self" herdr.space
+}
+
+# 監督役を起動する。<スペース> があれば Herdr app のそのスペースのタブ（<タブ>、空なら新しいタブ）に出す。
+launch() {
+  local space="$1" tab="$2"
+  # 初回は trust ダイアログで最初の依頼文が届かず、hc run が届くまで待ち続ける（実機 2026-11-14）。
+  # --timeout で待ちを切り上げる（terminal は動いたまま）。役割はシステムプロンプトで渡すので、
+  # 依頼文が届かなくても監督役は待機状態になる。
+  hc run --bg --timeout 20 --no-parent --keep --name "$name" --label role=supervisor --cwd "$cwd" \
+    claude-supervisor '監督を開始してください。' || true
+  exists "$name" || die "監督役を起動できませんでした（hc ls で確認してください）"
+  printf '起動しました: %s\n' "$name"
   [[ -n "$space" ]] || return 0
-  tab="tb$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  [[ -n "$tab" ]] || tab="tb$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
   hc label "$name" "herdr.space=$space" "herdr.tab=$tab" "where=supervisor" >/dev/null \
     && printf 'Herdr app のこのスペースにタブとして表示します: %s\n' "$name"
+}
+
+restart_request='【再起動の準備】hc-supervisor restart からの依頼です。監督役を作り直すので、システムプロンプトの「作り直し」の手順 1 のとおり、進行中のワーカーと未回答の質問を ~/.local/share/hc-supervisor/handoff.md に書いてください。書き終えたら、hc-supervisor restart は実行せずにターンを終えてください。'
+
+restart() {
+  if ! exists "$name"; then
+    launch "$(caller_space)" ""
+    return
+  fi
+  local json address space tab
+  json="$(hc get "$name" --json)"
+  address="$(json_value field "$json" address)"
+  space="$(json_value label "$json" herdr.space)"
+  tab="$(json_value label "$json" herdr.tab)"
+
+  # 監督役が自分で実行した: ここで自分を止めると起動し直す処理も止まるので、
+  # 親のない別の terminal に切り離して作り直す。引き継ぎは監督役が先に書いておく。
+  if [[ -n "${HC_TERMINAL_ID:-}" && ( "$HC_TERMINAL_ID" == "$address" || "$HC_TERMINAL_ID" == "$name" ) ]]; then
+    [[ -f "$handoff" ]] || die "先に引き継ぎを $handoff に書いてください"
+    mkdir -p "$state_dir"
+    hc run --bg --no-parent --rm --no-notify --name supervisor-restart -- \
+      bash -c '"$0" restart --handoff-ready --cwd "$1" >>"$2" 2>&1' "$self_path" "$cwd" "$restart_log" >/dev/null
+    printf '別の terminal で作り直します。この監督役はまもなく止まります。結果: %s\n' "$restart_log"
+    return
+  fi
+
+  # herdr-core の再起動後は、監督役の terminal が Claude Code ではなくシェルになる（--keep）。
+  # シェルに引き継ぎの依頼を打ち込まないよう、エージェントの状態でなければ止める。
+  case "$(json_value status "$json" state)" in
+    idle|working|done) ;;
+    *) ((handoff_ready)) \
+         || die "監督役の terminal で Claude Code が応答できる状態ではありません（herdr-core の再起動後のシェル、ダイアログ待ちなど）。hc read $name で確かめ、必要なら hc-supervisor stop → hc-supervisor で起動し直してください。" ;;
+  esac
+
+  if ((handoff_ready)); then
+    [[ -f "$handoff" ]] || die "引き継ぎ（$handoff）がありません。監督役は止めていません。"
+  else
+    local started mtime
+    started="$(date +%s)"
+    printf '監督役に引き継ぎを書いてもらっています（最大 10 分）…\n'
+    hc send --wait --timeout 600 "$name" "$restart_request" >/dev/null \
+      || die "監督役に引き継ぎを頼めませんでした。監督役は止めていません。hc read $name で画面を確かめてください。"
+    mtime="$(stat -c %Y "$handoff" 2>/dev/null || echo 0)"
+    ((mtime >= started)) \
+      || die "引き継ぎ（$handoff）が書かれませんでした。監督役は止めていません。hc read $name で画面を確かめてください。"
+  fi
+
+  hc kill "$name" >/dev/null
+  hc wait "$name" --timeout 30 >/dev/null 2>&1 || true
+  hc rm "$name" >/dev/null 2>&1 || true
+  ! exists "$name" || die "古い監督役が止まりませんでした（hc ls で確認してください）。引き継ぎは $handoff にあります。"
+  printf '古い監督役を止めました。\n'
+  launch "$space" "$tab"
 }
 
 command="start"
@@ -67,14 +145,24 @@ if (($#)) && [[ "$1" != -* ]]; then
   command="$1"
   shift
 fi
-default_cwd="${XDG_DATA_HOME:-$HOME/.local/share}/hc-supervisor"
+state_dir="${XDG_DATA_HOME:-$HOME/.local/share}/hc-supervisor"
+default_cwd="$state_dir"
+handoff="$state_dir/handoff.md"
+restart_log="$state_dir/restart.log"
+self_path="$(readlink -f "${BASH_SOURCE[0]}")"
 cwd="$default_cwd"
+handoff_ready=0
 while (($#)); do
   case "$1" in
     --cwd)
       (($# >= 2)) || die '--cwd にディレクトリを指定してください'
       cwd="$2"
       shift 2
+      ;;
+    --handoff-ready)
+      # restart の内部用: 引き継ぎは書かれているので、監督役に頼まずに作り直す。
+      handoff_ready=1
+      shift
       ;;
     -h|--help)
       usage
@@ -104,7 +192,7 @@ case "$command" in
     fi
     exit 0
     ;;
-  start) ;;
+  start|restart) ;;
   *)
     usage >&2
     exit 2
@@ -118,17 +206,12 @@ command -v hc-claude >/dev/null 2>&1 \
 [[ "$cwd" != "$default_cwd" ]] || mkdir -p "$cwd"
 [[ -d "$cwd" ]] || die "ディレクトリがありません: $cwd"
 
-if exists "$name"; then
+if [[ "$command" == restart ]]; then
+  restart
+elif exists "$name"; then
   printf '監督役は起動済みです: %s\n' "$name"
 else
-  # 初回は trust ダイアログで最初の依頼文が届かず、hc run が届くまで待ち続ける（実機 2026-11-14）。
-  # --timeout で待ちを切り上げる（terminal は動いたまま）。役割はシステムプロンプトで渡すので、
-  # 依頼文が届かなくても監督役は待機状態になる。
-  hc run --bg --timeout 20 --no-parent --keep --name "$name" --label role=supervisor --cwd "$cwd" \
-    claude-supervisor '監督を開始してください。' || true
-  exists "$name" || die "監督役を起動できませんでした（hc ls で確認してください）"
-  printf '起動しました: %s\n' "$name"
-  show_in_herdr_app
+  launch "$(caller_space)" ""
 fi
 
 printf '見る: Herdr app / スマホのサイドバーの %s、または hc attach %s（Ctrl+\\ で離れる）\n' "$name" "$name"

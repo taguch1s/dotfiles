@@ -107,6 +107,7 @@ hc templates       # claude-supervisor / claude-worker が出ることを確認
 hc-supervisor      # 監督役を起動。Herdr app のタブから実行すると、そのスペースに「supervisor」タブが出る
 hc-supervisor status
 hc-supervisor stop # 止める（ワーカーは止まらない）
+hc-supervisor restart  # 引き継ぎを書かせてから作り直す（プロンプトや設定の変更を反映する）
 hc attach supervisor   # 端末から見る場合。Ctrl+\ で離れる（止まらない）
 ```
 
@@ -134,8 +135,12 @@ Herdr app の端末での貼り付けは **Ctrl+Shift+V**（または右クリ�
 - ワーカーを頼む: Herdr app かスマホで `supervisor` を開き、「~/mlbot-dev の Issue #12 と #13 を /issue-development-workflow で PR 作成まで進めて」のように頼みます。監督役はワーカーを `--outlive-parent` で起動し、結果を実測で確かめて報告します。
 - ワーカーが判断に迷うと `hc send supervisor` で相談が届き、監督役が仕様・設計を含めて 1 つに決めて返し、`~/.local/share/hc-supervisor/decisions.md` に記録します。後から見るときは監督役に「判断記録を見せて」と頼むか、ファイルを直接開きます。取り消しにくい外部操作と hook に止められた操作が必要なものだけ、監督役のタブに「【確認】…」として質問が出ます。
 - 手動セッション: Herdr app で新しいタブを開いて使えます。権限確認は `~/.claude/settings.json` のとおりで、監督役は関与しません（相談したいときは `hc send supervisor`）。
-- 監督役の作り直し: 文脈が大きくなると、監督役が `~/.local/share/hc-supervisor/handoff.md` に引き継ぎを書き、作り直しを頼んできます。`hc-supervisor stop` → `hc-supervisor` を実行すると、新しい監督役が handoff を読んで続けます。
-- `hc-supervisor` は監督役を `--keep` で起動します。herdr-core の再起動後、監督役の terminal はシェルになります。`hc-supervisor stop` の後に `hc-supervisor` で起動し直してください。
+- 監督役の作り直し（`hc-supervisor restart`）: プロンプトや設定を変えたときは、監督役に「再起動して」と頼むか、端末で `hc-supervisor restart` を実行します。ワーカーとのやり取りを止めずに入れ替わります。
+  1. 動いている監督役が、進行中のワーカー・回答待ちの相談・未回答の質問を `~/.local/share/hc-supervisor/handoff.md` に書く（端末から実行したときは `【再起動の準備】` の依頼が届き、書き終えるまで最大 10 分待つ）。書かれなければ何も止めずに終わる。
+  2. 古い監督役を止め、同じ名前 `supervisor`・Herdr app の同じタブで起動し直す。監督役が自分で実行したときは、親のない別の terminal（`supervisor-restart`）に切り離して行い、結果を `~/.local/share/hc-supervisor/restart.log` に残す。
+  3. 新しい監督役は handoff を読み、`role=worker` の terminal の画面を確かめて、入れ替わりの間に届かなかった報告・相談を拾う。ワーカーは `--outlive-parent` なので動き続け、報告先は名前の `supervisor` なので新しい監督役に届く。入れ替わりの数秒に `hc send supervisor` が失敗したワーカーは、報告を画面に書いてターンを終える。
+  文脈が大きくなったときも、監督役が同じ手順で自分を作り直します。
+- `hc-supervisor` は監督役を `--keep` で起動します。herdr-core の再起動後、監督役の terminal はシェルになります。`hc-supervisor stop` の後に `hc-supervisor` で起動し直してください（シェルに引き継ぎの依頼を打ち込まないよう、`restart` は使いません）。
 
 ## GitHub ruleset（ユーザーが設定する）
 
