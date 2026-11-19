@@ -28,6 +28,10 @@ awake-keeper がスリープを抑止する条件は次のいずれかです（s
 - `claude-tool`: `claude` プロセスの直下にシェルがいる（Bash ツールで長いコマンドを実行中。マーカーが古くなっても抑止を続ける）
 - `ssh`: Tailscale SSH のセッションがある（`tailscaled be-child ssh` プロセス）
 - `ssh-tmux`: SSH 経由で tmux に attach している
+- `hc-working`: herdr-core（hc）に status が `working` の端末がある（エージェントが作業中）。`idle`・`done` などで待っているエージェントは数えない
+- `hc-job`: hc の端末で処理が動いている。前面（`hc get` の `foreground`）がシェル以外のプログラムか、`-c` やスクリプトファイルを実行中のシェルなら数える。プロンプトで待つ対話シェルは数えない。また、`~/.local/share/hc-supervisor/heavy.lock`（重い処理の共有ロック）が保持されている間も数える（`/proc/locks` で判定し、ロックは取らない）
+
+hc の判定は `~/.local/bin/hc` を直接呼び（service の PATH に `~/.local/bin` がないため）、各呼び出しに5秒の timeout を付けます。hc や core が応答しなければ、hc の条件を数えずにループを続けます。`awake-keeper --once` で1回だけ判定した理由を出せます。
 
 いずれも成り立たなければ、Windows の電源設定どおり（AC で15分）にスリープします。
 
@@ -46,7 +50,7 @@ make remote-access  # awake-keeper.service を有効化し、linger を設定
 確認方法:
 
 ```bash
-journalctl --user -u awake-keeper -f   # state: claude / claude-tool / ssh / idle が出る
+journalctl --user -u awake-keeper -f   # state: claude / claude-tool / ssh / hc-working / hc-job / idle が出る
 ```
 
 Windows 側（PowerShell。スタートアップにショートカットを作り、すぐ起動する）:

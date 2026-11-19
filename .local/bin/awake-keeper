@@ -2,10 +2,14 @@
 # Windows のアイドルスリープを抑止すべきかを判定し、~/.cache/awake/state に書く常駐ループ (systemd user service)
 # dev ディストリは interop 無効で powershell.exe を呼べないため、実際の抑止は Windows 側の
 # windows/awake-watcher.ps1 が state を読んで SetThreadExecutionState を保持する。
-# state の中身: 抑止理由 (claude / claude-tool / ssh など。空なら抑止しない)。毎ループ書き直すので mtime が生存確認を兼ねる。
+# state の中身: 抑止理由 (claude / claude-tool / ssh / hc-working / hc-job など。空なら抑止しない)。毎ループ書き直すので mtime が生存確認を兼ねる。
 DIR=$HOME/.cache/awake
 BUSY_TTL=${BUSY_TTL:-30}   # 分。Esc 中断では Stop hook が走らずマーカーが残るため、期限で打ち切る
 INTERVAL=${INTERVAL:-30}   # 秒
+HC_BIN=${HC_BIN:-$HOME/.local/bin/hc}   # systemd user service の PATH には ~/.local/bin がない
+HC_TIMEOUT=${HC_TIMEOUT:-5}   # 秒。hc や core が応答しなくてもループを止めない
+HEAVY_LOCK=${HEAVY_LOCK:-$HOME/.local/share/hc-supervisor/heavy.lock}
+PROC_LOCKS=${PROC_LOCKS:-/proc/locks}
 
 # hook が置く作業中マーカー (UserPromptSubmit / PreToolUse で更新、Stop で削除)
 claude_busy() {
@@ -38,15 +42,74 @@ ssh_tmux() {
   return 1
 }
 
-mkdir -p "$DIR"
-prev=-
-while true; do
-  r=()
+# hc の端末の状態を 1 行に 1 つ出す: working (エージェントが作業中) / job (シェル以外、またはスクリプトを実行中のシェルが前面にいる)
+# 待機中のエージェント (status が idle・done など) と、プロンプトで待つ対話シェルは出さない。
+# 各 hc 呼び出しに timeout を付け、失敗した端末は数えない。
+hc_states() {
+  [ -x "$HC_BIN" ] || return 0
+  timeout 20 python3 - "$HC_BIN" "$HC_TIMEOUT" <<'EOF' 2>/dev/null
+import json, os, subprocess, sys
+hc, timeout = sys.argv[1], float(sys.argv[2])
+SHELLS = {"sh", "bash", "zsh", "dash", "fish"}
+
+def hc_json(*args):
+    out = subprocess.run([hc, *args, "--json"], capture_output=True, text=True, timeout=timeout, check=True).stdout
+    return json.loads(out)
+
+def running_job(fg):
+    name = os.path.basename(fg.get("name") or "").lstrip("-")
+    if name not in SHELLS:
+        return True
+    # 対話シェルは前面のジョブが foreground になる。シェル自身が前面で -c やスクリプトを持つなら実行中
+    args = (fg.get("argv") or [])[1:]
+    return "-c" in args or any(not a.startswith("-") for a in args)
+
+try:
+    terminals = hc_json("ls").get("terminals", [])
+except Exception:
+    sys.exit(0)
+for t in terminals:
+    if t.get("state") != "live":
+        continue
+    if t.get("status") is not None:
+        if t["status"] == "working":
+            print("working")
+        continue
+    try:
+        fg = hc_json("get", t["address"]).get("foreground") or {}
+    except Exception:
+        continue
+    if fg and running_job(fg):
+        print("job")
+EOF
+}
+
+# 重い処理の共有ロック (flock) を誰かが持っている。flock を試すと実処理の取得と競合するので /proc/locks を読む
+heavy_lock_held() {
+  local ino
+  ino=$(stat -c %i "$HEAVY_LOCK" 2>/dev/null) || return 1
+  awk -v ino="$ino" '{ n = split($6, f, ":"); if (f[n] == ino) { found = 1; exit } } END { exit !found }' "$PROC_LOCKS" 2>/dev/null
+}
+
+reasons() {
+  local r=() hc
   claude_busy && r+=(claude)
   claude_tool && r+=(claude-tool)
   tailscale_ssh && r+=(ssh)
   ssh_tmux && r+=(ssh-tmux)
-  reason=$(IFS=+; echo "${r[*]}")
+  hc=$(hc_states)
+  grep -qx working <<<"$hc" && r+=(hc-working)
+  { grep -qx job <<<"$hc" || heavy_lock_held; } && r+=(hc-job)
+  (IFS=+; echo "${r[*]}")
+}
+
+# --once: 1 回だけ判定して理由を出す (test・手動確認用)
+[ "${1:-}" = --once ] && { reasons; exit 0; }
+
+mkdir -p "$DIR"
+prev=-
+while true; do
+  reason=$(reasons)
   printf '%s\n' "$reason" > "$DIR/state.tmp" && mv -f "$DIR/state.tmp" "$DIR/state"
   [ "$reason" != "$prev" ] && echo "state: ${reason:-idle}" && prev=$reason
   sleep "$INTERVAL"
