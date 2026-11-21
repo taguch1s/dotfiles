@@ -145,6 +145,67 @@ class ManageDotfilesConfigsTest(unittest.TestCase):
 
         self.assertIn("NG    リンク", output.getvalue())
 
+    def link_configs(self):
+        names = ("placed", "missing", "occupied")
+        for name in names:
+            (self.root / ".local" / "bin").mkdir(parents=True, exist_ok=True)
+            (self.root / ".local" / "bin" / name).write_text("#!/bin/sh\n")
+        home = self.root / "home" / ".local" / "bin"
+        home.mkdir(parents=True)
+        (home / "placed").symlink_to(self.root / ".local" / "bin" / "placed")
+        (home / "occupied").write_text("user file\n")
+        return home, [
+            {"name": name, "mode": "link", "source": f".local/bin/{name}", "target": str(home / name)} for name in names
+        ]
+
+    def test_link_missing_only_keeps_existing_files(self):
+        home, configs = self.link_configs()
+        original_configs = MANAGER.configs
+        MANAGER.configs = lambda: configs
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(MANAGER.link(missing_only=True), 0)
+        finally:
+            MANAGER.configs = original_configs
+
+        self.assertEqual((home / "missing").resolve(), self.root / ".local" / "bin" / "missing")
+        self.assertEqual((home / "occupied").read_text(), "user file\n")
+        self.assertEqual(list(home.parent.glob("bin/*.dotfiles-backup-*")), [])
+
+    def test_plan_lists_missing_and_conflicting_links_and_unsynced_configs(self):
+        home, configs = self.link_configs()
+        target = self.root / "home" / "config.toml"
+        configs.append(self.config(target))
+        original_configs = MANAGER.configs
+        MANAGER.configs = lambda: configs
+        output = io.StringIO()
+        try:
+            with redirect_stdout(output):
+                self.assertEqual(MANAGER.plan(), 0)
+        finally:
+            MANAGER.configs = original_configs
+
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [f"link-missing\t{home / 'missing'}", f"link-conflict\t{home / 'occupied'}", f"sync\t{target}"],
+        )
+
+    def test_plan_is_empty_when_everything_is_in_place(self):
+        target = self.root / "home" / "config.toml"
+        target.parent.mkdir(parents=True)
+        target.write_text("[features]\nhooks = true\nmemories = true\n")
+        config = self.config(target)
+        original_configs = MANAGER.configs
+        MANAGER.configs = lambda: [config]
+        output = io.StringIO()
+        try:
+            with redirect_stdout(output):
+                self.assertEqual(MANAGER.plan(), 0)
+        finally:
+            MANAGER.configs = original_configs
+
+        self.assertEqual(output.getvalue(), "")
+
 
 
 CONTEXT_GUARD = "~/.local/bin/claude-context-guard"
@@ -425,6 +486,17 @@ class ClaudeSettingsSyncTest(unittest.TestCase):
         self.write_source(source)
         result, output = self.run_with_config(MANAGER.doctor, static=True)
         self.assertEqual(result, 1, output)
+
+    def test_plan_reports_the_settings_until_synced(self):
+        self.write_target(machine_settings())
+
+        result, output = self.run_with_config(MANAGER.plan)
+        self.assertEqual(result, 0)
+        self.assertEqual(output, f"sync\t{self.target}\n")
+
+        self.assertTrue(self.sync()[0])
+        result, output = self.run_with_config(MANAGER.plan)
+        self.assertEqual(output, "")
 
     def test_diff_shows_pending_changes_until_synced(self):
         self.write_target(machine_settings())
