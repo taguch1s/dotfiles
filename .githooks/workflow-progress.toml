@@ -2,6 +2,10 @@
 branch = "feature/issue-9-workflow-progress-review-gate"
 handoff = "issue-9-workflow-progress-review-gate.md"
 
+[[issue_branch]]
+branch = "feature/issue-28-claude-settings-sync"
+handoff = "issue-28-claude-settings-sync.md"
+
 [[out_of_scope_branch]]
 branch = "main"
 reason = "個人利用のため main へ直接 push する"

@@ -45,7 +45,7 @@ make link           # tmux・awake-* をリンク
 make remote-access  # awake-keeper.service を有効化し、linger を設定
 ```
 
-`~/.claude/settings.json` が既にある PC では、既定値はコピーされません（`copy-if-missing`）。その場合は `make diff` で差分を確認し、`hooks` の awake-hook 部分を手で追加してください。
+`~/.claude/settings.json` が既にある PC では、`make sync` で awake-hook を含む dotfiles 管理の hook だけが追加されます（管理外の hook・キーは残ります。`make diff` で事前に確認できます）。
 
 確認方法:
 

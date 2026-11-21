@@ -10,15 +10,9 @@ claude-token-metrics report --json                      # 同じ内容を JSON �
 
 ## SessionEnd hook の導入
 
-リポジトリ版 `.claude/settings.json` の `SessionEnd` に `claude-token-metrics record` を登録してある。ただし `~/.claude/settings.json` は `copy-if-missing` なので、既に設定がある端末には反映されない。その場合は `make link` で `~/.local/bin/claude-token-metrics` を配置したうえで、`~/.claude/settings.json` の `hooks.SessionEnd[0].hooks` に次を手で追加する。
+リポジトリ版 `.claude/settings.json` の `SessionEnd` に `claude-token-metrics record` を登録してある。`make link` で `~/.local/bin/claude-token-metrics` を配置したうえで、`make sync` を実行すると `~/.claude/settings.json` に反映される（#28）。
 
-```json
-{
-  "type": "command",
-  "command": "~/.local/bin/claude-token-metrics record || true",
-  "timeout": 10
-}
-```
+`~/.claude/settings.json` は `dotfiles.toml` で `mode = "merge-json-managed"` として管理している。`make sync` は `hook_commands` に宣言した hook と `keys`（`statusLine`）だけをリポジトリ版に合わせ、Herdr の `SessionStart` hook や Claude Code が書き足す `autoMode`・`env` などの管理外の hook・キーはそのまま残す。変更前のファイルは `~/.claude/settings.json.dotfiles-backup-<時刻>` に残る。反映前の確認は `make diff`、反映漏れの検出は `make doctor`（欠けていれば NG）。
 
 `record` は stdin の `transcript_path` / `session_id` を受け取ると、集計を切り離した子プロセスに任せてすぐ終了する（大きなセッションでは集計に数十秒かかるため）。結果は `${XDG_DATA_HOME:-~/.local/share}/claude-token-metrics/sessions.jsonl` に 1 行ずつ追記され、失敗は同じディレクトリの `record.log` に残る。同じ `session_id` を再記録した場合、`report` は後の行を採用する。
 
@@ -50,7 +44,9 @@ claude-token-metrics report --json                      # 同じ内容を JSON �
 
 ## statusline と使用率の記録（#20）
 
-`claude-statusline` は Claude Code の statusline コマンドで、`ctx 182k | 5h 54% | 7d 8%` の 1 行を出す。
+`claude-statusline` は Claude Code の statusline コマンドで、`Opus | dotfiles | ctx 182k | 5h 54% | 7d 8%` の 1 行を出す。
+
+- モデル名・ディレクトリ：stdin の `model.display_name` と `workspace.current_dir`（無ければ `cwd`）の末尾。無い項目は出さない。以前の `~/.claude/statusline.py` の表示を取り込んだもので、同期後は `statusline.py` は使われない。
 
 - `ctx`：`transcript_path` の最後のリクエスト（本体の assistant 行。合成メッセージと sidechain は除く）の `input + cache 作成 + cache 読み込み`。上の文脈サイズと同じ定義で、トランスクリプトは末尾から最大 16MB だけ読む。
 - `5h` / `7d`：stdin の `rate_limits.five_hour` / `seven_day` の `used_percentage`。`rate_limits` が null や欠けている場合は `-` を出し、記録しない。
@@ -61,11 +57,7 @@ claude-token-metrics report --json                      # 同じ内容を JSON �
 {"ts": "2026-11-14T01:02:03.456+00:00", "session_id": "...", "five_hour": {"used_percentage": 54, "resets_at": 1763100000}, "seven_day": {"used_percentage": 8, "resets_at": 1763600000}}
 ```
 
-どんな入力でも 1 行を出して exit 0 で終わる。リポジトリ版 `.claude/settings.json` に `statusLine` を登録してあるが、`~/.claude/settings.json` は `copy-if-missing` なので、既に設定がある端末では `make link` のあとに次を手で追加する。
-
-```json
-"statusLine": {"type": "command", "command": "~/.local/bin/claude-statusline"}
-```
+どんな入力でも 1 行を出して exit 0 で終わる。リポジトリ版 `.claude/settings.json` の `statusLine` は、`make link` のあとに `make sync` で `~/.claude/settings.json` に反映される（値ごと置き換える）。
 
 ## 使用率から重みを推定する（calibrate）
 

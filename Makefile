@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: bootstrap link codex-config integration wsl wsl-slim dev-mode remote-access doctor diff check hooks help
+.PHONY: bootstrap link codex-config sync integration wsl wsl-slim dev-mode remote-access doctor diff check hooks help
 
 bootstrap: ## 端末・エージェント用ツールを導入し、移植可能な設定をリンクする。
 	./.bin/install-agent-terminal.sh
@@ -13,6 +13,9 @@ link: ## 移植可能な設定を現在のホームディレクトリへリン�
 
 codex-config: ## ローカル設定がない場合のみ、移植可能な Codex 既定値を導入する。
 	./.bin/install-codex-config.sh
+
+sync: ## 端末の設定へ dotfiles が管理する部分（Claude の hook・statusLine、Codex の feature）だけを同期する。
+	./.bin/manage-dotfiles-configs.py sync
 
 integration: ## Herdr が生成する Codex・Claude 連携ファイルを導入する。
 	./.bin/install-codex-herdr-integration.sh
@@ -32,7 +35,7 @@ remote-access: ## スマホから遠隔操作中のスリープ抑止サービ�
 doctor: ## コマンド、リンク、ステータスラインスクリプトを検証する。
 	./.bin/doctor-agent-terminal.sh
 
-diff: ## コピー管理の設定について、dotfiles とローカル設定の差分を表示する。
+diff: ## コピー・同期管理の設定について、dotfiles とローカル設定の差分を表示する。
 	@./.bin/manage-dotfiles-configs.py diff || true
 
 check: ## PR・コミット前にリンク、構文、秘密情報を検査する。
