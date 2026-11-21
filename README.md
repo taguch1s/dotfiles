@@ -74,12 +74,14 @@ make dev-mode   # スタートメニューに「Dev Mode」「Normal Mode」を�
 make remote-access # スマホから遠隔操作中のスリープ抑止サービスを有効化する（docs/remote-access.md）
 # Herdr app / スマホの Claude Code を監督役が見張る構成（hc-supervisor）は docs/herdr-core-orchestration.md
 # セッションごとのトークン効率指標（claude-token-metrics と SessionEnd hook）、statusline と使用率からの重み推定は docs/claude-token-metrics.md
+make sync       # ~/.claude/settings.json の dotfiles 管理の hook・statusLine と Codex の feature だけを同期
+# Claude Code のセッション開始時に dotfiles-main の fast-forward・新しいリンク・make sync を自動で行う（docs/dotfiles-autosync.md）
 make doctor     # コマンド、リンク、ステータススクリプトを検証
-make diff       # コピー管理の Codex 設定とローカル設定の差分を表示
+make diff       # コピー・同期管理の設定とローカル設定の差分を表示
 make check      # PR・コミット前の検査（bootstrap 後は commit 時にも自動実行）
 ```
 
-`make doctor` は、実際にホームディレクトリへリンクを配置した checkout でリンク先まで検証します。`make check` は linked worktree でも commit 前検査を行えるよう、ホームリンクを所有する checkout では同じ完全検証、それ以外では管理対象 source・構文・test・差分・秘密情報を検証する worktree-safe static mode を自動選択します。リンクの張替えは行いません。
+`make doctor` は、実際にホームディレクトリへリンクを配置した checkout でリンク先まで検証します。`make check` は linked worktree でも commit 前検査を行えるよう、ホームリンクを所有する checkout では同じ完全検証、それ以外では管理対象 source・構文・test・差分・秘密情報を検証する worktree-safe static mode を自動選択します。リンクの張替えは行いません。`~/.claude/settings.json` の管理対象 hook・キーも同様に、完全検証では端末の設定に欠けや古さがあれば NG（`make sync` で解消）、static mode では宣言と source だけを検証します。
 
 Ghostty が Ubuntu の標準リポジトリから導入できるのは十分に新しいバージョンだけです。
 Ubuntu 24.04 では、bootstrap はコミュニティパッケージを暗黙には導入せず、対応方法だけを
@@ -98,7 +100,11 @@ GHOSTTY_INSTALL=community-deb make bootstrap
 以後の変更は `git status` で確認できます。修正ごとに `make link` を実行する必要はありません。
 
 アプリが端末固有の状態を書き足す設定は `mode = "copy-if-missing"` または管理対象キーだけを
-同期する `mode = "merge-toml-features"` とし、`make diff` で確認します。
+同期する `mode = "merge-toml-features"`（Codex の `[features]`）/ `mode = "merge-json-managed"`
+（`~/.claude/settings.json` の `hook_commands` に宣言した hook と `keys`）とし、`make diff` で確認して
+`make sync` で反映します（main への merge 後は、次の Claude Code セッションの開始時に `dotfiles-autosync` が
+checkout の fast-forward・新しいリンクの配置・`make sync` を自動で行います。docs/dotfiles-autosync.md）。`merge-json-managed` は管理外の hook・キーを残し、変更前のファイルを
+`<file>.dotfiles-backup-<時刻>` に退避し、JSON を解析できない場合は書き込みません。
 認証情報・トークンは `mode = "ignore"`、sudo や Windows を必要とする設定は `mode = "manual"` として
 明示的に分離します。新しい設定は、秘密情報を除外したうえで `dotfiles.toml` に追加してから `make link` と
 `make check` を実行してください。

@@ -3,6 +3,14 @@ branch = "feature/issue-9-workflow-progress-review-gate"
 handoff = "issue-9-workflow-progress-review-gate.md"
 
 [[issue_branch]]
+branch = "feature/issue-28-claude-settings-sync"
+handoff = "issue-28-claude-settings-sync.md"
+
+[[issue_branch]]
+branch = "feature/issue-29-dotfiles-autosync"
+handoff = "issue-29-dotfiles-autosync.md"
+
+[[issue_branch]]
 branch = "feature/issue-30-hc-context-guard"
 handoff = "issue-30-hc-context-guard.md"
 

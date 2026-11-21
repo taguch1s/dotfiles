@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Claude Code の statusline。文脈サイズと Pro プランの使用率を 1 行で出し、使用率の変化を記録する。
 
-表示: `ctx 182k | 5h 54% | 7d 8%`
+表示: `Opus | dotfiles | ctx 182k | 5h 54% | 7d 8%`
+- モデル名・ディレクトリ: stdin の model.display_name と workspace.current_dir（無ければ cwd）の末尾。
+  無い項目は出さない（旧 ~/.claude/statusline.py の表示を取り込んだもの）。
 - ctx: transcript_path の最後のリクエスト（本体、合成メッセージを除く）の
   input + cache 作成 + cache 読み込み。claude-token-metrics の文脈サイズと同じ定義。
 - 5h / 7d: stdin の rate_limits.five_hour / seven_day の used_percentage。
@@ -145,6 +147,21 @@ def format_percent(window: dict | None) -> str:
     return f"{window['used_percentage']:.0f}%" if window else "-"
 
 
+def labels(payload: dict) -> list[str]:
+    """先頭に出すモデル名とディレクトリ名。"""
+    result = []
+    model = payload.get("model")
+    if isinstance(model, dict) and isinstance(model.get("display_name"), str) and model["display_name"]:
+        result.append(model["display_name"])
+    workspace = payload.get("workspace")
+    directory = workspace.get("current_dir") if isinstance(workspace, dict) else None
+    if not isinstance(directory, str) or not directory:
+        directory = payload.get("cwd")
+    if isinstance(directory, str) and directory:
+        result.append(os.path.basename(directory.rstrip("/")) or directory)
+    return result
+
+
 def render(payload: object) -> str:
     payload = payload if isinstance(payload, dict) else {}
     context = None
@@ -161,8 +178,9 @@ def render(payload: object) -> str:
         except OSError as error:
             print(f"claude-statusline: 記録できません: {error}", file=sys.stderr)
     windows = current or {}
-    return f"ctx {format_tokens(context)} | 5h {format_percent(windows.get('five_hour'))}" \
-           f" | 7d {format_percent(windows.get('seven_day'))}"
+    return " | ".join([*labels(payload), f"ctx {format_tokens(context)}",
+                       f"5h {format_percent(windows.get('five_hour'))}",
+                       f"7d {format_percent(windows.get('seven_day'))}"])
 
 
 def main() -> int:

@@ -262,11 +262,32 @@ source = ".claude/CLAUDE.md"
 target = ".claude/CLAUDE.md"
 mode = "link"
 
+# Claude Code が autoMode・env などを書き足すため link にはしない。無い端末には全体をコピーし、
+# ある端末には dotfiles が持つ hook と keys だけを make sync で同期する（管理外の hook・キーは残す）。
+# hook_commands は dotfiles が持つ hook の command の一覧。source から消した command は端末からも消え、
+# hook_commands から外した command は管理外として端末に残る。source の hook はすべてここに書く。
 [[config]]
-name = "Claude user settings defaults"
+name = "Claude user settings（dotfiles 管理の hook と statusLine）"
 source = ".claude/settings.json"
 target = ".claude/settings.json"
-mode = "copy-if-missing"
+mode = "merge-json-managed"
+keys = ["statusLine"]
+hook_commands = [
+  "~/.local/bin/awake-hook on",
+  "~/.local/bin/awake-hook off",
+  "~/.local/bin/claude-context-guard",
+  "~/.local/bin/claude-token-metrics record || true",
+  "~/.local/bin/dotfiles-autosync || true",
+]
+
+# SessionStart hook から呼ばれ、dotfiles-main を origin/main へ fast-forward してから
+# 新しいリンクと上の管理 hook・キーを反映する。説明は docs/dotfiles-autosync.md
+[[config]]
+name = "dotfiles 自動同期（SessionStart hook）"
+source = ".local/bin/dotfiles-autosync"
+target = ".local/bin/dotfiles-autosync"
+mode = "link"
+executable = true
 
 [[config]]
 name = "Claude 文脈予算 hook"
