@@ -182,6 +182,13 @@ hc run --bg --outlive-parent --label role=worker --name small-issue --cwd <workt
 - 引き継ぎ（`resume-worker`）は、前のワーカーのラベル `model` と同じモデルで起動します（ラベルが無い・不正なら opus）。`--model <opus|sonnet>` で明示もできますが、監督役のプロンプトでは、ラベルの無いワーカーのモデルを補うときだけ使い、引き継ぎでモデルを変えません（途中でのモデル切り替えは #33 の対象外）。許可しない `--model` は、前のワーカーを止めずに拒否します。
 - 比べ方: 監督役は進捗ボードの「進行中」「完了」に `[<モデル> / <経路>]` と差し戻しの回数を書き、ワーカーは PR 本文に `ワーカー: <モデル>（監督役の見立て: <経路>）` を書きます。Issue 1 件あたりのコストは `claude-token-metrics report` の `by_model` で、完了率と差し戻しの回数は PR とボードで、Opus の作業と比べます。単価・使用率の換算は推測で決めず、#20 の calibrate（`by_model`）の実データで確かめます。
 
+### 報告・相談の形と受理の確認
+
+監督役は、メッセージが届くたびに自分の文脈（実測で平均 80k〜109k）を読み直します。監督役のコストは、ほぼ「リクエスト数 × 平均文脈」なので、ワーカーからのメッセージの数と長さ、受理での確認の回数を減らします（Issue #34）。相談の禁止や回数の上限は設けません（判断の質を下げないため）。
+
+- ワーカー（[worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) の「報告と相談の形」）: 監督役に送るのは `【相談】`・`【完了】`・`【中断】`・`【引き継ぎ】` だけで、途中経過は送りません。相談は同じ Unit の論点を番号付きで 1 通にまとめ、回答に左右されない作業は待たずに進めます。完了・中断の報告は `PR:`・`検証:`・`未解決:`・`判断:`・`詳細:` の各 1 行で、長い内容はファイルに書いて `詳細:` に path を書きます。`【引き継ぎ】<path>` の 1 行（#31）は変えていません。
+- 監督役（[supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) の「待ち方」「受理時の確認の型」）: 待つのは `hc wait --children any` だけで、`reason: timeout` では何も読まずに待ち直します。受理では、`gh pr view --json state,isDraft,mergeable,headRefOid,body,statusCheckRollup` と `git -C <worktree> status`・`log` を 1 回の Bash 呼び出しで出し、要る値だけを確かめます（実測は省きません）。`hc read` で画面を読むのは、報告が欠けたときだけです。複数の論点がある相談には、論点ごとに判断記録を残して 1 通で返します。
+
 ### フォルダ信頼（trust）
 
 trust は git リポジトリのルートに付き、worktree はメイン checkout のルートを使います。リポジトリごとに 1 回 trust すれば、そのリポジトリの worktree では出ません。dev は admin の `~/.claude.json` を複製するので、既存のリポジトリは trust 済みです。新しいリポジトリで出たら、Herdr app かスマホで「Yes, I trust this folder」を選びます（既定は「No, exit」）。`$HOME` で起動したときの trust は保存されません。
@@ -321,3 +328,4 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
 - dev での実機確認が必要なもの（#31）: 「ワーカーの引き継ぎ」の「実機で確かめる」の 3 点。`resume-worker` が使う `hc get --json` のラベル（`role`・`handoffs`）と `status.state`、`hc run --timeout` の振る舞いは偽の `hc` でしか確かめていません。導入後、mlbot の Issue 数件で Issue 1 件あたりの重み付きコストと平均文脈を導入前（#17 のコメントの値）と比べ、引き継ぎ 1 回の追加コストより平均文脈の低下で得る分が大きいかを確かめます。
 - 導入後の計測が必要なもの（#32）: [worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) の「ツール出力を絞る」。導入後のワーカー数件で、`claude-token-metrics session` / `report` の L2（`by_tool` の Bash の `raw_bytes` 中央値、`new_info_rate`）と 1 リクエストあたりの文脈増分を導入前（#32 の本文の値）と比べます。下がらなければ、hook で出力を切り詰める対策を別 Issue にします。
 - dev での実機確認と導入後の計測が必要なもの（#33）: 監督役が `claude-worker-sonnet` で起動したワーカーの transcript の model が Sonnet になること、`claude-worker` では Opus のままであること（hc のテンプレートの `command` に `--model sonnet` を足しても引数として渡ることは、偽の `hc` でしか確かめていません）。導入後、Sonnet で実行した Issue の PR までの完了率・差し戻しの回数と Issue 1 件あたりのコスト（`by_model`）を、Opus の場合と比べます。
+- 導入後の計測が必要なもの（#34）: 上の「報告・相談の形と受理の確認」。導入後の監督役で、`claude-token-metrics report` の受理 1 件あたりのリクエスト数と平均文脈を、導入前（#34 の本文の値: 103 リクエスト・平均文脈 109k、31 リクエスト・平均 80k）と比べます。受理の確認の `gh pr view --jq` は、CI の無い PR（このリポジトリ）と CI のある公開リポジトリの PR（成功・失敗・実行中・StatusContext の `PENDING`）で出力を確かめました。
