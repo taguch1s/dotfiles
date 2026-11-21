@@ -6,6 +6,10 @@ handoff = "issue-9-workflow-progress-review-gate.md"
 branch = "feature/issue-28-claude-settings-sync"
 handoff = "issue-28-claude-settings-sync.md"
 
+[[issue_branch]]
+branch = "feature/issue-29-dotfiles-autosync"
+handoff = "issue-29-dotfiles-autosync.md"
+
 [[out_of_scope_branch]]
 branch = "main"
 reason = "個人利用のため main へ直接 push する"
