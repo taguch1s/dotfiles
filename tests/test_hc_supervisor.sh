@@ -253,13 +253,41 @@ if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '#31 を PR 作成
   run_line="$(runs)"
   [[ "$(cmds)" == 'kill wait rm run ' ]] \
     && ok 'resume-worker: 前のワーカーを止めて片付けてから、新しいワーカーを起動する' || ng "resume-worker の順序が違う: $(cmds)"
-  [[ "$run_line" == "run --bg --timeout 60 --outlive-parent --label role=worker --label handoffs=1 --name w1 --cwd $repo claude-worker 【再開】$worker_handoff"* ]] \
+  [[ "$run_line" == "run --bg --timeout 60 --outlive-parent --label role=worker --label handoffs=1 --label model=opus --name w1 --cwd $repo claude-worker 【再開】$worker_handoff"* ]] \
     && ok 'resume-worker: 同じ worktree・同じ名前で、依頼文の先頭に【再開】<handoff> を付けて起動する' || ng "resume-worker の hc run が違う: $run_line"
   [[ "$run_line" == *'#31 を PR 作成まで進める' ]] && ok 'resume-worker: 元の依頼文を添える' || ng "元の依頼文がない: $run_line"
   [[ "$(<"$fixture/run-handoffs")" == 1 ]] && ok 'resume-worker: 引き継ぎ回数（1 回目）を起動と同時にラベルに残す' || ng "引き継ぎ回数のラベルが違う: $run_line"
 else
   ng "resume-worker が失敗した: $(<"$fixture/err")"
 fi
+
+# モデル: 既定は前のワーカーのラベル model（無い・不正なら opus）。--model で指定できる（#33）。
+run_model() { runs | sed -E 's/.* --label model=([^ ]*) --name [^ ]* --cwd [^ ]* ([^ ]*) .*/\1 \2/'; }
+worker_ready '{"role":"worker","model":"sonnet"}'
+resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼' || true
+[[ "$(run_model)" == 'sonnet claude-worker-sonnet' ]] \
+  && ok 'resume-worker: 前のワーカーのラベル model=sonnet を引き継ぎ、claude-worker-sonnet で起動してラベルに残す' \
+  || ng "モデルの引き継ぎが違う: $(runs) / $(<"$fixture/err")"
+grep -q 'モデル sonnet' "$fixture/out" && ok 'resume-worker: 起動したモデルを表示する' || ng "モデルの表示がない: $(<"$fixture/out")"
+worker_ready '{"role":"worker","model":"sonnet"}'
+resume --from w1 --cwd "$repo" --handoff "$worker_handoff" --model opus '依頼' || true
+[[ "$(run_model)" == 'opus claude-worker' ]] && ok 'resume-worker: --model opus で前のワーカーのモデルより明示指定を優先する' \
+  || ng "--model opus の扱いが違う: $(runs) / $(<"$fixture/err")"
+worker_ready
+resume --from w1 --cwd "$repo" --handoff "$worker_handoff" --model sonnet '依頼' || true
+[[ "$(run_model)" == 'sonnet claude-worker-sonnet' ]] && ok 'resume-worker: ラベル model のない前のワーカーでも --model sonnet で起動できる' \
+  || ng "--model sonnet の扱いが違う: $(runs) / $(<"$fixture/err")"
+worker_ready '{"role":"worker","model":"haiku"}'
+resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼' || true
+[[ "$(run_model)" == 'opus claude-worker' ]] && ok 'resume-worker: 前のワーカーのラベル model が許可外なら opus' \
+  || ng "不正なラベル model の扱いが違う: $(runs) / $(<"$fixture/err")"
+for bad in haiku Sonnet ''; do
+  worker_ready
+  if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" --model "$bad" '依頼'; then ng "許可しない --model '$bad' を受け付けた"; continue; fi
+  [[ -z "$(cmds)" && "$(grep -c $'^get' "$fixture/hc.log" || true)" == 0 ]] && grep -q -- '--model は' "$fixture/err" \
+    && ok "resume-worker: 許可しない --model '$bad' は、前のワーカーを止めず hc に触れずに拒否" \
+    || ng "許可しない --model '$bad' の扱いが違う: $(cmds) / $(<"$fixture/err")"
+done
 
 worker_ready '{"role":"worker","handoffs":"2"}'
 resume --from w1 --cwd "$repo" --handoff "$worker_handoff" --name w1b '依頼' || true
