@@ -49,6 +49,7 @@
   ```
 
 - 失敗・ブロックで止まるときは、先頭を `【中断】` にし、`未解決:` に止まった理由と、続けるのに要るもの（判断、権限、外部の状態など）を書く。
+- 本文は `hc send supervisor "…"` の二重引用符の中に置くので、`"`・`` ` ``・`$` を入れない（シェルに展開されて崩れる）。入れる必要がある内容は、ファイルに書いて `詳細:` に path を書く。
 
 ## ツール出力を絞る
 
@@ -72,4 +73,4 @@
 依頼文の先頭に `【再開】<handoff の絶対 path>` があれば、前のワーカーの続きです。
 
 - 最初にその handoff を読み、`git status` / `git log` / `git branch --show-current` で、branch・HEAD・未 commit の変更が handoff と合うか確かめる。合えば、受け入れ済みの Unit をやり直さず、next safe action から再開する。以後も同じ handoff を更新する。
-- handoff がない、読めない、branch や HEAD が合わず説明がつかない、next safe action が書かれていない、のどれかなら、推測で再開しない。`hc send supervisor "【相談】<名前・worktree>: handoff から再開できません。<理由>。選択肢: <案>。推奨: <案>"` で相談し、返事を待つ。
+- handoff がない、読めない、branch や HEAD が合わず説明がつかない、next safe action が書かれていない、のどれかなら、推測で再開しない。`hc send supervisor "【相談】<名前・worktree>: handoff から再開できません。<理由>。選択肢: <案>。推奨: <案>"` で相談し、返事を待つ（論点 1 つの相談なので、「報告と相談の形」の番号と `待つ間:` の行は省いてよい）。
