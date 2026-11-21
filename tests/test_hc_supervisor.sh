@@ -8,7 +8,7 @@ launcher="$repository_root/.local/bin/hc-supervisor"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 
-mkdir -p "$fixture/bin" "$fixture/live" "$fixture/labels" "$fixture/home"
+mkdir -p "$fixture/bin" "$fixture/live" "$fixture/labels" "$fixture/alias" "$fixture/home"
 export MOCK_HC_DIR="$fixture" PATH="$fixture/bin:$PATH" HOME="$fixture/home"
 export HC_CLAUDE_ROLE_FILE="$fixture/dotfiles-role"
 echo dev >"$HC_CLAUDE_ROLE_FILE"
@@ -23,6 +23,8 @@ set -euo pipefail
 (IFS=$'\x1f'; line="$*"; printf '%s\n' "${line//$'\n'/\\n}") >>"$MOCK_HC_DIR/hc.log"
 case "$1" in
   get)
+    # $MOCK_HC_DIR/alias/<tN> があれば、その tN を中身の名前の terminal として扱う。
+    [[ ! -f "$MOCK_HC_DIR/alias/$2" ]] || set -- "$1" "$(<"$MOCK_HC_DIR/alias/$2")" "${@:3}"
     if [[ "$2" == self ]]; then
       echo '{"address":"t1","state":"live","labels":{"herdr.space":"spABC","herdr.tab":"tbOLD"}}'
       exit 0
@@ -43,7 +45,11 @@ case "$1" in
       case "$1" in --) break ;; --bg|--no-parent|--keep|--no-notify|--outlive-parent|--rm) shift ;; *) shift 2 ;; esac
     done
     ;;
-  kill) rm -f "$MOCK_HC_DIR/live/$2" ;;
+  kill)
+    target="$2"
+    [[ ! -f "$MOCK_HC_DIR/alias/$2" ]] || target="$(<"$MOCK_HC_DIR/alias/$2")"
+    rm -f "$MOCK_HC_DIR/live/$target"
+    ;;
   send)
     # MOCK_SEND_WRITES_HANDOFF=1 なら、依頼を受けた監督役が引き継ぎを書いたことにする。
     if [[ "${MOCK_SEND_WRITES_HANDOFF:-}" == 1 ]]; then
@@ -267,6 +273,14 @@ if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼'; then ng 
 worker_ready '{"role":"worker","handoffs":"3"}'
 HC_SUPERVISOR_MAX_WORKER_HANDOFFS=4 resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼' || true
 [[ "$(cmds)" == 'kill wait rm run ' ]] && ok 'resume-worker: 上限は HC_SUPERVISOR_MAX_WORKER_HANDOFFS で変えられる' || ng "上限の上書きが違う: $(cmds)"
+
+worker_ready
+echo w1 >"$fixture/alias/t5"
+resume --from t5 --cwd "$repo" --handoff "$worker_handoff" '依頼' || true
+[[ "$(cmds)" == 'kill wait rm run ' && "$(runs)" == *' --name w1 '* ]] \
+  && ok 'resume-worker: --from に tN を渡しても、前のワーカー自身を名前の衝突とみなさず、同じ名前で起動する' \
+  || ng "--from tN の扱いが違う: $(cmds) / $(runs) / $(<"$fixture/err")"
+rm -f "$fixture/alias/"*
 
 worker_ready
 echo live >"$fixture/live/other"

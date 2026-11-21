@@ -271,10 +271,14 @@ resume_worker() {
   count=$((previous + 1))
   ((count <= max)) \
     || die "同じ作業で引き継ぎが $max 回を超えます（今回 $count 回目）。新しいワーカーを起動せず、前のワーカー $from も止めていません。ユーザーに報告してください。"
-  [[ -n "$new_name" ]] || new_name="$(json_value field "$json" name)"
+  local old_name old_address
+  old_name="$(json_value field "$json" name)"
+  old_address="$(json_value field "$json" address)"
+  [[ -n "$new_name" ]] || new_name="$old_name"
   [[ -n "$new_name" ]] || die "前のワーカーの名前が分かりません。--name で新しいワーカーの名前を指定してください。"
-  # 別の名前で起動するとき、その名前の terminal が既にあれば、起動の成否を見分けられないので止める。
-  [[ "$new_name" == "$from" ]] || ! exists "$new_name" \
+  # 前のワーカーと別の terminal の名前で起動するとき、その名前の terminal が既にあれば、
+  # 起動の成否を見分けられないので止める（--from は名前でも tN でもよいので、両方と比べる）。
+  [[ "$new_name" == "$from" || "$new_name" == "$old_name" || "$new_name" == "$old_address" ]] || ! exists "$new_name" \
     || die "$new_name という terminal が既にあります。別の --name を指定してください。前のワーカーは止めていません。"
 
   hc kill "$from" >/dev/null
