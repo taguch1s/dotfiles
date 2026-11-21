@@ -35,6 +35,41 @@ expected="--model opus --effort medium --permission-mode bypassPermissions --set
 [[ "$(args)" == "--model opus --effort high "*"--append-system-prompt-file $config/supervisor-prompt.md" ]] && ok 'dev: 監督役は effort high・監督役のプロンプトで起動する' \
   || ng "監督役の引数が違う: $(args)"
 
+# モデル: 既定は opus。ワーカーだけ役割の直後の --model で opus / sonnet を選べる（#33）。
+worker_tail="--effort medium --permission-mode bypassPermissions --settings $config/session-settings.json --append-system-prompt-file $config/worker-prompt.md"
+"$launcher" worker --model sonnet '依頼文'
+[[ "$(args)" == "--model sonnet $worker_tail 依頼文" ]] \
+  && ok 'モデル: ワーカーは --model sonnet で sonnet を使い、--model を claude に二重に渡さない' || ng "--model sonnet の引数が違う: $(args)"
+"$launcher" worker --model=sonnet '依頼文'
+[[ "$(args)" == "--model sonnet $worker_tail 依頼文" ]] && ok 'モデル: --model=sonnet の形も受け付ける' || ng "--model=sonnet の引数が違う: $(args)"
+"$launcher" worker --model opus '依頼文'
+[[ "$(args)" == "--model opus $worker_tail 依頼文" ]] && ok 'モデル: --model opus を明示できる' || ng "--model opus の引数が違う: $(args)"
+bad_ok=1
+for bad in haiku Sonnet fable 'opus sonnet' claude-sonnet-4-5 ''; do
+  "$launcher" worker --model "$bad" '依頼文' 2>"$fixture/err"
+  [[ "$(args)" == "--model opus $worker_tail 依頼文" ]] || { ng "許可しないモデル '$bad' で opus に戻らない: $(args)"; bad_ok=0; }
+  grep -q '許可していないモデル' "$fixture/err" || { ng "許可しないモデル '$bad' を黙って捨てた"; bad_ok=0; }
+done
+[[ "$bad_ok" == 1 ]] && ok 'モデル: 許可しない名前（opus・sonnet 以外）は警告して opus で起動する（起動は止めない）'
+"$launcher" supervisor --model sonnet 2>"$fixture/err"
+[[ "$(args)" == "--model opus --effort high "* && "$(args)" != *sonnet* ]] && grep -q 'opus 固定' "$fixture/err" \
+  && ok 'モデル: 監督役は --model を渡されても警告して opus のまま' || ng "監督役の --model の扱いが違う: $(args) / $(cat "$fixture/err")"
+if "$launcher" worker --model 2>/dev/null; then ng '値のない --model を受け付けた'; else ok 'モデル: 値のない --model は使い方の誤りとして拒否'; fi
+python3 - "$repository_root/.config/herdr-core/templates/claude-worker.md" "$repository_root/.config/herdr-core/templates/claude-worker-sonnet.md" \
+  "$repository_root/dotfiles.toml" <<'EOF' && ok 'テンプレート: claude-worker は opus（--model なし）、claude-worker-sonnet は --model sonnet、どちらも link する' \
+  || ng 'ワーカーのテンプレートが違う'
+import re, sys, tomllib
+def command(path):
+    return re.search(r"^command: (.*)$", open(path).read(), re.M).group(1)
+assert command(sys.argv[1]) == "hc-claude worker", command(sys.argv[1])
+assert command(sys.argv[2]) == "hc-claude worker --model sonnet", command(sys.argv[2])
+# 依頼文の前置き（本文）は同じにする（モデル以外の振る舞いを変えない）。
+body = lambda p: open(p).read().split("---\n", 2)[2]
+assert body(sys.argv[1]) == body(sys.argv[2])
+sources = {c.get("source") for c in tomllib.load(open(sys.argv[3], "rb"))["config"]}
+assert {".config/herdr-core/templates/claude-worker.md", ".config/herdr-core/templates/claude-worker-sonnet.md"} <= sources
+EOF
+
 # 文脈予算の閾値（claude-context-guard が読む CLAUDE_CTX_GUARD_TOKENS）を役割ごとに渡す。
 ctx() { cat "$fixture/bin/ctx"; }
 "$launcher" supervisor

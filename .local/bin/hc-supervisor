@@ -13,7 +13,7 @@ usage() {
 Usage: hc-supervisor [start] [--cwd DIR]
        hc-supervisor restart [--cwd DIR]
        hc-supervisor status | stop | board
-       hc-supervisor resume-worker --from WORKER --cwd WORKTREE --handoff PATH [--name NAME] REQUEST
+       hc-supervisor resume-worker --from WORKER --cwd WORKTREE --handoff PATH [--name NAME] [--model opus|sonnet] REQUEST
 
 start    監督役（名前 supervisor、ラベル role=supervisor）を起動する。既に監督役がいれば起動しない。
          --cwd の既定は ~/.local/share/hc-supervisor（$HOME はフォルダ信頼が保存されず、
@@ -36,7 +36,10 @@ resume-worker
          絶対 path に限る。前のワーカーが role=worker でない、まだ動いている（working）、見つからないときは、
          何も止めず起動もしない。引き継ぎ回数をラベル handoffs に残し、上限
          （HC_SUPERVISOR_MAX_WORKER_HANDOFFS、既定 3）を超えるなら起動しない（ユーザーに報告する）。
-         新しいワーカーの名前は --name、無ければ前のワーカーと同じ名前。監督役が実行する。
+         新しいワーカーの名前は --name、無ければ前のワーカーと同じ名前。
+         モデルは --model、無ければ前のワーカーのラベル model（無い・不正なら opus）。opus は
+         テンプレート claude-worker、sonnet は claude-worker-sonnet で起動し、ラベル model に残す。
+         監督役が実行する。
 EOF
 }
 
@@ -202,6 +205,14 @@ restart() {
   launch "$space" "$tab"
 }
 
+# ワーカーに選べるモデル（hc-claude の --model と同じ。opus 以外は claude-worker-<モデル> のテンプレートがある）。
+worker_models=(opus sonnet)
+is_worker_model() {
+  local m
+  for m in "${worker_models[@]}"; do [[ "$1" == "$m" ]] && return 0; done
+  return 1
+}
+
 resume_request() {
   local handoff_path="$1" count="$2" request="$3"
   printf '【再開】%s\n前のワーカーが文脈の区切りで引き継ぎました（引き継ぎ %s 回目）。システムプロンプトの「文脈の区切りと引き継ぎ」に従い、この handoff を読んで next safe action から再開してください。\n\n元の依頼:\n%s' \
@@ -211,16 +222,17 @@ resume_request() {
 # 前のワーカー（引き継ぎを送って止まった）を片付け、同じ worktree で handoff 付きの新しいワーカーを起動する。
 # 前後のワーカーが同じ worktree で同時に動かないよう、前のワーカーが止まって消えたことを確かめてから起動する。
 resume_worker() {
-  local from="" worktree="" handoff_path="" new_name="" request=""
+  local from="" worktree="" handoff_path="" new_name="" model="" model_given=0 request=""
   while (($#)); do
     case "$1" in
-      --from|--cwd|--handoff|--name)
+      --from|--cwd|--handoff|--name|--model)
         (($# >= 2)) || die "$1 に値を指定してください"
         case "$1" in
           --from) from="$2" ;;
           --cwd) worktree="$2" ;;
           --handoff) handoff_path="$2" ;;
           --name) new_name="$2" ;;
+          --model) model="$2" model_given=1 ;;
         esac
         shift 2
         ;;
@@ -243,6 +255,7 @@ resume_worker() {
   [[ -n "${request//[[:space:]]/}" ]] || die '依頼文（前のワーカーに渡したものと同じ）を指定してください'
   local max="${HC_SUPERVISOR_MAX_WORKER_HANDOFFS:-3}"
   [[ "$max" =~ ^[1-9][0-9]*$ ]] || die "HC_SUPERVISOR_MAX_WORKER_HANDOFFS は正の整数にしてください: $max"
+  ((!model_given)) || is_worker_model "$model" || die "--model は ${worker_models[*]} のどれかにしてください: $model"
 
   # handoff は Git 管理外の codex-handoffs の下に限る（session-handoff の保存先）。
   [[ -d "$worktree" ]] || die "worktree がありません: $worktree"
@@ -275,6 +288,14 @@ resume_worker() {
   old_name="$(json_value field "$json" name)"
   old_address="$(json_value field "$json" address)"
   [[ -n "$new_name" ]] || new_name="$old_name"
+  # モデルは前のワーカーと同じものを既定にする（引き継ぎでモデルを変えない）。ラベルが無い・不正なら
+  # （この仕組みより前に起動したワーカーなど）、hc-claude の既定と同じ opus。
+  if ((!model_given)); then
+    model="$(json_value label "$json" model)"
+    is_worker_model "$model" || model=opus
+  fi
+  local template=claude-worker
+  [[ "$model" == opus ]] || template="claude-worker-$model"
   [[ -n "$new_name" ]] || die "前のワーカーの名前が分かりません。--name で新しいワーカーの名前を指定してください。"
   # 前のワーカーと別の terminal の名前で起動するとき、その名前の terminal が既にあれば、
   # 起動の成否を見分けられないので止める（--from は名前でも tN でもよいので、両方と比べる）。
@@ -290,10 +311,11 @@ resume_worker() {
   # 同じリポジトリの worktree なので trust のダイアログは出ない想定。出て最初の依頼文が届かないときに
   # 待ち続けないよう、--timeout で切り上げる（terminal は動いたまま。結果の first_message.sent で分かる）。
   # 引き継ぎ回数のラベルは起動と同時に付ける（後から付けると、付け損ねたときに回数が 0 に戻る）。
-  hc run --bg --timeout 60 --outlive-parent --label role=worker --label "handoffs=$count" --name "$new_name" --cwd "$worktree" \
-    claude-worker "$(resume_request "$real_handoff" "$count" "$request")" || true
+  hc run --bg --timeout 60 --outlive-parent --label role=worker --label "handoffs=$count" --label "model=$model" \
+    --name "$new_name" --cwd "$worktree" \
+    "$template" "$(resume_request "$real_handoff" "$count" "$request")" || true
   exists "$new_name" || die "新しいワーカーを起動できませんでした（hc ls で確認してください）。handoff は $real_handoff にあります（引き継ぎ $count 回目）。"
-  printf '新しいワーカーを起動しました: %s（引き継ぎ %s 回目、handoff: %s）\n' "$new_name" "$count" "$real_handoff"
+  printf '新しいワーカーを起動しました: %s（引き継ぎ %s 回目、モデル %s、handoff: %s）\n' "$new_name" "$count" "$model" "$real_handoff"
 }
 
 command="start"

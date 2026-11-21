@@ -68,6 +68,12 @@ target = ".config/herdr-core/templates/claude-worker.md"
 mode = "link"
 
 [[config]]
+name = "herdr-core ワーカーテンプレート（Sonnet）"
+source = ".config/herdr-core/templates/claude-worker-sonnet.md"
+target = ".config/herdr-core/templates/claude-worker-sonnet.md"
+mode = "link"
+
+[[config]]
 name = "herdr-core の Claude Code settings（sandbox なし・bypassPermissions・事故よけ hook）"
 source = ".config/herdr-core/claude/session-settings.json"
 target = ".config/herdr-core/claude/session-settings.json"
