@@ -26,6 +26,10 @@ handoff = "issue-32-worker-output-discipline.md"
 branch = "feature/issue-33-worker-model"
 handoff = "issue-33-worker-model.md"
 
+[[issue_branch]]
+branch = "feature/issue-34-short-reports"
+handoff = "issue-34-short-reports.md"
+
 [[out_of_scope_branch]]
 branch = "main"
 reason = "個人利用のため main へ直接 push する"
