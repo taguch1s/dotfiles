@@ -65,17 +65,17 @@ TUI 版 `herdr` と herdr-core は別の実行基盤です。TUI で起動した
   │ 依頼・質問への回答
   ▼
 supervisor（dev、role=supervisor、親なし）
-  │ hc run … claude-worker（--outlive-parent）     ▲ hc send supervisor（相談・報告）
-  ▼                                               │
+  │ hc run … claude-worker[-sonnet]（--outlive-parent）  ▲ hc send supervisor（相談・報告）
+  ▼                                                      │
 ワーカー（dev、role=worker）── commit・push・PR まで止まらない
 ```
 
 | ファイル | 内容 |
 | --- | --- |
-| [hc-claude](../.local/bin/hc-claude) | 監督役・ワーカーの起動ラッパー。`/etc/dotfiles-role` が `dev` のときだけ `claude --model opus --effort <high|medium> --permission-mode bypassPermissions --settings session-settings.json --append-system-prompt-file <role>-prompt.md` を exec し（effort は監督役 high・ワーカー medium）、それ以外（admin）では起動を拒否する。文脈予算の閾値 `CLAUDE_CTX_GUARD_TOKENS` を役割ごとに渡す（下記「文脈予算とトークン記録」） |
+| [hc-claude](../.local/bin/hc-claude) | 監督役・ワーカーの起動ラッパー。`/etc/dotfiles-role` が `dev` のときだけ `claude --model <opus|sonnet> --effort <high|medium> --permission-mode bypassPermissions --settings session-settings.json --append-system-prompt-file <role>-prompt.md` を exec し（effort は監督役 high・ワーカー medium。モデルは既定で opus、ワーカーだけ `hc-claude worker --model sonnet` で選べる。下記「ワーカーのモデル」）、それ以外（admin）では起動を拒否する。文脈予算の閾値 `CLAUDE_CTX_GUARD_TOKENS` を役割ごとに渡す（下記「文脈予算とトークン記録」） |
 | [hc-supervisor](../.local/bin/hc-supervisor) | 監督役の起動・状態表示・停止と、引き継いだワーカーの起動し直し（`resume-worker`）。dev でだけ起動する |
 | [hc-permission](../.local/bin/hc-permission) | 事故よけの deny リスト（`hook` / `check`） |
-| [templates/claude-supervisor.md](../.config/herdr-core/templates/claude-supervisor.md) / [claude-worker.md](../.config/herdr-core/templates/claude-worker.md) | `hc run` のテンプレート（`command: hc-claude supervisor|worker`） |
+| [templates/claude-supervisor.md](../.config/herdr-core/templates/claude-supervisor.md) / [claude-worker.md](../.config/herdr-core/templates/claude-worker.md) / [claude-worker-sonnet.md](../.config/herdr-core/templates/claude-worker-sonnet.md) | `hc run` のテンプレート（`command: hc-claude supervisor|worker`、Sonnet のワーカーは `hc-claude worker --model sonnet`） |
 | [claude/session-settings.json](../.config/herdr-core/claude/session-settings.json) | hc 上のセッションの設定（`defaultMode: bypassPermissions`、`sandbox.enabled: false`、`PreToolUse` Bash → `hc-permission hook`、`UserPromptSubmit`・`PostToolUse` → `claude-context-guard`、`SessionEnd` → `claude-token-metrics record`） |
 | [claude/supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) / [worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) | 役割のシステムプロンプト |
 | [herdr-app/mods/supervisor-board](../.config/herdr-app/mods/supervisor-board/main.js) / [layouts/board.json](../.config/herdr-app/layouts/board.json) | Herdr app の監督役ボード。`board` レイアウト（main の複製）で Changes パネルの中身をこの mod に替える |
@@ -155,7 +155,8 @@ claude-token-metrics report --since "$(date +%F)"   # ctx-check のセッショ�
 - 同じ worktree を 2 つのワーカーが同時に編集しないよう、`resume-worker` は前のワーカーを止めて消えたことを確かめてから起動します。前のワーカーがまだ `working`、`role=worker` でない、見つからない（回数が分からない）ときは、何も止めず起動もしません。
 - `resume-worker` は handoff が `--cwd` の `codex-handoffs` の下にある既存ファイルの絶対 path であることを確かめます。中身（branch・HEAD・next safe action）が今の worktree と合うかは、新しいワーカーが確かめ、合わなければ推測で再開せず監督役に相談します。
 - 引き継ぎ回数は新しいワーカーのラベル `handoffs` に残り、監督役が進捗ボードの「進行中」にも書きます。3 回を超える（4 回目の）引き継ぎは起動せず、監督役がユーザーに報告します。上限は `HC_SUPERVISOR_MAX_WORKER_HANDOFFS`（監督役の環境）で変えられます。
-- 起動し直したワーカーの閾値は、テンプレート（`claude-worker`）どおり既定の 120000 です。
+- 起動し直したワーカーの閾値は、テンプレート（`claude-worker` / `claude-worker-sonnet`）どおり既定の 120000 です。
+- 起動し直したワーカーのモデルは、前のワーカーのラベル `model` と同じです（下記「ワーカーのモデル」）。
 
 #### 実機で確かめる（dev、未実施）
 
@@ -171,6 +172,16 @@ hc run --bg --outlive-parent --label role=worker --name small-issue --cwd <workt
 - 前後のワーカーが同じ worktree で同時に動かないこと（`hc ls` で前のワーカーが消えてから新しいワーカーが出る）。
 - `claude-token-metrics report` で、起動し直したワーカーの文脈が開始時の水準（約 50k〜60k）から始まっていること。
 
+### ワーカーのモデル
+
+監督役は、ワーカーを起動するたびにモデル（Opus / Sonnet）を選びます（Issue #33）。既知パターンの局所変更を単価の安い Sonnet に回し、1 セッションあたりの使用量を下げるためです。監督役自身は判断の質を優先して Opus のままです。
+
+- 選び方の正本は [supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) の「モデルの選び方」です。`issue-development-workflow` の経路の見立てで、Full → Opus、Compact / Fast → Sonnet、迷ったら Opus。Sonnet で同じ作業が 2 回うまくいかなければ（失敗・ブロック・差し戻し）、Sonnet で続けずユーザーに報告し、Opus で起動し直すことを推奨します。
+- 起動: Opus は従来どおり `claude-worker`、Sonnet は `claude-worker-sonnet` テンプレート（`command: hc-claude worker --model sonnet`）で起動し、どちらもラベル `model=<opus|sonnet>` を付けます。`hc run` は呼び出し元の環境変数を terminal に渡さないので、モデルは環境変数ではなくテンプレート（= `hc-claude` の引数）で渡します。
+- `hc-claude worker --model <名前>`: 役割の直後に置きます。許可は `opus` と `sonnet` だけで（Claude Code の `--model` が受け付ける別名。`claude --help` で確認）、それ以外は警告して opus で起動します（起動は止めない）。`--model` を付けなければ opus で、従来の挙動と同じです。監督役（`hc-claude supervisor`）への `--model` は警告して無視します。
+- 引き継ぎ（`resume-worker`）は、前のワーカーのラベル `model` と同じモデルで起動します（ラベルが無い・不正なら opus）。`--model <opus|sonnet>` で明示もできますが、監督役のプロンプトでは、ラベルの無いワーカーのモデルを補うときだけ使い、引き継ぎでモデルを変えません（途中でのモデル切り替えは #33 の対象外）。許可しない `--model` は、前のワーカーを止めずに拒否します。
+- 比べ方: 監督役は進捗ボードの「進行中」「完了」に `[<モデル> / <経路>]` と差し戻しの回数を書き、ワーカーは PR 本文に `ワーカー: <モデル>（監督役の見立て: <経路>）` を書きます。Issue 1 件あたりのコストは `claude-token-metrics report` の `by_model` で、完了率と差し戻しの回数は PR とボードで、Opus の作業と比べます。単価・使用率の換算は推測で決めず、#20 の calibrate（`by_model`）の実データで確かめます。
+
 ### フォルダ信頼（trust）
 
 trust は git リポジトリのルートに付き、worktree はメイン checkout のルートを使います。リポジトリごとに 1 回 trust すれば、そのリポジトリの worktree では出ません。dev は admin の `~/.claude.json` を複製するので、既存のリポジトリは trust 済みです。新しいリポジトリで出たら、Herdr app かスマホで「Yes, I trust this folder」を選びます（既定は「No, exit」）。`$HOME` で起動したときの trust は保存されません。
@@ -181,7 +192,7 @@ trust は git リポジトリのルートに付き、worktree はメイン check
 
 ```bash
 make link          # hc-claude・hc-supervisor・hc-permission・テンプレート・役割ファイルをリンク
-hc templates       # claude-supervisor / claude-worker が出ることを確認
+hc templates       # claude-supervisor / claude-worker / claude-worker-sonnet が出ることを確認
 hc-supervisor      # 監督役を起動。Herdr app のタブから実行すると、そのスペースに「supervisor」タブが出る
 hc-supervisor status
 hc-supervisor board  # 進捗ボードを表示（どのセッションからでも）
@@ -297,7 +308,7 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
 
 ## 確認状況
 
-- テスト（`make check` で実行）: 事故よけのルールと hook の入出力は `tests/test_hc_permission.py`、起動ラッパーの role 判定・引数・役割ごとの閾値と、`session-settings.json` の hook は `tests/test_hc_claude.sh`、`hc-supervisor`（`resume-worker` の引数検査・止める順序・引き継ぎ回数を含む）は `tests/test_hc_supervisor.sh`（偽の `hc` を使用）。
+- テスト（`make check` で実行）: 事故よけのルールと hook の入出力は `tests/test_hc_permission.py`、起動ラッパーの role 判定・引数・ワーカーのモデル（`--model` の検査とテンプレート）・役割ごとの閾値と、`session-settings.json` の hook は `tests/test_hc_claude.sh`、`hc-supervisor`（`resume-worker` の引数検査・止める順序・引き継ぎ回数・モデルの引き継ぎを含む）は `tests/test_hc_supervisor.sh`（偽の `hc` を使用）。
 - 実機で確認済み（hc 0.1.21、2026-11-14、旧構成で確認したもの）: `hc get --json` の形、Herdr app のラベル `herdr.space` / `herdr.tab` による配置、trust ダイアログ中は `hc run` の最初の依頼文が届かない（`first_message.sent: false`）こと。
 - dev の境界（sbx-test、2026-11-14）: [wsl-dev-distro.md](wsl-dev-distro.md) の「確認済みのこと」。
 - dev での実機確認が必要なもの（#26 の最後の受け入れ条件）:
@@ -309,3 +320,4 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
 - dev での実機確認が必要なもの（#30）: 上の「実機で確かめる」の手順で、ワーカーに guard の警告が入ること、終了後に `sessions.jsonl` に 1 行増え `cwd` がその worktree になること。
 - dev での実機確認が必要なもの（#31）: 「ワーカーの引き継ぎ」の「実機で確かめる」の 3 点。`resume-worker` が使う `hc get --json` のラベル（`role`・`handoffs`）と `status.state`、`hc run --timeout` の振る舞いは偽の `hc` でしか確かめていません。導入後、mlbot の Issue 数件で Issue 1 件あたりの重み付きコストと平均文脈を導入前（#17 のコメントの値）と比べ、引き継ぎ 1 回の追加コストより平均文脈の低下で得る分が大きいかを確かめます。
 - 導入後の計測が必要なもの（#32）: [worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) の「ツール出力を絞る」。導入後のワーカー数件で、`claude-token-metrics session` / `report` の L2（`by_tool` の Bash の `raw_bytes` 中央値、`new_info_rate`）と 1 リクエストあたりの文脈増分を導入前（#32 の本文の値）と比べます。下がらなければ、hook で出力を切り詰める対策を別 Issue にします。
+- dev での実機確認と導入後の計測が必要なもの（#33）: 監督役が `claude-worker-sonnet` で起動したワーカーの transcript の model が Sonnet になること、`claude-worker` では Opus のままであること（hc のテンプレートの `command` に `--model sonnet` を足しても引数として渡ることは、偽の `hc` でしか確かめていません）。導入後、Sonnet で実行した Issue の PR までの完了率・差し戻しの回数と Issue 1 件あたりのコスト（`by_model`）を、Opus の場合と比べます。
