@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""dotfiles の checkout を origin/main へ fast-forward し、リンクと管理設定を反映する。
+
+Claude Code の SessionStart hook から呼ばれる（手でも実行できる）。
+
+- 対象: このスクリプトの実体がある checkout（~/.local/bin のリンク先）。
+  DOTFILES_AUTOSYNC_REPO で変えられる。各ディストリは自分の checkout だけを更新する。
+- 間隔: DOTFILES_AUTOSYNC_INTERVAL 秒（既定 1800）に 1 回だけ実行する。--force で間隔を無視する。
+- ロック: 同時に開いた複数セッションのうち、ロックを取れた 1 本だけが実行する。
+- 状態: DOTFILES_AUTOSYNC_STATE_DIR（既定 ${XDG_STATE_HOME:-~/.local/state}/dotfiles-autosync）
+- 更新: main を checkout し、作業ツリーが clean で、origin/main が HEAD の子孫のときだけ
+  merge --ff-only する。それ以外は何も変えずに理由を出す。
+- 反映: 更新後（または更新が無くても）manage-dotfiles-configs.py plan でずれを調べ、
+  まだ何もない target へのリンク配置（link --missing-only）と管理キーの同期（sync）を行う。
+- 時間制限: 全体で DOTFILES_AUTOSYNC_TIMEOUT 秒（既定 20）。超えたら子プロセスごと止める。
+- 出力: 伝えることがあるときだけ stdout に 1 行。どの失敗でも exit 0。
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BRANCH = "main"
+REMOTE = "origin"
+TRACKING_REF = f"refs/remotes/{REMOTE}/{BRANCH}"
+DEFAULT_INTERVAL = 1800
+DEFAULT_TIMEOUT = 20
+MAX_REASON = 120
+MAX_LINE = 400
+
+
+class TimeLimitExceeded(Exception):
+    pass
+
+
+class CommandFailed(Exception):
+    pass
+
+
+def blocked_reason(branch: str | None, *, dirty: bool, repo: str) -> str | None:
+    """更新してはいけない理由を返す。更新してよければ None。"""
+    if branch is None:
+        return f"{repo} が detached HEAD です"
+    if branch != BRANCH:
+        return f"{repo} は {BRANCH} ではなく {branch} を checkout しています"
+    if dirty:
+        return f"{repo} に未コミットの変更があります"
+    return None
+
+
+def classify(head: str, upstream: str, *, head_in_upstream: bool, upstream_in_head: bool) -> str:
+    """HEAD と origin/main の関係を up_to_date / fast_forward / ahead / diverged で返す。"""
+    if head == upstream:
+        return "up_to_date"
+    if head_in_upstream:
+        return "fast_forward"
+    if upstream_in_head:
+        return "ahead"
+    return "diverged"
+
+
+def is_due(*, now: float, last: float | None, interval: float) -> bool:
+    """前回の実行から interval 秒たったか。時計が戻った場合も実行する。"""
+    return last is None or now < last or now - last >= interval
+
+
+def read_last_attempt(path: Path) -> float | None:
+    try:
+        value = json.loads(path.read_text()).get("last_attempt")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def write_last_attempt(path: Path, now: float) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps({"last_attempt": now}) + "\n")
+    os.replace(temporary, path)
+
+
+def try_lock(path: Path) -> int | None:
+    """排他ロックを待たずに取る。取れたら fd、ほかのプロセスが持っていれば None。"""
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def one_line(text: str, limit: int = MAX_REASON) -> str:
+    line = " ".join(text.split())
+    return line if len(line) <= limit else f"{line[: limit - 1]}…"
+
+
+def summarize(parts: list[str]) -> str | None:
+    if not parts:
+        return None
+    return one_line(f"dotfiles: {'、'.join(parts)}", MAX_LINE)
+
+
+def env_number(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+class Runner:
+    """全体の締め切りまでに子プロセスを実行し、超えたらプロセスグループごと止める。"""
+
+    def __init__(self, deadline: float) -> None:
+        self.deadline = deadline
+        # 呼び出し元の GIT_DIR などに引きずられず、対象の checkout だけを操作する。
+        local = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+        self.env = {key: value for key, value in os.environ.items() if key not in local}
+        self.env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+        self.env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
+
+    def run(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeLimitExceeded
+        process = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=self.env, start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise TimeLimitExceeded from None
+        result = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+        if check and result.returncode != 0:
+            message = (stderr.strip().splitlines() or [f"exit {result.returncode}"])[-1]
+            raise CommandFailed(message)
+        return result
+
+    def git(self, repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return self.run(["git", "-C", str(repo), *args], check=check)
+
+
+def is_ancestor(runner: Runner, repo: Path, ancestor: str, descendant: str) -> bool:
+    result = runner.git(repo, "merge-base", "--is-ancestor", ancestor, descendant, check=False)
+    if result.returncode not in (0, 1):
+        raise CommandFailed(one_line(result.stderr) or "merge-base に失敗しました")
+    return result.returncode == 0
+
+
+def update_checkout(runner: Runner, repo: Path) -> tuple[list[str], bool]:
+    """(伝える内容, リンク・設定を反映してよいか) を返す。"""
+    branch = runner.git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip() or None
+    dirty = bool(runner.git(repo, "status", "--porcelain").stdout.strip())
+    reason = blocked_reason(branch, dirty=dirty, repo=str(repo))
+    if reason:
+        return [f"更新していません（{reason}）"], False
+
+    try:
+        runner.git(repo, "fetch", "--quiet", "--no-tags", REMOTE, f"+refs/heads/{BRANCH}:{TRACKING_REF}")
+    except CommandFailed as error:
+        # origin に届かなくても、手元の main に合わせたリンク・設定の反映は続ける。
+        return [f"origin を確認できません（{one_line(str(error))}）"], True
+
+    head = runner.git(repo, "rev-parse", "HEAD").stdout.strip()
+    upstream = runner.git(repo, "rev-parse", TRACKING_REF).stdout.strip()
+    state = classify(
+        head, upstream,
+        head_in_upstream=is_ancestor(runner, repo, head, upstream),
+        upstream_in_head=is_ancestor(runner, repo, upstream, head),
+    )
+    if state == "diverged":
+        return [f"更新していません（{BRANCH} と {REMOTE}/{BRANCH} が分岐しています。{repo} で merge してください）"], False
+    if state == "ahead":
+        count = runner.git(repo, "rev-list", "--count", f"{upstream}..{head}").stdout.strip()
+        return [f"{REMOTE}/{BRANCH} より {count} commit 先行（未 push）"], True
+    if state == "fast_forward":
+        count = runner.git(repo, "rev-list", "--count", f"{head}..{upstream}").stdout.strip()
+        runner.git(repo, "merge", "--ff-only", "--quiet", upstream)
+        return [f"{count} commit 更新"], True
+    return [], True
+
+
+def apply_managed_state(runner: Runner, repo: Path) -> list[str]:
+    """更新後の checkout の manage-dotfiles-configs.py で、ずれているリンクと管理設定だけを反映する。"""
+    manager = [sys.executable, str(repo / ".bin" / "manage-dotfiles-configs.py")]
+    try:
+        lines = runner.run([*manager, "plan"]).stdout.splitlines()
+    except CommandFailed as error:
+        return [f"リンク・設定を確認できません（{one_line(str(error))}）"]
+    kinds = [line.split("\t", 1)[0] for line in lines if "\t" in line]
+    missing, conflicts, unsynced = (kinds.count(kind) for kind in ("link-missing", "link-conflict", "sync"))
+
+    parts = []
+    if missing:
+        result = runner.run([*manager, "link", "--missing-only"], check=False)
+        parts.append(f"リンク {missing} 件を追加" if result.returncode == 0 else "リンクの配置に失敗（make link で確認）")
+    if conflicts:
+        parts.append(f"リンク {conflicts} 件は既存のファイルがあり未配置（make doctor で確認）")
+    if unsynced:
+        result = runner.run([*manager, "sync"], check=False)
+        parts.append(f"設定 {unsynced} 件を同期" if result.returncode == 0 else "設定の同期に失敗（make diff・make sync で確認）")
+    return parts
+
+
+def autosync(*, repo: Path, state_dir: Path, interval: float, timeout: float, force: bool) -> str | None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock = try_lock(state_dir / "lock")
+    if lock is None:
+        return None
+    try:
+        state = state_dir / "state.json"
+        now = time.time()
+        if not force and not is_due(now=now, last=read_last_attempt(state), interval=interval):
+            return None
+        # 失敗した回も記録し、ネットワーク不通の間にセッションごと fetch を待たないようにする。
+        write_last_attempt(state, now)
+
+        runner = Runner(time.monotonic() + timeout)
+        parts: list[str] = []
+        try:
+            update_parts, may_apply = update_checkout(runner, repo)
+            parts += update_parts
+            if may_apply:
+                parts += apply_managed_state(runner, repo)
+        except TimeLimitExceeded:
+            parts.append(f"{timeout:g} 秒の時間内に終わらなかったため中断しました")
+        except CommandFailed as error:
+            parts.append(f"更新に失敗しました（{one_line(str(error))}）")
+        return summarize(parts)
+    finally:
+        os.close(lock)
+
+
+def default_repo() -> Path:
+    override = os.environ.get("DOTFILES_AUTOSYNC_REPO")
+    return Path(override).expanduser() if override else Path(__file__).resolve().parents[2]
+
+
+def default_state_dir() -> Path:
+    override = os.environ.get("DOTFILES_AUTOSYNC_STATE_DIR")
+    if override:
+        return Path(override).expanduser()
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "dotfiles-autosync"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="dotfiles の checkout・リンク・管理設定を origin/main に合わせる")
+    parser.add_argument("--force", action="store_true", help="間隔を無視して今すぐ確認する")
+    args = parser.parse_args(argv)
+    try:
+        line = autosync(
+            repo=default_repo(),
+            state_dir=default_state_dir(),
+            interval=env_number("DOTFILES_AUTOSYNC_INTERVAL", DEFAULT_INTERVAL),
+            timeout=env_number("DOTFILES_AUTOSYNC_TIMEOUT", DEFAULT_TIMEOUT),
+            force=args.force,
+        )
+    except Exception as error:  # hook がセッションを止めないよう、想定外の失敗も exit 0 にする。
+        line = summarize([f"自動同期に失敗しました（{one_line(str(error)) or type(error).__name__}）"])
+    if line:
+        print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

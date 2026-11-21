@@ -273,7 +273,8 @@ def backup(target: Path) -> None:
     print(f"退避  {target} → {destination}")
 
 
-def link() -> int:
+def link(*, missing_only: bool = False) -> int:
+    """link mode を配置する。missing_only では既存のファイル・別のリンクを退避せずに残す。"""
     for config in configs():
         if config["mode"] != "link":
             continue
@@ -283,6 +284,9 @@ def link() -> int:
             print(f"OK    リンク: {config['target']}")
             continue
         if target.exists() or target.is_symlink():
+            if missing_only:
+                print(f"保持  {target}（既存のファイルがあります。make link で置き換えられます）")
+                continue
             backup(target)
         target.symlink_to(source)
         if config.get("executable"):
@@ -313,6 +317,52 @@ def sync() -> int:
         elif config["mode"] == "merge-json-managed":
             succeeded = merge_json_managed(config) and succeeded
     return int(not succeeded)
+
+
+def toml_features_in_sync(config: dict[str, object]) -> bool:
+    target = target_path(config)
+    try:
+        actual = tomllib.loads(target.read_text()).get("features", {})
+        expected = feature_values(config)
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return False
+    return isinstance(actual, dict) and all(actual.get(name) == value for name, value in expected.items())
+
+
+def json_managed_in_sync(config: dict[str, object]) -> bool:
+    if target_path(config).is_symlink() or not target_path(config).is_file():
+        return False
+    try:
+        _, current, planned = managed_json_plan(config)
+    except (OSError, ValueError):
+        return False
+    return planned == current
+
+
+def plan() -> int:
+    """link と sync が端末に反映していないものを「種類<TAB>target」で 1 行ずつ出す。何も変更しない。
+
+    link-missing は link --missing-only で置ける、link-conflict は既存のファイルなどがあり置けない、
+    sync は sync で同期が必要（同期できない状態も含む）であることを示す。
+    """
+    for config in configs():
+        mode, target = config["mode"], target_path(config)
+        if mode == "link":
+            if target.is_symlink() and target.resolve() == source_path(config).resolve():
+                continue
+            kind = "link-conflict" if target.exists() or target.is_symlink() else "link-missing"
+        elif mode == "merge-toml-features":
+            if toml_features_in_sync(config):
+                continue
+            kind = "sync"
+        elif mode == "merge-json-managed":
+            if json_managed_in_sync(config):
+                continue
+            kind = "sync"
+        else:
+            continue
+        print(f"{kind}\t{target}")
+    return 0
 
 
 def has_installed_link() -> bool:
@@ -380,12 +430,7 @@ def doctor(*, static: bool = False, auto: bool = False) -> int:
                 print(f"NG    設定: {config['target']}")
                 failures += 1
                 continue
-            try:
-                actual = tomllib.loads(target.read_text()).get("features", {})
-                expected = feature_values(config)
-                ok = isinstance(actual, dict) and all(actual.get(name) == value for name, value in expected.items())
-            except (OSError, ValueError, tomllib.TOMLDecodeError):
-                ok = False
+            ok = toml_features_in_sync(config)
             print(f"{'OK' if ok else 'NG'}    Codex feature: {config['target']}")
             failures += not ok
         elif mode == "merge-json-managed":
@@ -443,14 +488,19 @@ def diff() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("link", "install", "sync", "doctor", "diff"))
+    parser.add_argument("command", choices=("link", "install", "sync", "doctor", "diff", "plan"))
     parser.add_argument("--static", action="store_true", help="home link を変更せず source だけを検証する")
     parser.add_argument("--auto", action="store_true", help="installed checkout は full、linked worktree は static で検証する")
+    parser.add_argument("--missing-only", action="store_true", help="link で、まだ何もない target にだけリンクを置く")
     args = parser.parse_args()
     if (args.static or args.auto) and args.command != "doctor":
         parser.error("--static と --auto は doctor だけで使用できます")
+    if args.missing_only and args.command != "link":
+        parser.error("--missing-only は link だけで使用できます")
     if args.command == "doctor":
         return doctor(static=args.static, auto=args.auto)
+    if args.command == "link":
+        return link(missing_only=args.missing_only)
     return globals()[args.command]()
 
 

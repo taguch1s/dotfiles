@@ -277,7 +277,17 @@ hook_commands = [
   "~/.local/bin/awake-hook off",
   "~/.local/bin/claude-context-guard",
   "~/.local/bin/claude-token-metrics record || true",
+  "~/.local/bin/dotfiles-autosync || true",
 ]
+
+# SessionStart hook から呼ばれ、dotfiles-main を origin/main へ fast-forward してから
+# 新しいリンクと上の管理 hook・キーを反映する。説明は docs/dotfiles-autosync.md
+[[config]]
+name = "dotfiles 自動同期（SessionStart hook）"
+source = ".local/bin/dotfiles-autosync"
+target = ".local/bin/dotfiles-autosync"
+mode = "link"
+executable = true
 
 [[config]]
 name = "Claude 文脈予算 hook"
