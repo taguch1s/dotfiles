@@ -73,7 +73,7 @@ supervisor（dev、role=supervisor、親なし）
 | ファイル | 内容 |
 | --- | --- |
 | [hc-claude](../.local/bin/hc-claude) | 監督役・ワーカーの起動ラッパー。`/etc/dotfiles-role` が `dev` のときだけ `claude --model opus --effort <high|medium> --permission-mode bypassPermissions --settings session-settings.json --append-system-prompt-file <role>-prompt.md` を exec し（effort は監督役 high・ワーカー medium）、それ以外（admin）では起動を拒否する。文脈予算の閾値 `CLAUDE_CTX_GUARD_TOKENS` を役割ごとに渡す（下記「文脈予算とトークン記録」） |
-| [hc-supervisor](../.local/bin/hc-supervisor) | 監督役の起動・状態表示・停止（dev でだけ起動） |
+| [hc-supervisor](../.local/bin/hc-supervisor) | 監督役の起動・状態表示・停止と、引き継いだワーカーの起動し直し（`resume-worker`）。dev でだけ起動する |
 | [hc-permission](../.local/bin/hc-permission) | 事故よけの deny リスト（`hook` / `check`） |
 | [templates/claude-supervisor.md](../.config/herdr-core/templates/claude-supervisor.md) / [claude-worker.md](../.config/herdr-core/templates/claude-worker.md) | `hc run` のテンプレート（`command: hc-claude supervisor|worker`） |
 | [claude/session-settings.json](../.config/herdr-core/claude/session-settings.json) | hc 上のセッションの設定（`defaultMode: bypassPermissions`、`sandbox.enabled: false`、`PreToolUse` Bash → `hc-permission hook`、`UserPromptSubmit`・`PostToolUse` → `claude-context-guard`、`SessionEnd` → `claude-token-metrics record`） |
@@ -108,7 +108,7 @@ hc 上の監督役・ワーカーでは、`session-settings.json` の hook で�
 | 役割 | 既定 | 上書きする環境変数 | 警告を受けたら |
 | --- | --- | --- | --- |
 | 監督役 | 150000 | `HC_CLAUDE_SUPERVISOR_CTX_GUARD_TOKENS` | handoff を書いて `hc-supervisor restart`（[supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) の「コンテキストの予算と作り直し」） |
-| ワーカー | 120000 | `HC_CLAUDE_WORKER_CTX_GUARD_TOKENS` | `~/.claude/CLAUDE.md` の「セッションの引き継ぎ」に従い handoff を保存する（区切った後の再開手順は #31） |
+| ワーカー | 120000 | `HC_CLAUDE_WORKER_CTX_GUARD_TOKENS` | handoff を更新して `【引き継ぎ】<path>` を監督役に送り、ターンを終える。監督役が同じ worktree で新しいワーカーを起動して続けさせる（下記「ワーカーの引き継ぎ」） |
 
 - 上書き値は `hc-claude` を起動する環境に置きます。正の整数でなければ警告を出して既定を使います（起動は止めません）。
 - 呼び出し元の `CLAUDE_CTX_GUARD_TOKENS` は使わず、必ず役割の値で上書きします。監督役の環境がワーカーに引き継がれても、ワーカーの閾値は監督役の値になりません。
@@ -134,6 +134,42 @@ claude-token-metrics report --since "$(date +%F)"   # ctx-check のセッショ�
 ```
 
 `make link` で `~/.local/bin/claude-context-guard` と `~/.local/bin/claude-token-metrics` がリンクされている必要があります。
+
+### ワーカーの引き継ぎ（文脈の区切り）
+
+セッションは自分で `/clear` できず、ワーカーは他のエージェントを起動できません。そこで、文脈が閾値を超えたワーカーは handoff を残して止まり、監督役が同じ worktree で新しいワーカーを起動して続きから再開させます（Issue #31）。1 つの Issue を大きな文脈のまま最後まで進めず、毎リクエストの cache 読み込み（≒ リクエスト数 × 平均文脈）を下げるためです。新しいワーカーは開始時の約 51k を cache 作成として払い直します。
+
+```
+ワーカー A ── guard の警告 → 進行中の操作を区切る → handoff を更新
+   │ hc send supervisor "【引き継ぎ】<handoff の絶対 path>"（これだけ送ってターンを終える）
+   ▼
+監督役 ── hc-supervisor resume-worker --from A --cwd <worktree> --handoff <path> "<同じ依頼文>"
+   │ A が role=worker で working でないことを確かめる → A を kill・rm → 消えたことを確かめる
+   │ 同じ worktree で新しいワーカーを起動（依頼文の先頭に【再開】<path>、ラベル handoffs=<回数>）
+   ▼
+ワーカー B ── handoff を読み、branch・HEAD・未 commit の変更と照合 → next safe action から再開
+```
+
+- 手順の正本はプロンプトです。ワーカー側は [worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) の「文脈の区切りと引き継ぎ」、監督役側は [supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) の「ワーカーの引き継ぎ（文脈の区切り）」。
+- handoff は `issue-development-workflow` / `session-handoff` の形式（`workflow-progress/v1`）のまま、worktree の `git rev-parse --git-path codex-handoffs` の下（Git 管理外）に置きます。引き継ぐたびに同じファイルを更新します。
+- 同じ worktree を 2 つのワーカーが同時に編集しないよう、`resume-worker` は前のワーカーを止めて消えたことを確かめてから起動します。前のワーカーがまだ `working`、`role=worker` でない、見つからない（回数が分からない）ときは、何も止めず起動もしません。
+- `resume-worker` は handoff が `--cwd` の `codex-handoffs` の下にある既存ファイルの絶対 path であることを確かめます。中身（branch・HEAD・next safe action）が今の worktree と合うかは、新しいワーカーが確かめ、合わなければ推測で再開せず監督役に相談します。
+- 引き継ぎ回数は新しいワーカーのラベル `handoffs` に残り、監督役が進捗ボードの「進行中」にも書きます。3 回を超える（4 回目の）引き継ぎは起動せず、監督役がユーザーに報告します。上限は `HC_SUPERVISOR_MAX_WORKER_HANDOFFS`（監督役の環境）で変えられます。
+- 起動し直したワーカーの閾値は、テンプレート（`claude-worker`）どおり既定の 120000 です。
+
+#### 実機で確かめる（dev、未実施）
+
+小さな Issue で、閾値を下げた最初のワーカーを起動し、監督役に引き継がせます。
+
+```bash
+# 監督役のタブで: 依頼文には、リポジトリ・worktree・Issue・skill・完了条件（PR 作成まで）を書く
+hc run --bg --outlive-parent --label role=worker --name small-issue --cwd <worktree> \
+  -- env HC_CLAUDE_WORKER_CTX_GUARD_TOKENS=70000 hc-claude worker '<依頼文>'
+```
+
+- ワーカーが `【引き継ぎ】<path>` だけを送ってターンを終え、監督役が `resume-worker` で起動し直したワーカーが handoff の next safe action から再開して PR 作成まで進むこと。
+- 前後のワーカーが同じ worktree で同時に動かないこと（`hc ls` で前のワーカーが消えてから新しいワーカーが出る）。
+- `claude-token-metrics report` で、起動し直したワーカーの文脈が開始時の水準（約 50k〜60k）から始まっていること。
 
 ### フォルダ信頼（trust）
 
@@ -176,6 +212,7 @@ Herdr app の端末での貼り付けは **Ctrl+Shift+V**（または右クリ�
 ## 使い方
 
 - ワーカーを頼む: Herdr app かスマホで `supervisor` を開き、「~/mlbot-dev の Issue #12 と #13 を /issue-development-workflow で PR 作成まで進めて」のように頼みます。監督役はワーカーを `--outlive-parent` で起動し、結果を実測で確かめて報告します。
+- ワーカーの文脈が閾値を超えると、`【引き継ぎ】<handoff>` が届き、監督役が同じ worktree で新しいワーカーに続きをさせます（上の「ワーカーの引き継ぎ」）。ユーザーの操作は要りません。引き継ぎが 3 回を超えたときだけ、監督役から報告が来ます。
 - ワーカーが判断に迷うと `hc send supervisor` で相談が届き、監督役が仕様・設計を含めて 1 つに決めて返し、`~/.local/share/hc-supervisor/decisions.md` に記録します。後から見るときは監督役に「判断記録を見せて」と頼むか、ファイルを直接開きます。取り消しにくい外部操作と hook に止められた操作が必要なものだけ、監督役のタブに「【確認】…」として質問が出ます。
 - 手動セッション: Herdr app で新しいタブを開いて使えます。権限確認は `~/.claude/settings.json` のとおりで、監督役は関与しません（相談したいときは `hc send supervisor`）。
 - 監督役の作り直し（`hc-supervisor restart`）: プロンプトや設定を変えたときは、監督役に「再起動して」と頼むか、端末で `hc-supervisor restart` を実行します。ワーカーとのやり取りを止めずに入れ替わります。
@@ -260,7 +297,7 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
 
 ## 確認状況
 
-- テスト（`make check` で実行）: 事故よけのルールと hook の入出力は `tests/test_hc_permission.py`、起動ラッパーの role 判定・引数・役割ごとの閾値と、`session-settings.json` の hook は `tests/test_hc_claude.sh`、`hc-supervisor` は `tests/test_hc_supervisor.sh`（偽の `hc` を使用）。
+- テスト（`make check` で実行）: 事故よけのルールと hook の入出力は `tests/test_hc_permission.py`、起動ラッパーの role 判定・引数・役割ごとの閾値と、`session-settings.json` の hook は `tests/test_hc_claude.sh`、`hc-supervisor`（`resume-worker` の引数検査・止める順序・引き継ぎ回数を含む）は `tests/test_hc_supervisor.sh`（偽の `hc` を使用）。
 - 実機で確認済み（hc 0.1.21、2026-11-14、旧構成で確認したもの）: `hc get --json` の形、Herdr app のラベル `herdr.space` / `herdr.tab` による配置、trust ダイアログ中は `hc run` の最初の依頼文が届かない（`first_message.sent: false`）こと。
 - dev の境界（sbx-test、2026-11-14）: [wsl-dev-distro.md](wsl-dev-distro.md) の「確認済みのこと」。
 - dev での実機確認が必要なもの（#26 の最後の受け入れ条件）:
@@ -270,3 +307,4 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
   - 仕様・設計の判断依頼に監督役が自分で回答し、`~/.local/share/hc-supervisor/decisions.md` に記録する
   - スマホ（Tailscale SSH）から dev の hc に届く
 - dev での実機確認が必要なもの（#30）: 上の「実機で確かめる」の手順で、ワーカーに guard の警告が入ること、終了後に `sessions.jsonl` に 1 行増え `cwd` がその worktree になること。
+- dev での実機確認が必要なもの（#31）: 「ワーカーの引き継ぎ」の「実機で確かめる」の 3 点。`resume-worker` が使う `hc get --json` のラベル（`role`・`handoffs`）と `status.state`、`hc run --timeout` の振る舞いは偽の `hc` でしか確かめていません。導入後、mlbot の Issue 数件で Issue 1 件あたりの重み付きコストと平均文脈を導入前（#17 のコメントの値）と比べ、引き継ぎ 1 回の追加コストより平均文脈の低下で得る分が大きいかを確かめます。
