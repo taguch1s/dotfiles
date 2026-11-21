@@ -38,6 +38,8 @@ case "$1" in
     shift
     while [[ "$1" == --* ]]; do
       [[ "$1" == --name ]] && echo live >"$MOCK_HC_DIR/live/$2"
+      # --label handoffs=N は、起動した terminal のラベルとして残す（resume-worker の引き継ぎ回数）。
+      [[ "$1" == --label && "$2" == handoffs=* ]] && printf '%s\n' "${2#handoffs=}" >"$MOCK_HC_DIR/run-handoffs"
       case "$1" in --) break ;; --bg|--no-parent|--keep|--no-notify|--outlive-parent|--rm) shift ;; *) shift 2 ;; esac
     done
     ;;
@@ -234,7 +236,7 @@ worker_handoff="$handoff_dir/issue-31.md"
 echo '# Handoff' >"$worker_handoff"
 resume() { "$launcher" resume-worker "$@" >"$fixture/out" 2>"$fixture/err"; }
 worker_ready() {
-  rm -f "$fixture/live/"* "$fixture/labels/"*
+  rm -f "$fixture/live/"* "$fixture/labels/"* "$fixture/run-handoffs"
   echo live >"$fixture/live/w1"
   printf '%s\n' "${1:-{\"role\":\"worker\"\}}" >"$fixture/labels/w1"
   reset
@@ -243,20 +245,19 @@ worker_ready() {
 worker_ready
 if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '#31 を PR 作成まで進める'; then
   run_line="$(runs)"
-  label_line="$(grep $'^label' "$fixture/hc.log" | tr '\037' ' ')"
-  [[ "$(cmds)" == 'kill wait rm run label ' ]] \
+  [[ "$(cmds)" == 'kill wait rm run ' ]] \
     && ok 'resume-worker: 前のワーカーを止めて片付けてから、新しいワーカーを起動する' || ng "resume-worker の順序が違う: $(cmds)"
-  [[ "$run_line" == "run --bg --timeout 60 --outlive-parent --label role=worker --name w1 --cwd $repo claude-worker 【再開】$worker_handoff"* ]] \
+  [[ "$run_line" == "run --bg --timeout 60 --outlive-parent --label role=worker --label handoffs=1 --name w1 --cwd $repo claude-worker 【再開】$worker_handoff"* ]] \
     && ok 'resume-worker: 同じ worktree・同じ名前で、依頼文の先頭に【再開】<handoff> を付けて起動する' || ng "resume-worker の hc run が違う: $run_line"
   [[ "$run_line" == *'#31 を PR 作成まで進める' ]] && ok 'resume-worker: 元の依頼文を添える' || ng "元の依頼文がない: $run_line"
-  [[ "$label_line" == 'label w1 handoffs=1' ]] && ok 'resume-worker: 引き継ぎ回数（1 回目）をラベルに残す' || ng "引き継ぎ回数のラベルが違う: $label_line"
+  [[ "$(<"$fixture/run-handoffs")" == 1 ]] && ok 'resume-worker: 引き継ぎ回数（1 回目）を起動と同時にラベルに残す' || ng "引き継ぎ回数のラベルが違う: $run_line"
 else
   ng "resume-worker が失敗した: $(<"$fixture/err")"
 fi
 
 worker_ready '{"role":"worker","handoffs":"2"}'
 resume --from w1 --cwd "$repo" --handoff "$worker_handoff" --name w1b '依頼' || true
-[[ "$(grep $'^label' "$fixture/hc.log" | tr '\037' ' ')" == 'label w1b handoffs=3' && "$(runs)" == *' --name w1b '* ]] \
+[[ "$(<"$fixture/run-handoffs")" == 3 && "$(runs)" == *' --name w1b '* ]] \
   && ok 'resume-worker: 前の回数に 1 を足し、--name の名前で起動する' || ng "回数の加算・--name が違う: $(cmds) / $(runs) / $(<"$fixture/err")"
 
 worker_ready '{"role":"worker","handoffs":"3"}'
@@ -265,7 +266,13 @@ if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼'; then ng 
   && ok 'resume-worker: 引き継ぎが 3 回を超えるなら、前のワーカーを止めず起動もせず、ユーザーへの報告を促す' || ng "上限の扱いが違う: $(cmds) / $(<"$fixture/err")"
 worker_ready '{"role":"worker","handoffs":"3"}'
 HC_SUPERVISOR_MAX_WORKER_HANDOFFS=4 resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼' || true
-[[ "$(cmds)" == 'kill wait rm run label ' ]] && ok 'resume-worker: 上限は HC_SUPERVISOR_MAX_WORKER_HANDOFFS で変えられる' || ng "上限の上書きが違う: $(cmds)"
+[[ "$(cmds)" == 'kill wait rm run ' ]] && ok 'resume-worker: 上限は HC_SUPERVISOR_MAX_WORKER_HANDOFFS で変えられる' || ng "上限の上書きが違う: $(cmds)"
+
+worker_ready
+echo live >"$fixture/live/other"
+if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" --name other '依頼'; then ng '既にある terminal の名前で起動した'; fi
+[[ -z "$(cmds)" ]] && grep -q '既にあります' "$fixture/err" \
+  && ok 'resume-worker: --name が既にある別の terminal と同じなら、前のワーカーを止めず起動もしない' || ng "名前の衝突の扱いが違う: $(cmds) / $(<"$fixture/err")"
 
 worker_ready
 if MOCK_AGENT_STATE=working resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼'; then ng '動いているワーカーの worktree で起動した'; fi

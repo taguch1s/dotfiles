@@ -273,6 +273,9 @@ resume_worker() {
     || die "同じ作業で引き継ぎが $max 回を超えます（今回 $count 回目）。新しいワーカーを起動せず、前のワーカー $from も止めていません。ユーザーに報告してください。"
   [[ -n "$new_name" ]] || new_name="$(json_value field "$json" name)"
   [[ -n "$new_name" ]] || die "前のワーカーの名前が分かりません。--name で新しいワーカーの名前を指定してください。"
+  # 別の名前で起動するとき、その名前の terminal が既にあれば、起動の成否を見分けられないので止める。
+  [[ "$new_name" == "$from" ]] || ! exists "$new_name" \
+    || die "$new_name という terminal が既にあります。別の --name を指定してください。前のワーカーは止めていません。"
 
   hc kill "$from" >/dev/null
   hc wait "$from" --timeout 30 >/dev/null 2>&1 || true
@@ -282,11 +285,10 @@ resume_worker() {
 
   # 同じリポジトリの worktree なので trust のダイアログは出ない想定。出て最初の依頼文が届かないときに
   # 待ち続けないよう、--timeout で切り上げる（terminal は動いたまま。結果の first_message.sent で分かる）。
-  hc run --bg --timeout 60 --outlive-parent --label role=worker --name "$new_name" --cwd "$worktree" \
+  # 引き継ぎ回数のラベルは起動と同時に付ける（後から付けると、付け損ねたときに回数が 0 に戻る）。
+  hc run --bg --timeout 60 --outlive-parent --label role=worker --label "handoffs=$count" --name "$new_name" --cwd "$worktree" \
     claude-worker "$(resume_request "$real_handoff" "$count" "$request")" || true
-  exists "$new_name" || die "新しいワーカーを起動できませんでした（hc ls で確認してください）。handoff は $real_handoff にあります。"
-  hc label "$new_name" "handoffs=$count" >/dev/null \
-    || die "新しいワーカー $new_name は起動しましたが、引き継ぎ回数（$count）をラベルに残せませんでした。進捗ボードに回数を書いてください。"
+  exists "$new_name" || die "新しいワーカーを起動できませんでした（hc ls で確認してください）。handoff は $real_handoff にあります（引き継ぎ $count 回目）。"
   printf '新しいワーカーを起動しました: %s（引き継ぎ %s 回目、handoff: %s）\n' "$new_name" "$count" "$real_handoff"
 }
 
