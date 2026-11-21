@@ -78,7 +78,7 @@ class DisplayTest(StatuslineCase):
         self.write_transcript([assistant("r1", (5, 1000, 100_000)), assistant("r2", (3, 2000, 180_000))])
         result = self.run_statusline(self.payload(rate_limits=rate_limits(54, 8)))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "ctx 182k | 5h 54% | 7d 8%\n")
+        self.assertEqual(result.stdout, "Opus | tmp | ctx 182k | 5h 54% | 7d 8%\n")
 
     def test_context_uses_last_real_request(self):
         # 合成メッセージ、sidechain、壊れた行、usage のない行は飛ばし、最後の本体リクエストを使う。
@@ -92,12 +92,27 @@ class DisplayTest(StatuslineCase):
             "{broken",
         ])
         result = self.run_statusline(self.payload())
-        self.assertEqual(result.stdout, "ctx 1.2M | 5h - | 7d -\n")
+        self.assertEqual(result.stdout, "Opus | tmp | ctx 1.2M | 5h - | 7d -\n")
 
     def test_small_context_and_fractional_percent(self):
         self.write_transcript([assistant("r1", (1, 0, 998))])
         result = self.run_statusline(self.payload(rate_limits=rate_limits(12.6, 0.4)))
-        self.assertEqual(result.stdout, "ctx 999 | 5h 13% | 7d 0%\n")
+        self.assertEqual(result.stdout, "Opus | tmp | ctx 999 | 5h 13% | 7d 0%\n")
+
+    def test_model_and_directory_come_from_stdin(self):
+        # ~/.claude/statusline.py から取り込んだ表示。workspace.current_dir を cwd より優先する。
+        self.write_transcript([assistant("r1", (1, 0, 999))])
+        cases = {
+            "workspace": (self.payload(workspace={"current_dir": "/home/u/dotfiles/"}), "Opus | dotfiles | ctx 1k"),
+            "no model": (json.dumps({"transcript_path": str(self.transcript), "cwd": "/home/u/repo"}), "repo | ctx 1k"),
+            "broken model": (self.payload(model="opus", cwd=None), "ctx 1k"),
+            "root dir": (self.payload(model={}, cwd="/"), "/ | ctx 1k"),
+        }
+        for name, (stdin, prefix) in cases.items():
+            with self.subTest(name=name):
+                result = self.run_statusline(stdin)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"{prefix} | 5h - | 7d -\n")
 
     def test_missing_inputs_still_print_one_line(self):
         cases = {
@@ -114,7 +129,7 @@ class DisplayTest(StatuslineCase):
                 result = self.run_statusline(stdin)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len(result.stdout.splitlines()), 1)
-                self.assertTrue(result.stdout.startswith("ctx "))
+                self.assertIn("ctx ", result.stdout)
         self.assertFalse(self.records_file().exists())
 
 
