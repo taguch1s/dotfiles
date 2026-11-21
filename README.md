@@ -75,6 +75,7 @@ make remote-access # スマホから遠隔操作中のスリープ抑止サー�
 # Herdr app / スマホの Claude Code を監督役が見張る構成（hc-supervisor）は docs/herdr-core-orchestration.md
 # セッションごとのトークン効率指標（claude-token-metrics と SessionEnd hook）、statusline と使用率からの重み推定は docs/claude-token-metrics.md
 make sync       # ~/.claude/settings.json の dotfiles 管理の hook・statusLine と Codex の feature だけを同期
+# Claude Code のセッション開始時に dotfiles-main の fast-forward・新しいリンク・make sync を自動で行う（docs/dotfiles-autosync.md）
 make doctor     # コマンド、リンク、ステータススクリプトを検証
 make diff       # コピー・同期管理の設定とローカル設定の差分を表示
 make check      # PR・コミット前の検査（bootstrap 後は commit 時にも自動実行）
@@ -101,7 +102,8 @@ GHOSTTY_INSTALL=community-deb make bootstrap
 アプリが端末固有の状態を書き足す設定は `mode = "copy-if-missing"` または管理対象キーだけを
 同期する `mode = "merge-toml-features"`（Codex の `[features]`）/ `mode = "merge-json-managed"`
 （`~/.claude/settings.json` の `hook_commands` に宣言した hook と `keys`）とし、`make diff` で確認して
-`make sync` で反映します。`merge-json-managed` は管理外の hook・キーを残し、変更前のファイルを
+`make sync` で反映します（main への merge 後は、次の Claude Code セッションの開始時に `dotfiles-autosync` が
+checkout の fast-forward・新しいリンクの配置・`make sync` を自動で行います。docs/dotfiles-autosync.md）。`merge-json-managed` は管理外の hook・キーを残し、変更前のファイルを
 `<file>.dotfiles-backup-<時刻>` に退避し、JSON を解析できない場合は書き込みません。
 認証情報・トークンは `mode = "ignore"`、sudo や Windows を必要とする設定は `mode = "manual"` として
 明示的に分離します。新しい設定は、秘密情報を除外したうえで `dotfiles.toml` に追加してから `make link` と
