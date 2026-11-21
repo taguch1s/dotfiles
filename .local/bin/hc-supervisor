@@ -3,7 +3,9 @@
 # Herdr app・スマホ・端末のどこからでも同じ 1 行で使う。全体像は docs/herdr-core-orchestration.md
 set -euo pipefail
 
-name=supervisor
+# HC_SUPERVISOR_NAME は検証用（本物の監督役に触れずに別の名前で試す）。普段は supervisor。
+name="${HC_SUPERVISOR_NAME:-supervisor}"
+start_request='監督を開始してください。'
 role_file="${HC_CLAUDE_ROLE_FILE:-/etc/dotfiles-role}"
 
 usage() {
@@ -16,7 +18,10 @@ start    監督役（名前 supervisor、ラベル role=supervisor）を起動�
          --cwd の既定は ~/.local/share/hc-supervisor（$HOME はフォルダ信頼が保存されず、
          起動のたびに trust ダイアログが出るため）。
 restart  監督役を作り直す（プロンプトや設定の変更を反映する）。動いている監督役に引き継ぎ
-         （~/.local/share/hc-supervisor/handoff.md）を書かせてから止め、同じ名前・同じタブで起動し直す。
+         （~/.local/share/hc-supervisor/handoff.md）を書かせてから、同じ terminal（同じ tN）の中で
+         Claude Code だけを起動し直す。監督役が起動したワーカーは、そのまま新しい監督役の子になる。
+         入れ替えられないとき（この仕組みより前に起動した監督役など）は、terminal を消して同じ名前・
+         同じタブで作り直す（その場合、それまでのワーカーとの親子関係は切れる）。
          新しい監督役は引き継ぎを読んで続ける。ワーカーは止まらない（--outlive-parent）。
          引き継ぎが書かれなければ、何も止めずに終わる。監督役が自分で実行するときは、
          先に引き継ぎを書いておく（別の terminal に切り離して作り直す）。
@@ -78,8 +83,15 @@ launch() {
   # 初回は trust ダイアログで最初の依頼文が届かず、hc run が届くまで待ち続ける（実機 2026-11-14）。
   # --timeout で待ちを切り上げる（terminal は動いたまま）。役割はシステムプロンプトで渡すので、
   # 依頼文が届かなくても監督役は待機状態になる。
-  hc run --bg --timeout 20 --no-parent --keep --name "$name" --label role=supervisor --cwd "$cwd" \
-    claude-supervisor '監督を開始してください。' || true
+  if [[ -n "${HC_CLAUDE_BIN:-}" ]]; then
+    # 検証用: hc run は呼び出し元の環境変数を terminal に渡さないので、偽の claude を env で渡す。
+    # hc-claude はこの hc-supervisor の隣のもの（worktree で試すときに、本番のリンク先を使わない）。
+    hc run --bg --timeout 20 --no-parent --keep --name "$name" --label role=supervisor --cwd "$cwd" \
+      -- env "${passthrough_env[@]}" "$(dirname "$self_path")/hc-claude" supervisor "$start_request" >/dev/null || true
+  else
+    hc run --bg --timeout 20 --no-parent --keep --name "$name" --label role=supervisor --cwd "$cwd" \
+      claude-supervisor "$start_request" || true
+  fi
   exists "$name" || die "監督役を起動できませんでした（hc ls で確認してください）"
   printf '起動しました: %s\n' "$name"
   [[ -n "$space" ]] || return 0
@@ -89,6 +101,40 @@ launch() {
 }
 
 restart_request='【再起動の準備】hc-supervisor restart からの依頼です。監督役を作り直すので、システムプロンプトの「作り直し」の手順 1 のとおり、進行中のワーカーと未回答の質問を ~/.local/share/hc-supervisor/handoff.md に書いてください。書き終えたら、hc-supervisor restart は実行せずにターンを終えてください。'
+
+# 監督役の terminal <tN> の中で、Claude Code だけを止めて起動し直す（terminal・tN・ラベルはそのまま）。
+# hc-claude が <tN>.pid に書いた自分の pid の子（claude）を止める。hc-claude は <tN>.restart の依頼文で
+# claude を起動し直す。入れ替えの仕組みがない（古い hc-claude で起動した、シェルになっている）ときは、
+# 何もせずに 1 を返す。
+swap_in_place() {
+  local address="$1" pid_file restart_file shell_pid old_pid new_pid i
+  pid_file="$claude_state_dir/$address.pid"
+  restart_file="$claude_state_dir/$address.restart"
+  shell_pid="$(cat "$pid_file" 2>/dev/null || true)"
+  [[ "$shell_pid" =~ ^[0-9]+$ ]] || return 1
+  tr '\0' ' ' <"/proc/$shell_pid/cmdline" 2>/dev/null | grep -q 'hc-claude supervisor' || return 1
+  old_pid="$(pgrep -P "$shell_pid" | head -n 1 || true)"
+  [[ -n "$old_pid" ]] || return 1
+
+  printf '%s' "$start_request" >"$restart_file"
+  kill -TERM "$old_pid" 2>/dev/null || true
+  for ((i = 0; i < 30; i++)); do
+    [[ -d "/proc/$old_pid" ]] || break
+    sleep 0.5
+  done
+  [[ ! -d "/proc/$old_pid" ]] || kill -KILL "$old_pid" 2>/dev/null || true
+  for ((i = 0; i < 30; i++)); do
+    new_pid="$(pgrep -P "$shell_pid" | head -n 1 || true)"
+    [[ -z "$new_pid" || "$new_pid" == "$old_pid" ]] || break
+    new_pid=""
+    sleep 0.5
+  done
+  if [[ -z "$new_pid" ]]; then
+    rm -f "$restart_file"
+    die "古い Claude Code は止めましたが、新しい Claude Code が起動しませんでした。hc read $name で確かめ、必要なら hc-supervisor stop → hc-supervisor で起動し直してください。引き継ぎは $handoff にあります。"
+  fi
+  printf '同じ terminal（%s）のまま、監督役の Claude Code を起動し直しました。ワーカーとの親子関係はそのままです。\n' "$address"
+}
 
 restart() {
   if ! exists "$name"; then
@@ -106,8 +152,8 @@ restart() {
   if [[ -n "${HC_TERMINAL_ID:-}" && ( "$HC_TERMINAL_ID" == "$address" || "$HC_TERMINAL_ID" == "$name" ) ]]; then
     [[ -f "$handoff" ]] || die "先に引き継ぎを $handoff に書いてください"
     mkdir -p "$state_dir"
-    hc run --bg --no-parent --rm --no-notify --name supervisor-restart -- \
-      bash -c '"$0" restart --handoff-ready --cwd "$1" >>"$2" 2>&1' "$self_path" "$cwd" "$restart_log" >/dev/null
+    hc run --bg --no-parent --rm --no-notify --name "$name-restart" -- \
+      env "${passthrough_env[@]}" bash -c '"$0" restart --handoff-ready --cwd "$1" >>"$2" 2>&1' "$self_path" "$cwd" "$restart_log" >/dev/null
     printf '別の terminal で作り直します。この監督役はまもなく止まります。結果: %s\n' "$restart_log"
     return
   fi
@@ -133,6 +179,12 @@ restart() {
       || die "引き継ぎ（$handoff）が書かれませんでした。監督役は止めていません。hc read $name で画面を確かめてください。"
   fi
 
+  if swap_in_place "$address"; then
+    return
+  fi
+
+  printf '同じ terminal で Claude Code を入れ替えられないので、terminal を作り直します（この仕組みより前に起動した監督役など）。\n'
+  printf '注意: 作り直すと、これまでに監督役が起動したワーカーは新しい監督役の子になりません（hc の parent は %s のまま）。\n' "$address"
   hc kill "$name" >/dev/null
   hc wait "$name" --timeout 30 >/dev/null 2>&1 || true
   hc rm "$name" >/dev/null 2>&1 || true
@@ -151,6 +203,13 @@ default_cwd="$state_dir"
 handoff="$state_dir/handoff.md"
 board="$state_dir/board.md"
 restart_log="$state_dir/restart.log"
+# hc-claude が監督役の claude の pid と入れ替えの印を置く場所（hc-claude と同じ既定値）。
+claude_state_dir="${HC_CLAUDE_STATE_DIR:-$HOME/.local/state/hc-claude}"
+# 別の terminal（hc run）へ引き継ぐ環境変数。hc run は呼び出し元の環境を渡さないので、検証用の差し替えを明示して渡す。
+passthrough_env=()
+for var in HC_SUPERVISOR_NAME HC_CLAUDE_BIN HC_CLAUDE_STATE_DIR XDG_DATA_HOME; do
+  [[ -z "${!var:-}" ]] || passthrough_env+=("$var=${!var}")
+done
 self_path="$(readlink -f "${BASH_SOURCE[0]}")"
 cwd="$default_cwd"
 handoff_ready=0
