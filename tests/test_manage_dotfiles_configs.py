@@ -350,6 +350,31 @@ class ClaudeSettingsSyncTest(unittest.TestCase):
                 self.assertEqual(self.target.read_text(), broken)
                 self.assertEqual(self.backups(), [])
 
+    def test_unusual_unmanaged_handlers_are_kept(self):
+        machine = machine_settings()
+        odd = {"type": "command", "command": ["not", "a", "string"]}
+        machine["hooks"]["Stop"][0]["hooks"].append(odd)
+        machine["hooks"]["Stop"][0]["hooks"].append("not a handler")
+        self.write_target(machine)
+
+        ok, output = self.sync()
+
+        self.assertTrue(ok, output)
+        self.assertEqual(self.read_target()["hooks"]["Stop"], [{"hooks": [handler(AWAKE_OFF), odd, "not a handler"]}])
+
+    def test_symlinked_target_fails_without_replacing_the_link(self):
+        real = self.root / "real.json"
+        real.write_text(json.dumps(machine_settings()))
+        self.target.symlink_to(real)
+        original = real.read_text()
+
+        ok, output = self.sync()
+
+        self.assertFalse(ok)
+        self.assertIn("シンボリックリンク", output)
+        self.assertTrue(self.target.is_symlink())
+        self.assertEqual(real.read_text(), original)
+
     def test_undeclared_source_hook_fails_without_writing(self):
         source = repo_settings()
         source["hooks"]["Stop"][0]["hooks"].append(handler("~/.local/bin/undeclared"))

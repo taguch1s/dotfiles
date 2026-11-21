@@ -133,8 +133,9 @@ def hook_groups(settings: object, label: object) -> dict[str, list[dict]]:
     return hooks
 
 
-def handler_command(handler: object) -> object:
-    return handler.get("command") if isinstance(handler, dict) else None
+def handler_command(handler: object) -> str | None:
+    command = handler.get("command") if isinstance(handler, dict) else None
+    return command if isinstance(command, str) else None
 
 
 def managed_json_source(config: dict[str, object], source: object) -> dict[HookKey, dict]:
@@ -223,6 +224,10 @@ def managed_json_plan(config: dict[str, object]) -> tuple[str, object, dict]:
 
 def merge_json_managed(config: dict[str, object]) -> bool:
     source, target = source_path(config), target_path(config)
+    if target.is_symlink():
+        # rename するとリンク自体が通常ファイルに置き換わり、リンク先は古いまま残るため扱わない。
+        print(f"NG    シンボリックリンクは同期できません: {target}", file=sys.stderr)
+        return False
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
