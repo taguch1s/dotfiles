@@ -72,11 +72,11 @@ supervisor（dev、role=supervisor、親なし）
 
 | ファイル | 内容 |
 | --- | --- |
-| [hc-claude](../.local/bin/hc-claude) | 監督役・ワーカーの起動ラッパー。`/etc/dotfiles-role` が `dev` のときだけ `claude --model opus --effort <high|medium> --permission-mode bypassPermissions --settings session-settings.json --append-system-prompt-file <role>-prompt.md` を exec し（effort は監督役 high・ワーカー medium）、それ以外（admin）では起動を拒否する |
+| [hc-claude](../.local/bin/hc-claude) | 監督役・ワーカーの起動ラッパー。`/etc/dotfiles-role` が `dev` のときだけ `claude --model opus --effort <high|medium> --permission-mode bypassPermissions --settings session-settings.json --append-system-prompt-file <role>-prompt.md` を exec し（effort は監督役 high・ワーカー medium）、それ以外（admin）では起動を拒否する。文脈予算の閾値 `CLAUDE_CTX_GUARD_TOKENS` を役割ごとに渡す（下記「文脈予算とトークン記録」） |
 | [hc-supervisor](../.local/bin/hc-supervisor) | 監督役の起動・状態表示・停止（dev でだけ起動） |
 | [hc-permission](../.local/bin/hc-permission) | 事故よけの deny リスト（`hook` / `check`） |
 | [templates/claude-supervisor.md](../.config/herdr-core/templates/claude-supervisor.md) / [claude-worker.md](../.config/herdr-core/templates/claude-worker.md) | `hc run` のテンプレート（`command: hc-claude supervisor|worker`） |
-| [claude/session-settings.json](../.config/herdr-core/claude/session-settings.json) | hc 上のセッションの設定（`defaultMode: bypassPermissions`、`sandbox.enabled: false`、`PreToolUse` Bash → `hc-permission hook`） |
+| [claude/session-settings.json](../.config/herdr-core/claude/session-settings.json) | hc 上のセッションの設定（`defaultMode: bypassPermissions`、`sandbox.enabled: false`、`PreToolUse` Bash → `hc-permission hook`、`UserPromptSubmit`・`PostToolUse` → `claude-context-guard`、`SessionEnd` → `claude-token-metrics record`） |
 | [claude/supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) / [worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) | 役割のシステムプロンプト |
 | [herdr-app/mods/supervisor-board](../.config/herdr-app/mods/supervisor-board/main.js) / [layouts/board.json](../.config/herdr-app/layouts/board.json) | Herdr app の監督役ボード。`board` レイアウト（main の複製）で Changes パネルの中身をこの mod に替える |
 
@@ -93,6 +93,47 @@ supervisor（dev、role=supervisor、親なし）
 - 止めないもの: main への直接 push（dotfiles は main へ push する規約）、`gh pr merge`（ruleset で守る）、秘密情報のパターン（境界の外の話）、`hc keys` / `hc send --force`（同じ境界の中の干渉は許容）。
 
 拒否されたセッションにはエラーが返るだけで、止まりません。ワーカーは別の方法を取るか、監督役に相談します。
+
+### 文脈予算とトークン記録
+
+hc 上の監督役・ワーカーでは、`session-settings.json` の hook で次の 2 つが動きます（Issue #30）。`~/.claude/settings.json` に同じ hook が入っているかどうかに関係なく動きます。
+
+| 何を | hook | 結果 |
+| --- | --- | --- |
+| 文脈予算の警告 | `UserPromptSubmit`・`PostToolUse` → [claude-context-guard](../.local/bin/claude-context-guard) | 直近リクエストの文脈（input + cache 作成 + cache 読み込み）が閾値を超えると、handoff を促す警告が `additionalContext` としてセッションに入る。以後は前回の警告から `CLAUDE_CTX_GUARD_INTERVAL`（既定 50000）増えるたびに再警告する |
+| トークン記録 | `SessionEnd` → [claude-token-metrics](../.local/bin/claude-token-metrics) `record` | セッションの終了時に `~/.local/share/claude-token-metrics/sessions.jsonl` へ 1 行追記する（`cwd` はそのセッションの作業ディレクトリ）。`claude-token-metrics report` で一覧できる。詳しくは [claude-token-metrics.md](claude-token-metrics.md) |
+
+閾値は `hc-claude` が役割ごとに `CLAUDE_CTX_GUARD_TOKENS` として渡します。
+
+| 役割 | 既定 | 上書きする環境変数 | 警告を受けたら |
+| --- | --- | --- | --- |
+| 監督役 | 150000 | `HC_CLAUDE_SUPERVISOR_CTX_GUARD_TOKENS` | handoff を書いて `hc-supervisor restart`（[supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) の「コンテキストの予算と作り直し」） |
+| ワーカー | 120000 | `HC_CLAUDE_WORKER_CTX_GUARD_TOKENS` | `~/.claude/CLAUDE.md` の「セッションの引き継ぎ」に従い handoff を保存する（区切った後の再開手順は #31） |
+
+- 上書き値は `hc-claude` を起動する環境に置きます。正の整数でなければ警告を出して既定を使います（起動は止めません）。
+- 呼び出し元の `CLAUDE_CTX_GUARD_TOKENS` は使わず、必ず役割の値で上書きします。監督役の環境がワーカーに引き継がれても、ワーカーの閾値は監督役の値になりません。
+- ワーカーを 120k にしているのは、実測（2026-11-22）でワーカーの文脈が開始時 51k から約 15 リクエストで 120k に達し、150k を超えた後も数十リクエスト続いていたためです。
+- hook は失敗してもセッションを止めません（guard は常に exit 0、record は `|| true`）。
+
+#### ユーザー設定と同じ hook を置いている理由
+
+リポジトリ版 `.claude/settings.json`（`~/.claude/settings.json` の元）にも同じ hook があります。hc のセッションでは `~/.claude/settings.json` と `--settings` の両方が読まれますが、Claude Code は同じ hook（同じ command 文字列）を複数の設定ファイルに書いても 1 回だけ実行します（公式ドキュメント hooks の "If you define the same handler in more than one settings file, it runs once."。project 設定と `--settings` の組み合わせでは 1 回だけ動くことを実機で確認済み）。そのため command 文字列をユーザー設定と 1 文字も違わないように揃えています（`~/.local/bin/x` と `"$HOME/.local/bin/x"` は別の hook として両方動く）。`tests/test_hc_claude.sh` が両方のファイルの command 文字列が一致することを検査します。
+
+両方に置くのは、`~/.claude/settings.json` が古いまま（同期前）の端末でも hc のセッションでは確実に動かすためです。もし二重に動いても、警告が 2 回出るか、`sessions.jsonl` に同じ `session_id` の行が 2 行増えるだけです（`report` は後の行を採用する）。
+
+#### 実機で確かめる（dev）
+
+`hc run` には環境変数を渡すオプションがないので、閾値を小さくしたワーカーは `env` を挟んで起動します。
+
+```bash
+hc run --name ctx-check --cwd ~/dotfiles -- env HC_CLAUDE_WORKER_CTX_GUARD_TOKENS=1000 hc-claude worker 'README.md を読んで 1 行で要約して'
+# 返答の後、transcript に警告（additionalContext）が入ることを確かめる
+grep -l 'claude-context-guard' ~/.claude/projects/-home-issei-dotfiles/*.jsonl
+# Herdr app か hc attach ctx-check で開き、/exit で終了する（SessionEnd で記録される）
+claude-token-metrics report --since "$(date +%F)"   # ctx-check のセッションが cwd ~/dotfiles で 1 行出る
+```
+
+`make link` で `~/.local/bin/claude-context-guard` と `~/.local/bin/claude-token-metrics` がリンクされている必要があります。
 
 ### フォルダ信頼（trust）
 
@@ -219,7 +260,7 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
 
 ## 確認状況
 
-- テスト（`make check` で実行）: 事故よけのルールと hook の入出力は `tests/test_hc_permission.py`、起動ラッパーの role 判定と引数は `tests/test_hc_claude.sh`、`hc-supervisor` は `tests/test_hc_supervisor.sh`（偽の `hc` を使用）。
+- テスト（`make check` で実行）: 事故よけのルールと hook の入出力は `tests/test_hc_permission.py`、起動ラッパーの role 判定・引数・役割ごとの閾値と、`session-settings.json` の hook は `tests/test_hc_claude.sh`、`hc-supervisor` は `tests/test_hc_supervisor.sh`（偽の `hc` を使用）。
 - 実機で確認済み（hc 0.1.21、2026-11-14、旧構成で確認したもの）: `hc get --json` の形、Herdr app のラベル `herdr.space` / `herdr.tab` による配置、trust ダイアログ中は `hc run` の最初の依頼文が届かない（`first_message.sent: false`）こと。
 - dev の境界（sbx-test、2026-11-14）: [wsl-dev-distro.md](wsl-dev-distro.md) の「確認済みのこと」。
 - dev での実機確認が必要なもの（#26 の最後の受け入れ条件）:
@@ -228,3 +269,4 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
   - 事故よけの hook が効く（例: ワーカーで `git push --force` が理由付きで拒否される）
   - 仕様・設計の判断依頼に監督役が自分で回答し、`~/.local/share/hc-supervisor/decisions.md` に記録する
   - スマホ（Tailscale SSH）から dev の hc に届く
+- dev での実機確認が必要なもの（#30）: 上の「実機で確かめる」の手順で、ワーカーに guard の警告が入ること、終了後に `sessions.jsonl` に 1 行増え `cwd` がその worktree になること。

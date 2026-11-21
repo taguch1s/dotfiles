@@ -45,6 +45,22 @@ case "$role" in
   worker) effort=medium ;;
 esac
 
+# 文脈予算: session-settings.json の claude-context-guard hook が読む閾値を役割ごとに渡す。
+# 監督役は CLAUDE.md の 150k、ワーカーは作業単位で区切る前提で 120k。上書きは役割ごとの
+# HC_CLAUDE_<ROLE>_CTX_GUARD_TOKENS で行い、呼び出し元の CLAUDE_CTX_GUARD_TOKENS は使わない
+# （監督役の環境がワーカーに引き継がれても、ワーカーの閾値が監督役の値にならないように）。
+case "$role" in
+  supervisor) ctx_var=HC_CLAUDE_SUPERVISOR_CTX_GUARD_TOKENS ctx_tokens=150000 ;;
+  worker) ctx_var=HC_CLAUDE_WORKER_CTX_GUARD_TOKENS ctx_tokens=120000 ;;
+esac
+ctx_override="${!ctx_var:-}"
+if [[ "$ctx_override" =~ ^[1-9][0-9]*$ ]]; then
+  ctx_tokens="$ctx_override"
+elif [[ -n "$ctx_override" ]]; then
+  printf 'hc-claude: %s=%s は正の整数ではないので、既定の %s を使います。\n' "$ctx_var" "$ctx_override" "$ctx_tokens" >&2
+fi
+export CLAUDE_CTX_GUARD_TOKENS="$ctx_tokens"
+
 claude_args=(--model opus --effort "$effort" --permission-mode bypassPermissions
   --settings "$settings" --append-system-prompt-file "$prompt")
 
