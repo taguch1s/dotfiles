@@ -18,6 +18,10 @@ handoff = "issue-30-hc-context-guard.md"
 branch = "feature/issue-31-worker-handoff"
 handoff = "issue-31-worker-handoff.md"
 
+[[issue_branch]]
+branch = "feature/issue-32-worker-output-discipline"
+handoff = "issue-32-worker-output-discipline.md"
+
 [[out_of_scope_branch]]
 branch = "main"
 reason = "個人利用のため main へ直接 push する"
