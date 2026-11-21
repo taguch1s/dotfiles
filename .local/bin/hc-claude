@@ -19,6 +19,7 @@ Usage: hc-claude supervisor|worker [claude の引数...]
 
 役割のシステムプロンプトと hc 用の settings を付けて、claude を権限確認なしで起動する。
 dev ディストリ（/etc/dotfiles-role が dev）でだけ動く。
+hc 上の監督役は、hc-supervisor restart で同じ terminal のまま claude を起動し直せる。
 EOF
 }
 
@@ -44,5 +45,34 @@ case "$role" in
   worker) effort=medium ;;
 esac
 
-exec "${HC_CLAUDE_BIN:-claude}" --model opus --effort "$effort" --permission-mode bypassPermissions \
-  --settings "$settings" --append-system-prompt-file "$prompt" "$@"
+claude_args=(--model opus --effort "$effort" --permission-mode bypassPermissions
+  --settings "$settings" --append-system-prompt-file "$prompt")
+
+# ワーカー、または hc の外: claude に置き換わる。
+if [[ "$role" != supervisor || -z "${HC_TERMINAL_ID:-}" ]]; then
+  exec "${HC_CLAUDE_BIN:-claude}" "${claude_args[@]}" "$@"
+fi
+
+# 監督役: 同じ terminal（同じ tN）のまま Claude Code だけを入れ替えられるよう、claude を子として動かす。
+# hc の terminal の parent は起動時に決まり変えられないので、terminal を作り直すと、監督役が起動した
+# ワーカーとの親子関係が切れる。hc-supervisor restart は <状態>/<tN>.pid（この bash の pid）を見て、
+# <状態>/<tN>.restart に新しい claude への最初の依頼文を書いてから claude を SIGTERM で止める。
+# claude が終わったとき .restart があれば、その依頼文で claude を起動し直す。無ければ終わる。
+state_dir="${HC_CLAUDE_STATE_DIR:-$HOME/.local/state/hc-claude}"
+pid_file="$state_dir/$HC_TERMINAL_ID.pid"
+restart_file="$state_dir/$HC_TERMINAL_ID.restart"
+mkdir -p "$state_dir"
+rm -f "$restart_file"
+echo "$$" >"$pid_file"
+trap 'rm -f "$pid_file"' EXIT
+args=("$@")
+while :; do
+  status=0
+  "${HC_CLAUDE_BIN:-claude}" "${claude_args[@]}" "${args[@]}" || status=$?
+  [[ -f "$restart_file" ]] || exit "$status"
+  request="$(<"$restart_file")"
+  rm -f "$restart_file"
+  args=()
+  [[ -z "$request" ]] || args=("$request")
+  printf '\nhc-claude: Claude Code を起動し直します（同じ terminal %s のまま）。\n' "$HC_TERMINAL_ID"
+done

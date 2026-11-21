@@ -12,7 +12,7 @@ mkdir -p "$fixture/bin" "$fixture/live" "$fixture/home"
 export MOCK_HC_DIR="$fixture" PATH="$fixture/bin:$PATH" HOME="$fixture/home"
 export HC_CLAUDE_ROLE_FILE="$fixture/dotfiles-role"
 echo dev >"$HC_CLAUDE_ROLE_FILE"
-unset XDG_DATA_HOME HC_TERMINAL_ID
+unset XDG_DATA_HOME HC_TERMINAL_ID HC_CLAUDE_STATE_DIR HC_CLAUDE_BIN HC_SUPERVISOR_NAME
 cat >"$fixture/bin/hc" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -157,7 +157,7 @@ echo handoff >"$sup_handoff"
 reset
 HC_TERMINAL_ID=t9 "$launcher" restart >/dev/null 2>&1
 run_line="$(runs)"
-[[ "$run_line" == "run --bg --no-parent --rm --no-notify --name supervisor-restart -- bash -c "*'restart --handoff-ready'*" $home $home/restart.log" ]] \
+[[ "$run_line" == "run --bg --no-parent --rm --no-notify --name supervisor-restart -- env bash -c "*'restart --handoff-ready'*" $home $home/restart.log" ]] \
   && [[ "$(cmds)" == 'run ' ]] \
   && ok 'restart（監督役自身）: 親のない別の terminal に切り離し、自分では止めない' || ng "監督役自身の restart が違う: $(cmds) / $run_line"
 
@@ -172,6 +172,39 @@ reset
 "$launcher" restart >/dev/null 2>&1
 [[ "$(cmds)" == 'run ' && "$(runs)" == "$expected_supervisor" ]] \
   && ok 'restart: 監督役がいなければ start と同じく起動する' || ng "監督役なしの restart が違う: $(cmds)"
+
+# restart（同じ terminal で入れ替え）: 本物の hc-claude を偽の claude で動かし、terminal t9 の中身とみなす。
+config="$fixture/config/herdr-core/claude"
+mkdir -p "$config"
+touch "$config/session-settings.json" "$config/supervisor-prompt.md"
+cat >"$fixture/fake-claude" <<'EOF'
+#!/usr/bin/env bash
+printf 'claude %s\n' "${*: -1}" >>"$MOCK_HC_DIR/claude.log"
+exec sleep 60
+EOF
+chmod +x "$fixture/fake-claude"
+HC_TERMINAL_ID=t9 XDG_CONFIG_HOME="$fixture/config" HC_CLAUDE_BIN="$fixture/fake-claude" \
+  "$repository_root/.local/bin/hc-claude" supervisor '監督を開始してください。' >"$fixture/hc-claude.out" 2>&1 &
+hc_claude_pid=$!
+for _ in $(seq 50); do [[ -f "$fixture/claude.log" ]] && break; sleep 0.1; done
+old_claude="$(pgrep -P "$hc_claude_pid")"
+echo live >"$fixture/live/supervisor"
+echo handoff >"$sup_handoff"
+reset
+"$launcher" restart --handoff-ready >"$fixture/out" 2>&1
+new_claude="$(pgrep -P "$hc_claude_pid" || true)"
+[[ -z "$(cmds)" ]] && grep -q '同じ terminal（t9）のまま' "$fixture/out" \
+  && ok 'restart: hc-claude で動く監督役は、terminal を消さず・作らずに入れ替える' || ng "入れ替えの hc 操作が違う: $(cmds) / $(<"$fixture/out")"
+[[ -n "$new_claude" && "$new_claude" != "$old_claude" && "$(tail -n 1 "$fixture/claude.log")" == 'claude 監督を開始してください。' ]] \
+  && ok 'restart: 新しい claude を最初の依頼文で起動する' || ng "入れ替え後の claude が違う: $old_claude → $new_claude / $(cat "$fixture/claude.log")"
+[[ ! -e "$fixture/home/.local/state/hc-claude/t9.restart" ]] && ok 'restart: 入れ替えの印は使い終わると消える' || ng '入れ替えの印が残った'
+kill "$new_claude" 2>/dev/null || true
+wait "$hc_claude_pid" 2>/dev/null || true
+[[ ! -e "$fixture/home/.local/state/hc-claude/t9.pid" ]] && ok 'hc-claude: claude が自分で終われば終わり、pid の印を消す' || ng 'pid の印が残った'
+reset
+"$launcher" restart --handoff-ready >"$fixture/out" 2>&1
+[[ "$(cmds)" == 'kill wait rm run label ' ]] && grep -q '新しい監督役の子になりません' "$fixture/out" \
+  && ok 'restart: 入れ替えられなければ作り直し、親子関係が切れることを知らせる' || ng "作り直しへの切り替えが違う: $(cmds) / $(<"$fixture/out")"
 
 board_file="$home/board.md"
 rm -f "$board_file"

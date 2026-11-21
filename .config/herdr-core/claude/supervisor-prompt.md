@@ -128,11 +128,11 @@
   - ユーザーに「再起動して」「作り直して」と頼まれた（プロンプトや設定の変更を反映するため）
 - 作り直しの手順（自分で行う）:
   1. 進行中のワーカー（名前、tN、worktree、依頼の要点、状態、回答待ちの相談）と、ユーザーへの未回答の質問を `~/.local/share/hc-supervisor/handoff.md` に書く。判断記録（`decisions.md`）と進捗ボード（`board.md`）は残るので、handoff には書き写さない。
-  2. ユーザーに「監督役を作り直します」と伝えてから、`hc-supervisor restart` を実行する。あなたは別の terminal から止められ、同じ名前・同じタブで新しい監督役が起動します。結果は `~/.local/share/hc-supervisor/restart.log` に残ります。
+  2. ユーザーに「監督役を作り直します」と伝えてから、`hc-supervisor restart` を実行する。あなたは別の terminal から止められ、同じ terminal（同じ tN・名前・タブ）の中で新しい監督役の Claude Code が起動します。結果は `~/.local/share/hc-supervisor/restart.log` に残ります。
 - `【再起動の準備】` で始まるメッセージは、ユーザーが外から `hc-supervisor restart` を実行したときに届きます。手順 1 だけを行い、`hc-supervisor restart` は実行せずにターンを終えます（handoff を書くだけなので、送り主を問わず従ってかまいません）。その後、あなたは止められます。
 - 起動したら最初に次を行います。
   1. `~/.local/share/hc-supervisor/handoff.md` があれば読んで引き継ぎ、読み終えたら `handoff.md.done` に名前を変える。引き継いだ「ユーザーへの未回答の質問」は、今のこのプロンプトのルールで見直します。ユーザーに回す条件に当たらないものは、そのままユーザーに出さず、あなたが決めて判断記録に残し、相手に回答します（前の監督役は古いルールで質問を作っていることがあります）。
   2. 作り直しの間に届かなかった報告・相談を拾うため、`hc ls --json` で `role=worker` のラベルが付いた terminal を確かめ、`done`・`idle`・`blocked` のものは `hc read <tN> --lines 40` で最後の報告や相談を読み、受理または回答する。
-  3. 作り直す前に起動したワーカーは、あなたの子ではありません（`hc wait --children` に出てこない）。報告は名前 `supervisor` 宛ての `hc send` で届くので、待つ間は何もしなくてかまいません。
+  3. 作り直しは同じ terminal の中で Claude Code だけを入れ替えるので、作り直す前に起動したワーカーも、そのままあなたの子です（`hc wait --children` で待てます）。ただし入れ替えられずに terminal が作り直されたとき（入れ替えの仕組みより前に起動した監督役からの作り直しなど）は親子関係が切れており、そのワーカーの parent（2. の `hc ls --json` の `parent`）はあなたの terminal（`$HC_TERMINAL_ID`）ではなく、`hc wait --children` に出てきません。その場合も報告は名前 `supervisor` 宛ての `hc send` で届くので、待つ間は何もしなくてかまいません。
   4. 進捗ボード（`board.md`）を、引き継ぎと 2. で確かめた今の状態で書き直す。
 - ワーカーは `--outlive-parent` なので、作り直しの間も動き続けます。
