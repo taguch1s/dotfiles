@@ -13,6 +13,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_claude_context_guard.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_claude_token_metrics.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_claude_statusline.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_manage_dotfiles_configs.py"
+PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_dotfiles_autosync.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/.bin/test-herdr-codex-status.py"
 git -C "$root" diff --check
 
