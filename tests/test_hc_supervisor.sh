@@ -8,33 +8,48 @@ launcher="$repository_root/.local/bin/hc-supervisor"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 
-mkdir -p "$fixture/bin" "$fixture/live" "$fixture/home"
+mkdir -p "$fixture/bin" "$fixture/live" "$fixture/labels" "$fixture/alias" "$fixture/home"
 export MOCK_HC_DIR="$fixture" PATH="$fixture/bin:$PATH" HOME="$fixture/home"
 export HC_CLAUDE_ROLE_FILE="$fixture/dotfiles-role"
 echo dev >"$HC_CLAUDE_ROLE_FILE"
 unset XDG_DATA_HOME HC_TERMINAL_ID HC_CLAUDE_STATE_DIR HC_CLAUDE_BIN HC_SUPERVISOR_NAME
+# pre-commit hook から make check を実行すると GIT_DIR などが入っており、fixture の git が
+# このリポジトリを指してしまう。git の環境変数は引き継がない。
+unset $(compgen -e | grep '^GIT_' || true)
 cat >"$fixture/bin/hc" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-(IFS=$'\x1f'; printf '%s\n' "$*") >>"$MOCK_HC_DIR/hc.log"
+# 1 回の呼び出しを 1 行に残す（複数行の依頼文の改行は \n と書く）。
+(IFS=$'\x1f'; line="$*"; printf '%s\n' "${line//$'\n'/\\n}") >>"$MOCK_HC_DIR/hc.log"
 case "$1" in
   get)
+    # $MOCK_HC_DIR/alias/<tN> があれば、その tN を中身の名前の terminal として扱う。
+    [[ ! -f "$MOCK_HC_DIR/alias/$2" ]] || set -- "$1" "$(<"$MOCK_HC_DIR/alias/$2")" "${@:3}"
     if [[ "$2" == self ]]; then
       echo '{"address":"t1","state":"live","labels":{"herdr.space":"spABC","herdr.tab":"tbOLD"}}'
       exit 0
     fi
     [[ -f "$MOCK_HC_DIR/live/$2" ]] || { echo '{"error":{"kind":"not_found"}}' >&2; exit 3; }
-    printf '{"address":"t9","name":"%s","state":"%s","labels":{"herdr.space":"spSUP","herdr.tab":"tbSUP"},"status":{"state":"%s"}}\n' \
-      "$2" "$(<"$MOCK_HC_DIR/live/$2")" "${MOCK_AGENT_STATE-done}"
+    # $MOCK_HC_DIR/labels/<名前> があれば、その JSON をラベルとして返す（ワーカーの role・引き継ぎ回数）。
+    labels='{"herdr.space":"spSUP","herdr.tab":"tbSUP"}'
+    [[ ! -f "$MOCK_HC_DIR/labels/$2" ]] || labels="$(<"$MOCK_HC_DIR/labels/$2")"
+    printf '{"address":"t9","name":"%s","state":"%s","labels":%s,"status":{"state":"%s"}}\n' \
+      "$2" "$(<"$MOCK_HC_DIR/live/$2")" "$labels" "${MOCK_AGENT_STATE-done}"
     ;;
   run)
     shift
     while [[ "$1" == --* ]]; do
       [[ "$1" == --name ]] && echo live >"$MOCK_HC_DIR/live/$2"
+      # --label handoffs=N は、起動した terminal のラベルとして残す（resume-worker の引き継ぎ回数）。
+      [[ "$1" == --label && "$2" == handoffs=* ]] && printf '%s\n' "${2#handoffs=}" >"$MOCK_HC_DIR/run-handoffs"
       case "$1" in --) break ;; --bg|--no-parent|--keep|--no-notify|--outlive-parent|--rm) shift ;; *) shift 2 ;; esac
     done
     ;;
-  kill) rm -f "$MOCK_HC_DIR/live/$2" ;;
+  kill)
+    target="$2"
+    [[ ! -f "$MOCK_HC_DIR/alias/$2" ]] || target="$(<"$MOCK_HC_DIR/alias/$2")"
+    rm -f "$MOCK_HC_DIR/live/$target"
+    ;;
   send)
     # MOCK_SEND_WRITES_HANDOFF=1 なら、依頼を受けた監督役が引き継ぎを書いたことにする。
     if [[ "${MOCK_SEND_WRITES_HANDOFF:-}" == 1 ]]; then
@@ -217,6 +232,97 @@ printf '# 監督役ボード\n更新: 2026-11-21 21:40\n' >"$board_file"
 out="$("$launcher" board 2>&1)" && [[ "$out" == "$(<"$board_file")" ]] \
   && ok 'board: ボードの中身をそのまま表示する' || ng "board の表示が違う: $out"
 echo dev >"$HC_CLAUDE_ROLE_FILE"
+
+# resume-worker: 引き継ぎを送ったワーカーを片付け、同じ worktree で新しいワーカーを handoff 付きで起動する。
+repo="$fixture/repo"
+git init -q "$repo"
+handoff_dir="$(git -C "$repo" rev-parse --path-format=absolute --git-path codex-handoffs)"
+mkdir -p "$handoff_dir"
+worker_handoff="$handoff_dir/issue-31.md"
+echo '# Handoff' >"$worker_handoff"
+resume() { "$launcher" resume-worker "$@" >"$fixture/out" 2>"$fixture/err"; }
+worker_ready() {
+  rm -f "$fixture/live/"* "$fixture/labels/"* "$fixture/run-handoffs"
+  echo live >"$fixture/live/w1"
+  printf '%s\n' "${1:-{\"role\":\"worker\"\}}" >"$fixture/labels/w1"
+  reset
+}
+
+worker_ready
+if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '#31 を PR 作成まで進める'; then
+  run_line="$(runs)"
+  [[ "$(cmds)" == 'kill wait rm run ' ]] \
+    && ok 'resume-worker: 前のワーカーを止めて片付けてから、新しいワーカーを起動する' || ng "resume-worker の順序が違う: $(cmds)"
+  [[ "$run_line" == "run --bg --timeout 60 --outlive-parent --label role=worker --label handoffs=1 --name w1 --cwd $repo claude-worker 【再開】$worker_handoff"* ]] \
+    && ok 'resume-worker: 同じ worktree・同じ名前で、依頼文の先頭に【再開】<handoff> を付けて起動する' || ng "resume-worker の hc run が違う: $run_line"
+  [[ "$run_line" == *'#31 を PR 作成まで進める' ]] && ok 'resume-worker: 元の依頼文を添える' || ng "元の依頼文がない: $run_line"
+  [[ "$(<"$fixture/run-handoffs")" == 1 ]] && ok 'resume-worker: 引き継ぎ回数（1 回目）を起動と同時にラベルに残す' || ng "引き継ぎ回数のラベルが違う: $run_line"
+else
+  ng "resume-worker が失敗した: $(<"$fixture/err")"
+fi
+
+worker_ready '{"role":"worker","handoffs":"2"}'
+resume --from w1 --cwd "$repo" --handoff "$worker_handoff" --name w1b '依頼' || true
+[[ "$(<"$fixture/run-handoffs")" == 3 && "$(runs)" == *' --name w1b '* ]] \
+  && ok 'resume-worker: 前の回数に 1 を足し、--name の名前で起動する' || ng "回数の加算・--name が違う: $(cmds) / $(runs) / $(<"$fixture/err")"
+
+worker_ready '{"role":"worker","handoffs":"3"}'
+if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼'; then ng '上限（3 回）を超える引き継ぎで起動した'; fi
+[[ -z "$(cmds)" ]] && grep -q 'ユーザーに報告' "$fixture/err" \
+  && ok 'resume-worker: 引き継ぎが 3 回を超えるなら、前のワーカーを止めず起動もせず、ユーザーへの報告を促す' || ng "上限の扱いが違う: $(cmds) / $(<"$fixture/err")"
+worker_ready '{"role":"worker","handoffs":"3"}'
+HC_SUPERVISOR_MAX_WORKER_HANDOFFS=4 resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼' || true
+[[ "$(cmds)" == 'kill wait rm run ' ]] && ok 'resume-worker: 上限は HC_SUPERVISOR_MAX_WORKER_HANDOFFS で変えられる' || ng "上限の上書きが違う: $(cmds)"
+
+worker_ready
+echo w1 >"$fixture/alias/t5"
+resume --from t5 --cwd "$repo" --handoff "$worker_handoff" '依頼' || true
+[[ "$(cmds)" == 'kill wait rm run ' && "$(runs)" == *' --name w1 '* ]] \
+  && ok 'resume-worker: --from に tN を渡しても、前のワーカー自身を名前の衝突とみなさず、同じ名前で起動する' \
+  || ng "--from tN の扱いが違う: $(cmds) / $(runs) / $(<"$fixture/err")"
+rm -f "$fixture/alias/"*
+
+worker_ready
+echo live >"$fixture/live/other"
+if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" --name other '依頼'; then ng '既にある terminal の名前で起動した'; fi
+[[ -z "$(cmds)" ]] && grep -q '既にあります' "$fixture/err" \
+  && ok 'resume-worker: --name が既にある別の terminal と同じなら、前のワーカーを止めず起動もしない' || ng "名前の衝突の扱いが違う: $(cmds) / $(<"$fixture/err")"
+
+worker_ready
+if MOCK_AGENT_STATE=working resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼'; then ng '動いているワーカーの worktree で起動した'; fi
+[[ -z "$(cmds)" ]] && grep -q 'まだ動いています' "$fixture/err" \
+  && ok 'resume-worker: 前のワーカーが動いている（working）なら、止めず起動もしない' || ng "working の扱いが違う: $(cmds) / $(<"$fixture/err")"
+
+worker_ready '{"role":"supervisor"}'
+if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼'; then ng 'role=worker でない terminal を止めた'; fi
+[[ -z "$(cmds)" ]] && ok 'resume-worker: role=worker でない terminal は止めない' || ng "role の扱いが違う: $(cmds)"
+
+worker_ready
+rm -f "$fixture/live/w1"
+if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼'; then ng '前のワーカーが見つからないのに起動した'; fi
+[[ -z "$(cmds)" ]] && grep -q '見つかりません' "$fixture/err" \
+  && ok 'resume-worker: 前のワーカーが見つからなければ（回数が分からない）起動しない' || ng "前のワーカーなしの扱いが違う: $(cmds) / $(<"$fixture/err")"
+
+echo '# other' >"$fixture/stray.md"
+for bad in "$fixture/stray.md" "$handoff_dir/missing.md" "issue-31.md"; do
+  worker_ready
+  if resume --from w1 --cwd "$repo" --handoff "$bad" '依頼'; then ng "不正な handoff を受け付けた: $bad"; continue; fi
+  [[ -z "$(cmds)" && "$(grep -c $'^get' "$fixture/hc.log" || true)" == 0 ]] \
+    && ok "resume-worker: handoff が codex-handoffs の下の既存ファイル（絶対 path）でなければ、hc に触れず拒否: ${bad#"$fixture/"}" \
+    || ng "不正な handoff で hc を操作した: $bad / $(cmds)"
+done
+worker_ready
+if resume --from w1 --cwd "$fixture/home" --handoff "$worker_handoff" '依頼'; then ng 'git でない --cwd を受け付けた'; fi
+[[ -z "$(cmds)" ]] && ok 'resume-worker: --cwd が git の worktree でなければ拒否' || ng "git でない --cwd の扱いが違う: $(cmds)"
+worker_ready
+if resume --from w1 --cwd "$repo" --handoff "$worker_handoff"; then ng '依頼文なしで起動した'; fi
+[[ -z "$(cmds)" ]] && ok 'resume-worker: 依頼文がなければ拒否' || ng "依頼文なしの扱いが違う: $(cmds)"
+echo admin >"$HC_CLAUDE_ROLE_FILE"
+worker_ready
+if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼'; then ng 'admin でワーカーを起動した'; fi
+[[ -z "$(cmds)" ]] && ok 'resume-worker: dev ディストリ以外では起動しない' || ng "admin での resume-worker が違う: $(cmds)"
+echo dev >"$HC_CLAUDE_ROLE_FILE"
+rm -f "$fixture/live/"* "$fixture/labels/"*
 
 if "$launcher" --cwd "$fixture/missing" >/dev/null 2>&1; then ng '存在しない --cwd を受け付けた'; else ok '存在しない --cwd は拒否'; fi
 if "$launcher" bogus >/dev/null 2>&1; then ng '不明なサブコマンドを受け付けた'; else ok '不明なサブコマンドは拒否'; fi

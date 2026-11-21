@@ -13,6 +13,7 @@ usage() {
 Usage: hc-supervisor [start] [--cwd DIR]
        hc-supervisor restart [--cwd DIR]
        hc-supervisor status | stop | board
+       hc-supervisor resume-worker --from WORKER --cwd WORKTREE --handoff PATH [--name NAME] REQUEST
 
 start    監督役（名前 supervisor、ラベル role=supervisor）を起動する。既に監督役がいれば起動しない。
          --cwd の既定は ~/.local/share/hc-supervisor（$HOME はフォルダ信頼が保存されず、
@@ -28,6 +29,14 @@ restart  監督役を作り直す（プロンプトや設定の変更を反映�
 status   監督役の状態を表示する。
 stop     監督役を止める。監督役が起動したワーカーは止まらない（--outlive-parent）。
 board    監督役の進捗ボード（~/.local/share/hc-supervisor/board.md）を表示する。どのセッションからでも使える。
+resume-worker
+         「【引き継ぎ】<handoff>」を送ったワーカー（--from、名前か tN）を片付け、同じ worktree（--cwd）で
+         新しいワーカーを起動する。依頼文は「【再開】<handoff>」の行の後に REQUEST（前のワーカーへの依頼と同じ）を
+         付けたもの。handoff は --cwd の `git rev-parse --git-path codex-handoffs` の下にある既存ファイルの
+         絶対 path に限る。前のワーカーが role=worker でない、まだ動いている（working）、見つからないときは、
+         何も止めず起動もしない。引き継ぎ回数をラベル handoffs に残し、上限
+         （HC_SUPERVISOR_MAX_WORKER_HANDOFFS、既定 3）を超えるなら起動しない（ユーザーに報告する）。
+         新しいワーカーの名前は --name、無ければ前のワーカーと同じ名前。監督役が実行する。
 EOF
 }
 
@@ -193,6 +202,100 @@ restart() {
   launch "$space" "$tab"
 }
 
+resume_request() {
+  local handoff_path="$1" count="$2" request="$3"
+  printf '【再開】%s\n前のワーカーが文脈の区切りで引き継ぎました（引き継ぎ %s 回目）。システムプロンプトの「文脈の区切りと引き継ぎ」に従い、この handoff を読んで next safe action から再開してください。\n\n元の依頼:\n%s' \
+    "$handoff_path" "$count" "$request"
+}
+
+# 前のワーカー（引き継ぎを送って止まった）を片付け、同じ worktree で handoff 付きの新しいワーカーを起動する。
+# 前後のワーカーが同じ worktree で同時に動かないよう、前のワーカーが止まって消えたことを確かめてから起動する。
+resume_worker() {
+  local from="" worktree="" handoff_path="" new_name="" request=""
+  while (($#)); do
+    case "$1" in
+      --from|--cwd|--handoff|--name)
+        (($# >= 2)) || die "$1 に値を指定してください"
+        case "$1" in
+          --from) from="$2" ;;
+          --cwd) worktree="$2" ;;
+          --handoff) handoff_path="$2" ;;
+          --name) new_name="$2" ;;
+        esac
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -*)
+        usage >&2
+        exit 2
+        ;;
+      *)
+        [[ -z "$request" ]] || die '依頼文は 1 つの引数で渡してください'
+        request="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$from" && -n "$worktree" && -n "$handoff_path" ]] || die '--from・--cwd・--handoff を指定してください'
+  [[ -n "${request//[[:space:]]/}" ]] || die '依頼文（前のワーカーに渡したものと同じ）を指定してください'
+  local max="${HC_SUPERVISOR_MAX_WORKER_HANDOFFS:-3}"
+  [[ "$max" =~ ^[1-9][0-9]*$ ]] || die "HC_SUPERVISOR_MAX_WORKER_HANDOFFS は正の整数にしてください: $max"
+
+  # handoff は Git 管理外の codex-handoffs の下に限る（session-handoff の保存先）。
+  [[ -d "$worktree" ]] || die "worktree がありません: $worktree"
+  local handoff_dir
+  handoff_dir="$(git -C "$worktree" rev-parse --path-format=absolute --git-path codex-handoffs 2>/dev/null)" \
+    || die "git の worktree ではありません: $worktree"
+  [[ "$handoff_path" == /* ]] || die "handoff は絶対 path で指定してください: $handoff_path"
+  [[ -f "$handoff_path" && -s "$handoff_path" ]] || die "handoff がないか空です: $handoff_path"
+  local real_handoff real_dir
+  real_handoff="$(realpath -e "$handoff_path")"
+  real_dir="$(realpath -m "$handoff_dir")"
+  [[ "$real_handoff" == "$real_dir"/* ]] \
+    || die "handoff が $handoff_dir の下にありません（ワーカーの handoff は git rev-parse --git-path codex-handoffs に置きます）: $handoff_path"
+
+  local json
+  json="$(hc get "$from" --json 2>/dev/null)" \
+    || die "前のワーカー $from が見つかりません。引き継ぎ回数が分からないので起動しません。ユーザーに報告してください。"
+  [[ "$(json_value field "$json" state)" != finished ]] \
+    || die "前のワーカー $from は終了済みで、引き継ぎ回数が分かりません。起動しません。ユーザーに報告してください。"
+  [[ "$(json_value label "$json" role)" == worker ]] || die "$from は role=worker の terminal ではありません。止めません。"
+  [[ "$(json_value status "$json" state)" != working ]] \
+    || die "前のワーカー $from はまだ動いています（working）。ターンが終わってから（hc wait $from）実行してください。"
+  local previous count
+  previous="$(json_value label "$json" handoffs)"
+  [[ "$previous" =~ ^[0-9]+$ ]] || previous=0
+  count=$((previous + 1))
+  ((count <= max)) \
+    || die "同じ作業で引き継ぎが $max 回を超えます（今回 $count 回目）。新しいワーカーを起動せず、前のワーカー $from も止めていません。ユーザーに報告してください。"
+  local old_name old_address
+  old_name="$(json_value field "$json" name)"
+  old_address="$(json_value field "$json" address)"
+  [[ -n "$new_name" ]] || new_name="$old_name"
+  [[ -n "$new_name" ]] || die "前のワーカーの名前が分かりません。--name で新しいワーカーの名前を指定してください。"
+  # 前のワーカーと別の terminal の名前で起動するとき、その名前の terminal が既にあれば、
+  # 起動の成否を見分けられないので止める（--from は名前でも tN でもよいので、両方と比べる）。
+  [[ "$new_name" == "$from" || "$new_name" == "$old_name" || "$new_name" == "$old_address" ]] || ! exists "$new_name" \
+    || die "$new_name という terminal が既にあります。別の --name を指定してください。前のワーカーは止めていません。"
+
+  hc kill "$from" >/dev/null
+  hc wait "$from" --timeout 30 >/dev/null 2>&1 || true
+  hc rm "$from" >/dev/null 2>&1 || true
+  ! exists "$from" || die "前のワーカー $from が止まりませんでした。新しいワーカーは起動していません（hc ls で確認してください）。"
+  printf '前のワーカーを止めました: %s\n' "$from"
+
+  # 同じリポジトリの worktree なので trust のダイアログは出ない想定。出て最初の依頼文が届かないときに
+  # 待ち続けないよう、--timeout で切り上げる（terminal は動いたまま。結果の first_message.sent で分かる）。
+  # 引き継ぎ回数のラベルは起動と同時に付ける（後から付けると、付け損ねたときに回数が 0 に戻る）。
+  hc run --bg --timeout 60 --outlive-parent --label role=worker --label "handoffs=$count" --name "$new_name" --cwd "$worktree" \
+    claude-worker "$(resume_request "$real_handoff" "$count" "$request")" || true
+  exists "$new_name" || die "新しいワーカーを起動できませんでした（hc ls で確認してください）。handoff は $real_handoff にあります（引き継ぎ $count 回目）。"
+  printf '新しいワーカーを起動しました: %s（引き継ぎ %s 回目、handoff: %s）\n' "$new_name" "$count" "$real_handoff"
+}
+
 command="start"
 if (($#)) && [[ "$1" != -* ]]; then
   command="$1"
@@ -213,6 +316,12 @@ done
 self_path="$(readlink -f "${BASH_SOURCE[0]}")"
 cwd="$default_cwd"
 handoff_ready=0
+# resume-worker は自分の引数を持つので、ここでは読まずに後で渡す。
+resume_args=()
+if [[ "$command" == resume-worker ]]; then
+  resume_args=("$@")
+  set --
+fi
 while (($#)); do
   case "$1" in
     --cwd)
@@ -262,7 +371,7 @@ case "$command" in
     fi
     exit 0
     ;;
-  start|restart) ;;
+  start|restart|resume-worker) ;;
   *)
     usage >&2
     exit 2
@@ -273,6 +382,11 @@ esac
   || die "dev ディストリでだけ起動します（$role_file が dev ではありません）。admin ではエージェントを動かしません。docs/wsl-dev-distro.md"
 command -v hc-claude >/dev/null 2>&1 \
   || die 'hc-claude が PATH にありません（dotfiles で make link を実行してください）'
+if [[ "$command" == resume-worker ]]; then
+  resume_worker "${resume_args[@]}"
+  exit 0
+fi
+
 [[ "$cwd" != "$default_cwd" ]] || mkdir -p "$cwd"
 [[ -d "$cwd" ]] || die "ディレクトリがありません: $cwd"
 
