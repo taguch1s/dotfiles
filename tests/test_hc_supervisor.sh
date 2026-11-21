@@ -173,6 +173,18 @@ reset
 [[ "$(cmds)" == 'run ' && "$(runs)" == "$expected_supervisor" ]] \
   && ok 'restart: 監督役がいなければ start と同じく起動する' || ng "監督役なしの restart が違う: $(cmds)"
 
+board_file="$home/board.md"
+rm -f "$board_file"
+echo admin >"$HC_CLAUDE_ROLE_FILE"
+reset
+out="$("$launcher" board 2>&1)" && [[ "$out" == *'進捗ボードはまだありません'* && -z "$(cmds)" ]] \
+  && ok 'board: ボードが無ければそう表示し、hc を操作しない（admin でも使える）' || ng "ボードなしの board が違う: $out / $(cmds)"
+mkdir -p "$home"
+printf '# 監督役ボード\n更新: 2026-11-21 21:40\n' >"$board_file"
+out="$("$launcher" board 2>&1)" && [[ "$out" == "$(<"$board_file")" ]] \
+  && ok 'board: ボードの中身をそのまま表示する' || ng "board の表示が違う: $out"
+echo dev >"$HC_CLAUDE_ROLE_FILE"
+
 if "$launcher" --cwd "$fixture/missing" >/dev/null 2>&1; then ng '存在しない --cwd を受け付けた'; else ok '存在しない --cwd は拒否'; fi
 if "$launcher" bogus >/dev/null 2>&1; then ng '不明なサブコマンドを受け付けた'; else ok '不明なサブコマンドは拒否'; fi
 

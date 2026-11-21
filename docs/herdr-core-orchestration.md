@@ -78,6 +78,7 @@ supervisor（dev、role=supervisor、親なし）
 | [templates/claude-supervisor.md](../.config/herdr-core/templates/claude-supervisor.md) / [claude-worker.md](../.config/herdr-core/templates/claude-worker.md) | `hc run` のテンプレート（`command: hc-claude supervisor|worker`） |
 | [claude/session-settings.json](../.config/herdr-core/claude/session-settings.json) | hc 上のセッションの設定（`defaultMode: bypassPermissions`、`sandbox.enabled: false`、`PreToolUse` Bash → `hc-permission hook`） |
 | [claude/supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) / [worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) | 役割のシステムプロンプト |
+| [herdr-app/mods/supervisor-board](../.config/herdr-app/mods/supervisor-board/main.js) / [layouts/board.json](../.config/herdr-app/layouts/board.json) | Herdr app の監督役ボード。`board` レイアウト（main の複製）で Changes パネルの中身をこの mod に替える |
 
 - bypassPermissions・sandbox なしは **hc-claude で起動したセッション（監督役・ワーカー）だけ**です。Herdr app で手動で開いたセッションや VS Code の Claude Code は、各ディストリの `~/.claude/settings.json` のまま動きます。
 - `--settings` は user / project の設定より上、managed より下で効きます。`skipDangerousModePermissionPrompt`（bypassPermissions の初回確認を出さない）は `--settings` からは効かないため、dev の `~/.claude/settings.json` に `setup-dev-distro.sh` が入れます。
@@ -106,6 +107,7 @@ make link          # hc-claude・hc-supervisor・hc-permission・テンプレー
 hc templates       # claude-supervisor / claude-worker が出ることを確認
 hc-supervisor      # 監督役を起動。Herdr app のタブから実行すると、そのスペースに「supervisor」タブが出る
 hc-supervisor status
+hc-supervisor board  # 進捗ボードを表示（どのセッションからでも）
 hc-supervisor stop # 止める（ワーカーは止まらない）
 hc-supervisor restart  # 引き継ぎを書かせてから作り直す（プロンプトや設定の変更を反映する）
 hc attach supervisor   # 端末から見る場合。Ctrl+\ で離れる（止まらない）
@@ -141,6 +143,25 @@ Herdr app の端末での貼り付けは **Ctrl+Shift+V**（または右クリ�
   3. 新しい監督役は handoff を読み、`role=worker` の terminal の画面を確かめて、入れ替わりの間に届かなかった報告・相談を拾う。ワーカーは `--outlive-parent` なので動き続け、報告先は名前の `supervisor` なので新しい監督役に届く。入れ替わりの数秒に `hc send supervisor` が失敗したワーカーは、報告を画面に書いてターンを終える。
   文脈が大きくなったときも、監督役が同じ手順で自分を作り直します。
 - `hc-supervisor` は監督役を `--keep` で起動します。herdr-core の再起動後、監督役の terminal はシェルになります。`hc-supervisor stop` の後に `hc-supervisor` で起動し直してください（シェルに引き継ぎの依頼を打ち込まないよう、`restart` は使いません）。
+
+## 進捗ボード
+
+監督役の画面に出た質問は、その後の出力で流れて見えなくなります。そこで、監督役は今の状態を 1 つのファイルにまとめ直し続けます。
+
+- ファイル: `~/.local/share/hc-supervisor/board.md`（Git 管理外。書くのは監督役だけ）。節は「あなたの対応待ち」「次にやること」「進行中」「完了（直近 5 件）」「要確認の判断」。ユーザーに回した質問は、答えるまで「あなたの対応待ち」に残ります。書き方は [supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) の「進捗ボード」。
+- 読む: どのセッションからでも `hc-supervisor board`（または `cat` で直接）。
+- Herdr app: `board` レイアウトに切り替えると、タブバーの **Changes** ボタンが監督役ボードを開きます。上に hc の状態から自動で出す「あなたの対応待ち」（権限の確認などで止まっているセッション。手動セッションも含む）と「ワーカー」の一覧、下に `board.md` を表示します。行を押すとそのセッションへ移ります（ペインがなければ覗き窓で開く）。ワーカーが作業中なのに `board.md` が 30 分以上更新されていなければ、更新時刻を警告色で出します。
+
+導入（`make link` の後、Herdr app を開いた状態で）:
+
+```bash
+herdr-app check ~/.config/herdr-app/mods/supervisor-board   # mod が読み込めるか
+herdr-app do layout.switch '{"name":"board"}'               # board レイアウトにする（ctrl-shift-l でも切り替わる）
+```
+
+- レイアウトは main の複製です。Herdr app の更新で main が変わっても board には入りません。必要なら main を複製し直し、`changes` ブロックの `content` を `{"mod": "supervisor-board"}` に替えてください。
+- mod はファイルごとにリンクしています（フォルダごとだと Herdr app が書く `jsconfig.json` と `*.d.ts` がリポジトリに入るため）。dotfiles 側を編集しても表示が変わらなければ、Herdr app を開き直してください。
+- dev の WSLg で動かす Herdr app を前提にしています（`board.md` を Herdr app と同じマシンから読む）。Windows 版 Herdr app から dev を見る構成には対応していません。
 
 ## GitHub ruleset（ユーザーが設定する）
 

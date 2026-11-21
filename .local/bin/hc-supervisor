@@ -10,7 +10,7 @@ usage() {
   cat <<'EOF'
 Usage: hc-supervisor [start] [--cwd DIR]
        hc-supervisor restart [--cwd DIR]
-       hc-supervisor status | stop
+       hc-supervisor status | stop | board
 
 start    監督役（名前 supervisor、ラベル role=supervisor）を起動する。既に監督役がいれば起動しない。
          --cwd の既定は ~/.local/share/hc-supervisor（$HOME はフォルダ信頼が保存されず、
@@ -22,6 +22,7 @@ restart  監督役を作り直す（プロンプトや設定の変更を反映�
          先に引き継ぎを書いておく（別の terminal に切り離して作り直す）。
 status   監督役の状態を表示する。
 stop     監督役を止める。監督役が起動したワーカーは止まらない（--outlive-parent）。
+board    監督役の進捗ボード（~/.local/share/hc-supervisor/board.md）を表示する。どのセッションからでも使える。
 EOF
 }
 
@@ -148,6 +149,7 @@ fi
 state_dir="${XDG_DATA_HOME:-$HOME/.local/share}/hc-supervisor"
 default_cwd="$state_dir"
 handoff="$state_dir/handoff.md"
+board="$state_dir/board.md"
 restart_log="$state_dir/restart.log"
 self_path="$(readlink -f "${BASH_SOURCE[0]}")"
 cwd="$default_cwd"
@@ -183,6 +185,15 @@ case "$command" in
       hc get "$name"
     else
       printf '%s: 起動していません\n' "$name"
+    fi
+    exit 0
+    ;;
+  board)
+    if [[ -f "$board" ]]; then
+      cat "$board"
+    else
+      printf '進捗ボードはまだありません（監督役が %s に書きます）
+' "$board"
     fi
     exit 0
     ;;

@@ -85,6 +85,26 @@ source = ".config/herdr-core/claude/worker-prompt.md"
 target = ".config/herdr-core/claude/worker-prompt.md"
 mode = "link"
 
+# mod はファイルごとにリンクする（フォルダごとだと Herdr app が書く jsconfig.json・*.d.ts が入る）。
+[[config]]
+name = "Herdr app 監督役ボード（Changes パネルの代わりの mod）"
+source = ".config/herdr-app/mods/supervisor-board/main.js"
+target = ".config/herdr-app/mods/supervisor-board/main.js"
+mode = "link"
+
+[[config]]
+name = "Herdr app 監督役ボードの配置"
+source = ".config/herdr-app/mods/supervisor-board/mod.json"
+target = ".config/herdr-app/mods/supervisor-board/mod.json"
+mode = "link"
+
+# main レイアウトの複製で、Changes パネルの中身だけを監督役ボードにしたもの。
+[[config]]
+name = "Herdr app レイアウト board"
+source = ".config/herdr-app/layouts/board.json"
+target = ".config/herdr-app/layouts/board.json"
+mode = "link"
+
 [[config]]
 name = "Codex worktree launcher"
 source = ".local/bin/codex-worktree"
