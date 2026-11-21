@@ -109,7 +109,7 @@ hc-supervisor      # 監督役を起動。Herdr app のタブから実行する�
 hc-supervisor status
 hc-supervisor board  # 進捗ボードを表示（どのセッションからでも）
 hc-supervisor stop # 止める（ワーカーは止まらない）
-hc-supervisor restart  # 引き継ぎを書かせてから作り直す（プロンプトや設定の変更を反映する）
+hc-supervisor restart  # 引き継ぎを書かせてから、同じ terminal の中で Claude Code を起動し直す（プロンプトや設定の変更を反映する）
 hc attach supervisor   # 端末から見る場合。Ctrl+\ で離れる（止まらない）
 ```
 
@@ -139,7 +139,9 @@ Herdr app の端末での貼り付けは **Ctrl+Shift+V**（または右クリ�
 - 手動セッション: Herdr app で新しいタブを開いて使えます。権限確認は `~/.claude/settings.json` のとおりで、監督役は関与しません（相談したいときは `hc send supervisor`）。
 - 監督役の作り直し（`hc-supervisor restart`）: プロンプトや設定を変えたときは、監督役に「再起動して」と頼むか、端末で `hc-supervisor restart` を実行します。ワーカーとのやり取りを止めずに入れ替わります。
   1. 動いている監督役が、進行中のワーカー・回答待ちの相談・未回答の質問を `~/.local/share/hc-supervisor/handoff.md` に書く（端末から実行したときは `【再起動の準備】` の依頼が届き、書き終えるまで最大 10 分待つ）。書かれなければ何も止めずに終わる。
-  2. 古い監督役を止め、同じ名前 `supervisor`・Herdr app の同じタブで起動し直す。監督役が自分で実行したときは、親のない別の terminal（`supervisor-restart`）に切り離して行い、結果を `~/.local/share/hc-supervisor/restart.log` に残す。
+  2. 監督役の terminal は消さず、その中の Claude Code だけを止めて起動し直す（最初の依頼文は起動時と同じ「監督を開始してください。」）。terminal のアドレス（tN）・名前・Herdr app のタブはそのままなので、監督役が起動したワーカーは新しい監督役の子のまま（`hc get <ワーカー>` の `parent` が変わらず、`hc wait --children` で待てる）。監督役が自分で実行したときは、親のない別の terminal（`supervisor-restart`）に切り離して行い、結果を `~/.local/share/hc-supervisor/restart.log` に残す。
+     - 仕組み: 監督役の `hc-claude supervisor` は claude を `exec` せず子として動かし、`~/.local/state/hc-claude/<tN>.pid` に自分の pid を書く。`hc-supervisor restart` は `<tN>.restart` に依頼文を書いてから claude を SIGTERM で止め（15 秒で止まらなければ SIGKILL）、`hc-claude` が依頼文で claude を起動し直す。claude が自分で終わったとき（`/exit` など）は `.restart` が無いので、そのまま終わる。
+     - 入れ替えられないとき（この仕組みより前の `hc-claude` で起動した監督役など、`<tN>.pid` が無い）は、従来どおり terminal を消して同じ名前・同じタブで作り直し、「新しい監督役の子になりません」と知らせる。この場合、それまでのワーカーの `parent` は消えた terminal を指したままになる。
   3. 新しい監督役は handoff を読み、`role=worker` の terminal の画面を確かめて、入れ替わりの間に届かなかった報告・相談を拾う。ワーカーは `--outlive-parent` なので動き続け、報告先は名前の `supervisor` なので新しい監督役に届く。入れ替わりの数秒に `hc send supervisor` が失敗したワーカーは、報告を画面に書いてターンを終える。
   文脈が大きくなったときも、監督役が同じ手順で自分を作り直します。
 - `hc-supervisor` は監督役を `--keep` で起動します。herdr-core の再起動後、監督役の terminal はシェルになります。`hc-supervisor stop` の後に `hc-supervisor` で起動し直してください（シェルに引き継ぎの依頼を打ち込まないよう、`restart` は使いません）。
