@@ -826,5 +826,178 @@ class DelegationConfigTest(FixtureCase):
         self.assertIn("over_delegation", data["waste"]["rules"])
 
 
+# ---- タスク単位の記録（#48） ------------------------------------------------
+
+PATTERN = METRICS.DEFAULT_WASTE["task_branch_pattern"]
+
+
+def task_record(session_id, branch, *, cost, started, repo="dotfiles", role="worker", restart=None,
+                waste_cost=None, config_hash="aaa", subagent_cost=0, cwd="/w", models=("m1",)):
+    record = {"session_id": session_id, "started_at": started, "cwd": cwd,
+              "git": {"repo": repo, "branch": branch}, "hc": {"terminal": "t1", "role": role},
+              "total": {"requests": 10, "weighted_cost": cost},
+              "main": {"L1": {"context": {"max": int(cost / 10)}}, "by_model": {model: {} for model in models}},
+              "subagents": {"L0": {"weighted_cost": subagent_cost}, "by_model": {}}}
+    if restart is not None:
+        record["restart"] = restart
+    if waste_cost is not None:
+        record["waste"] = {"config_hash": config_hash, "total": {"weighted_cost": waste_cost},
+                           "rules": {"reread_file": {"weighted_cost": waste_cost * 0.75},
+                                     "cache_rewrite": {"weighted_cost": waste_cost * 0.25},
+                                     "oversized_output": {"weighted_cost": 0}}}
+    return record
+
+
+def transcript_lines(session_id, branch, cwd, first="始めて"):
+    meta = {"sessionId": session_id, "version": VERSION, "gitBranch": branch, "cwd": cwd}
+    return [{"type": "user", **meta, "timestamp": "2026-11-14T01:00:00.000Z",
+             "message": {"role": "user", "content": first}},
+            {**assistant("req_1", "m1", usage(10, 100, 0, 5), [{"type": "text", "text": "了解"}]), **meta}]
+
+
+class TaskKeyTest(unittest.TestCase):
+    def test_rules(self):
+        cases = [
+            ({"git": {"repo": "dotfiles", "branch": "feature/issue-12-x"}}, "dotfiles#12"),
+            ({"git": {"repo": "mlbot-dev", "branch": "epic-201-summary"}}, "mlbot-dev#201"),
+            ({"git": {"repo": "mlbot-dev", "branch": "docs/epic-201-summary"}}, "mlbot-dev#201"),
+            ({"git": {"repo": "dotfiles", "branch": "fix/no-issue-y"}}, "dotfiles:fix/no-issue-y"),
+            ({"git": {"repo": "dotfiles", "branch": "main"}, "cwd": "/x"}, "cwd:/x"),
+            ({"git": {"repo": "dotfiles", "branch": "master"}, "cwd": "/x"}, "cwd:/x"),
+            ({"git": {"repo": "dotfiles", "branch": "feature/issue-12-x"}, "hc": {"role": "supervisor"}},
+             "supervisor"),
+            ({"git": {"repo": None, "branch": None}, "cwd": "/x"}, "cwd:/x"),
+            ({"cwd": "/x"}, "cwd:/x"),  # git の無い古い記録
+            ({"git": {"repo": None, "branch": "feature/issue-7-y"}}, "?#7"),
+            ({"git": {"repo": "dotfiles", "branch": "tissue-3"}}, "dotfiles:tissue-3"),
+        ]
+        for record, expected in cases:
+            with self.subTest(record=record):
+                self.assertEqual(METRICS.task_key(record, PATTERN), expected)
+
+    def test_non_numeric_group_and_broken_fields_do_not_crash(self):
+        record = {"git": {"repo": "r", "branch": "feature/issue-abc"}, "cwd": "/x"}
+        self.assertEqual(METRICS.task_key(record, r"(issue-\w+)"), "r:feature/issue-abc")
+        self.assertEqual(METRICS.task_key({"git": {"repo": "r", "branch": "epic"}}, r"issue-(\d+)|epic"), "r:epic")
+        self.assertEqual(METRICS.task_key({"hc": "x", "git": "y", "cwd": "/x"}, PATTERN), "cwd:/x")
+
+    def test_pattern_is_validated(self):
+        for value in ("issue-\\d+", "(", 3):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                METRICS._waste_value("task_branch_pattern", value)
+        self.assertEqual(METRICS._waste_value("task_branch_pattern", "gh-(\\d+)"), "gh-(\\d+)")
+        record = {"git": {"repo": "r", "branch": "feature/gh-5"}}
+        self.assertEqual(METRICS.task_key(record, "gh-(\\d+)"), "r#5")
+
+
+class TaskRecordTest(FixtureCase):
+    def sessions_file(self):
+        return self.root / "data" / "claude-token-metrics" / "sessions.jsonl"
+
+    def git(self, *args):
+        # pre-commit hook から実行されると GIT_DIR・GIT_INDEX_FILE などが入っているので、外して一時リポジトリだけを触る
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        subprocess.run(["git", *args], check=True, capture_output=True,
+                       env=dict(env, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null"))
+
+    def record(self, cwd, **env):
+        hook = json.dumps({"session_id": SESSION, "transcript_path": str(self.transcript), "cwd": cwd,
+                           "reason": "other"})
+        environment = {key: value for key, value in self.env.items()
+                       if key not in ("HC_TERMINAL_ID", "HC_CLAUDE_ROLE", "CLAUDE_CTX_GUARD_TOKENS")}
+        result = subprocess.run([sys.executable, str(SCRIPT), "record", "--foreground"], input=hook, text=True,
+                                capture_output=True, env={**environment, **env}, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(self.sessions_file().read_text().splitlines()[-1])
+
+    def test_record_adds_git_hc_and_budget(self):
+        repo, worktree = self.root / "myrepo", self.root / "wt" / "feature-issue-9-x"
+        self.git("init", "-q", "-b", "main", str(repo))
+        self.git("-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                 "commit", "-q", "--allow-empty", "-m", "init")
+        self.git("-C", str(repo), "worktree", "add", "-q", "-b", "feature/issue-9-x", str(worktree))
+        record = self.record(str(worktree), HC_TERMINAL_ID="t7", HC_CLAUDE_ROLE="worker",
+                             CLAUDE_CTX_GUARD_TOKENS="120000")
+        self.assertEqual(record["git"], {"repo": "myrepo", "branch": "feature/issue-9-x", "branch_source": "git"})
+        self.assertEqual(record["hc"], {"terminal": "t7", "role": "worker"})
+        self.assertEqual(record["ctx_budget"], 120000)
+        self.assertEqual(record["waste"]["rules"]["context_bloat"]["budget"], 120000)
+        self.assertEqual(METRICS.task_key(record, PATTERN), "myrepo#9")
+
+    def test_record_without_git_falls_back_to_transcript(self):
+        write_jsonl(self.transcript, transcript_lines(SESSION, "feature/issue-5-y", "/gone")
+                    + transcript_lines(SESSION, "HEAD", "/gone")[:1])
+        record = self.record(str(self.root / "missing"))
+        self.assertEqual(record["git"], {"repo": None, "branch": "feature/issue-5-y", "branch_source": "transcript"})
+        self.assertEqual(record["hc"], {"terminal": None, "role": None})
+        self.assertIsNone(record["ctx_budget"])
+        self.assertEqual(METRICS.task_key(record, PATTERN), "?#5")
+
+    def write_records(self, records):
+        self.sessions_file().parent.mkdir(parents=True, exist_ok=True)
+        self.sessions_file().write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    def test_report_by_task(self):
+        branch = "feature/issue-48-task-records"
+        self.write_records([
+            task_record("s1", branch, cost=1000.0, started="2026-11-22T01:00:00Z",
+                        restart={"kind": "fresh", "startup_cost": 50.0}, waste_cost=100.0, subagent_cost=200),
+            task_record("s2", branch, cost=600.0, started="2026-11-22T02:00:00Z",
+                        restart={"kind": "resume_worker", "startup_cost": 80.0}, waste_cost=60.0,
+                        config_hash="bbb", models=("m2",)),
+            task_record("s3", "feature/issue-50-z", cost=300.0, started="2026-11-22T03:00:00Z"),
+            task_record("s4", "main", cost=10.0, started="2026-11-22T04:00:00Z", role="supervisor"),
+            task_record("s0", "feature/issue-50-z", cost=1.0, started="2026-11-20T00:00:00Z"),
+        ])
+        result = self.run_cli("report", "--by", "task", "--since", "2026-11-21", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = {row["task"]: row for row in json.loads(result.stdout)}
+        self.assertEqual(list(rows), ["dotfiles#48", "dotfiles#50", "supervisor"])
+        task = rows["dotfiles#48"]
+        self.assertEqual((task["sessions"], task["resumed"], task["requests"]), (2, 1, 20))
+        self.assertEqual(task["weighted_cost"], 1600.0)
+        self.assertAlmostEqual(task["restart_ratio"], 80 / 1600)
+        self.assertAlmostEqual(task["subagent_cost_share"], 200 / 1600)
+        self.assertAlmostEqual(task["waste_share"], 160 / 1600)
+        self.assertEqual(task["waste_top"], ["reread_file", "cache_rewrite"])
+        self.assertEqual((task["context_max"], task["models"]), (100, ["m1", "m2"]))
+        self.assertEqual((task["config_hashes"], task["sessions_without_waste"]), (["aaa", "bbb"], 0))
+        other = rows["dotfiles#50"]
+        self.assertEqual((other["sessions"], other["resumed"], other["restart_ratio"]), (1, None, None))
+        self.assertEqual((other["waste_share"], other["waste_top"], other["sessions_without_waste"]), (None, [], 1))
+
+        table = self.run_cli("report", "--by", "task", "--since", "2026-11-21")
+        self.assertEqual(table.returncode, 0, table.stderr)
+        lines = {line.split()[0]: line.split() for line in table.stdout.splitlines()}
+        self.assertIn("10.0%*", lines["dotfiles#48"])  # config_hash が 2 つ
+        self.assertEqual(lines["dotfiles#50"][2], "-")  # resumed（restart の無い記録）
+        self.assertEqual(lines["dotfiles#50"][7], "-")  # waste
+        self.assertIn("config_hash", table.stderr)
+
+    def test_rescan_only_recent_and_inherits_hc(self):
+        projects = self.root / "rescan-projects"
+        recent, old = projects / "-p" / "new-session.jsonl", projects / "-p" / "old-session.jsonl"
+        write_jsonl(recent, transcript_lines("new-session", "feature/issue-12-x", str(self.root / "gone")))
+        write_jsonl(old, transcript_lines("old-session", "feature/issue-13-x", str(self.root / "gone")))
+        os.utime(old, (1_700_000_000, 1_700_000_000))  # 2023-11
+        self.write_records([{"session_id": "new-session", "reason": "clear", "cwd": "/orig",
+                             "git": {"repo": "dotfiles", "branch": "x"},
+                             "hc": {"terminal": "t9", "role": "worker"}, "ctx_budget": 1000}])
+        result = self.run_cli("rescan", "--since", "2026-01-01", "--projects", str(projects))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [json.loads(line) for line in self.sessions_file().read_text().splitlines()]
+        self.assertEqual([line["session_id"] for line in lines], ["new-session", "new-session"])
+        record = lines[-1]
+        self.assertEqual(record["hc"], {"terminal": "t9", "role": "worker"})
+        self.assertEqual((record["ctx_budget"], record["reason"], record["cwd"]), (1000, "clear", "/orig"))
+        self.assertEqual(record["waste"]["rules"]["context_bloat"]["budget"], 1000)
+        self.assertEqual(record["git"], {"repo": "dotfiles", "branch": "feature/issue-12-x",
+                                         "branch_source": "transcript"})
+        self.assertTrue(record["rescanned"])
+        rows = json.loads(self.run_cli("report", "--by", "task", "--json").stdout)
+        self.assertEqual([(row["task"], row["sessions"]) for row in rows], [("dotfiles#12", 1)])
+        self.assertEqual(self.run_cli("rescan", "--projects", str(projects)).returncode, 2)  # --since は必須
+
+
 if __name__ == "__main__":
     unittest.main()

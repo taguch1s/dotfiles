@@ -7,6 +7,8 @@ claude-token-metrics session ~/.claude/projects/-home-issei/<session>.jsonl   # 
 claude-token-metrics report --since 2026-11-14          # 記録済みセッションの表
 claude-token-metrics report --json                      # 同じ内容を JSON の配列で
 claude-token-metrics waste <transcript.jsonl>           # 無駄の検出結果をルール別の表で（下の「無駄の検出」）
+claude-token-metrics report --by task --since 2026-11-22 # タスク（Issue）ごとの表（下の「タスク単位の集計」）
+claude-token-metrics rescan --since 2026-11-14          # transcript を集計し直して記録に追記する
 ```
 
 ## SessionEnd hook の導入
@@ -31,7 +33,7 @@ claude-token-metrics waste <transcript.jsonl>           # 無駄の検出結果�
 
 ## 出力（schema `claude-token-metrics/v1`）
 
-- 先頭：`session_id`、`transcript_path`、`version`（Claude Code）、`versions`、`started_at` / `ended_at`、`weights`、`weights_source`、`skipped`（`broken_lines`、`no_usage`、`synthetic`）。`record` はさらに `recorded_at`、`reason`、`cwd` を足す。
+- 先頭：`session_id`、`transcript_path`、`version`（Claude Code）、`versions`、`started_at` / `ended_at`、`weights`、`weights_source`、`skipped`（`broken_lines`、`no_usage`、`synthetic`）。`record` はさらに `recorded_at`、`reason`、`cwd`、`git`、`hc`、`ctx_budget` を足す（下の「タスク単位の集計」）。
 - scope：`main`（本体）、`sidechain`（本体ファイル内の `isSidechain` 行）、`subagents`（`files` つき）。それぞれ次を持つ。
   - `L0`：`tokens`（`input`、`cache_creation_5m`、`cache_creation_1h`、`cache_creation`、`cache_read`、`output`、`thinking`）と `weighted_cost`
   - `L1`：`requests`、`context`（`mean`、`max`、`last`、`deciles`）、`rent_rate`（家賃率 = cache 読み込みの重み付きコスト ÷ 総コスト）、`reread_ratio`（再読倍率 = cache 読み込み ÷ (input + cache 作成)）、`drops`（文脈が半分未満かつ 1000 トークン以上減った位置）、`compact_boundaries`
@@ -160,6 +162,7 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 | `startup_cap` | 20 | 1 以上の整数 |
 | `handoff_tail` | 10 | 1 以上の整数 |
 | `handoff_write_paths` | `["codex-handoffs/", "hc-supervisor/handoff.md"]` | 文字列の配列 |
+| `task_branch_pattern` | `(?:^\|/)(?:issue\|epic)-(\d+)` | グループを 1 つ以上持つ正規表現（Python `re`）。最初のグループを Issue の番号とみなす（下の「タスク単位の集計」） |
 
 知らないキーは stderr に警告して無視する。型・範囲が不正な値や読めないファイルは、`session` / `waste` では exit 2、`record` では既定値で集計して `record.log` に理由を残す。
 
@@ -213,3 +216,69 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 - `startup_cost`：上のリクエストの重み付きコストの合計（文脈を作り直すのにかかった分）。
 - `ended_with_handoff`：最後の `handoff_tail` リクエストの中に、`handoff_write_paths` のどれかを含む path への `Write`・`Edit` がある。
 - 対象は本体のストリームだけで、サブエージェントと `sidechain` は見ない。
+
+## タスク単位の集計（report --by task・rescan、#48）
+
+セッションの記録をタスク（Issue）ごとに束ね、Issue 1 件ごとの消費量、作り直しの割合、委譲の割合、無駄トークンを比べる。記録は SessionEnd の `record` で自動に溜まり、タスク単位の表は `report --by task` を実行するたびに記録から作る（別のファイルには溜めない）。
+
+### `record` が足す項目
+
+| キー | 取り方 |
+|---|---|
+| `git.repo` | `git -C <cwd> rev-parse --path-format=absolute --git-common-dir` の親ディレクトリの名前（worktree でも本体のリポジトリ名） |
+| `git.branch` | `git -C <cwd> branch --show-current`。取れなければ transcript の本体の行で最も多い `gitBranch`（`HEAD` は数えない） |
+| `git.branch_source` | `git` / `transcript` / `null` |
+| `hc.terminal` | `HC_TERMINAL_ID` |
+| `hc.role` | `HC_CLAUDE_ROLE`（`hc-claude` が `supervisor` / `worker` を export する） |
+| `ctx_budget` | `CLAUDE_CTX_GUARD_TOKENS`（`context_bloat` の予算にも使う） |
+
+`cwd` は hook の入力、無ければ transcript の本体の行で最も多い `cwd`。git が無い、`cwd` が無い（worktree を消した後など）ときは `null` にして記録は続ける。
+
+### タスクの key
+
+記録から次の順で決める（`task_key`。`record`・`rescan`・`git` の無い古い記録に同じ規則を使う）。
+
+1. `hc.role` が `supervisor` → `supervisor`（監督役のコストはタスクに配分せず、この行にまとめる）
+2. `git.branch` が `task_branch_pattern` に当たる → `<repo>#<番号>`（`feature/issue-12-x` → `dotfiles#12`、`epic-201-summary` → `mlbot-dev#201`）
+3. ブランチがあり `main`・`master` でない → `<repo>:<branch>`（`fix/no-issue-y` など）
+4. それ以外 → `cwd:<cwd>`
+
+`git.repo` が分からないときは `?` を使う（`?#12`）。hc の引き継ぎは同じ worktree・同じブランチで続くので、作り直したワーカーのセッションも同じタスクに入る。1 つのセッションで複数の Issue を扱うと（オーケストレーター方式のメインセッションなど）、そのブランチ 1 つの key にまとまる。サブエージェントが別 worktree で作業した分も、本体のセッションの key に入る。
+
+### `report --by task`
+
+```bash
+claude-token-metrics report --by task [--since 2026-11-22] [--json]
+```
+
+`--since` はセッションの `started_at`（UTC）で絞る。タスクごとに 1 行、始まりの早い順。
+
+| 列（JSON のキー） | 定義 |
+|---|---|
+| `task` | 上の key |
+| `sessions` / `resumed` | セッション数 / そのうち `restart.kind` が `resume_*` の数。`restart` の無い記録だけなら `-`（`null`） |
+| `requests`、`weighted_cost` | セッションの合計 |
+| `restart_ratio` | `resume_*` のセッションの `startup_cost` の合計 ÷ タスクの `weighted_cost` |
+| `subagent_cost_share` | `subagents` scope の重み付きコストの合計 ÷ タスクの `weighted_cost` |
+| `waste_share` | `waste.total.weighted_cost` の合計 ÷ タスクの `weighted_cost`。`waste` の無い記録だけなら `-` |
+| `waste_top` | ルール別の重み付きコストの合計が大きい順に 3 件（0 は出さない） |
+| `context_max`、`models` | 本体の文脈の最大、使ったモデルの一覧 |
+| `config_hashes` | 記録に含まれる `waste.config_hash` の一覧。2 つ以上なら表の `waste` 列に `*` を付け、stderr に注意を出す（閾値が違う記録を比べている） |
+| `sessions_without_waste` | `waste` の無い（#46 より前の）記録の数。`waste_share` の分母には入るので、0 でなければ低めに出る |
+| `started_at`、`session_ids` | 最初のセッションの開始時刻、セッションの一覧（JSON だけ） |
+
+比較は割合（`waste_share`、`restart_ratio`、`subagent_cost_share`）と、Issue 1 件あたりの `weighted_cost` で行う。
+
+### `rescan`
+
+```bash
+claude-token-metrics rescan --since 2026-11-14 [--projects <dir>]
+```
+
+`--since` の日（UTC）以降に更新された本体の transcript（`<projects>/<dir>/*.jsonl`。既定 `~/.claude/projects`）を、今の重みと `waste.json` で集計し直して `sessions.jsonl` に追記する。後の行が使われるので、閾値を変えた後の再集計にも使える。transcript は Claude Code が古いものを消すので、消えたセッションは再集計できない（記録は残る）。
+
+- `git.branch` は transcript の本体の行で最も多い `gitBranch`、`git.repo` は transcript の `cwd` に git を実行して取る（worktree を消していて取れなければ、同じ `session_id` の既存の記録の値）。
+- `hc`・`ctx_budget`・`reason`・`cwd` は同じ `session_id` の既存の記録から引き継ぐ（無ければ `null`）。`ctx_budget` は `context_bloat` の予算にも使う。
+- 追記した行には `"rescanned": true` が付く。1 件の集計に失敗しても他は続け、失敗があれば exit 1。
+
+確認方法（dev）：hc でワーカーを 1 件動かし、SessionEnd 後の `sessions.jsonl` の最後の行に `git.repo`・`git.branch`・`hc.role` = `worker`・`hc.terminal` が入り、`report --by task` にその Issue の行（`<repo>#<番号>`）が出ることを見る。

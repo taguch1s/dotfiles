@@ -18,6 +18,7 @@ cat >"$HC_CLAUDE_BIN" <<'EOF'
 #!/usr/bin/env bash
 (IFS=$'\x1f'; printf '%s\n' "$*") >"$(dirname "$0")/args"
 printf '%s\n' "${CLAUDE_CTX_GUARD_TOKENS-unset}" >"$(dirname "$0")/ctx"
+printf '%s\n' "${HC_CLAUDE_ROLE-unset}" >"$(dirname "$0")/role"
 EOF
 chmod +x "$HC_CLAUDE_BIN"
 
@@ -90,6 +91,13 @@ for bad in abc 0 -1 1e5 ''; do
   [[ -z "$bad" || -s "$fixture/err" ]] || { ng "不正な上書き値 '$bad' を黙って捨てた"; bad_ok=0; }
 done
 [[ "$bad_ok" == 1 ]] && ok '閾値: 正の整数でない上書き値は警告して既定に戻す（起動は止めない）'
+
+# 役割（claude-token-metrics record が hc.role に記録する）。呼び出し元の値は持ち込まない。
+role_of() { cat "$fixture/bin/role"; }
+HC_CLAUDE_ROLE=supervisor "$launcher" worker x
+[[ "$(role_of)" == worker ]] && ok '役割: ワーカーは HC_CLAUDE_ROLE=worker（呼び出し元の値を上書きする）' || ng "ワーカーの役割が違う: $(role_of)"
+"$launcher" supervisor
+[[ "$(role_of)" == supervisor ]] && ok '役割: 監督役は HC_CLAUDE_ROLE=supervisor' || ng "監督役の役割が違う: $(role_of)"
 
 # hc 上の監督役: claude が終わったとき入れ替えの印があれば、印の依頼文で起動し直す。
 state="$fixture/state"
