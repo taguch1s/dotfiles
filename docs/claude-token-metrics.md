@@ -190,7 +190,7 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 - `agent_calls`：本体の `Agent` / `Task` の tool_use の数。
 - `subagent_cost_share`：subagents scope の重み付きコスト ÷ セッション全体（0 なら null）。
 - `subagent_tool_bytes`：サブエージェントのツール結果のバイト数の合計（本体に入らずに済んだ量の上限）。
-- `agent_result_bytes`：本体に返った `Agent` のツール結果のバイト数の合計。
+- `agent_result_bytes`：本体に返った `Agent` のツール結果のバイト数の合計。バックグラウンド実行のサブエージェントでは、起動時の受付メッセージだけで、後から `<task-notification>` として届く本当の結果は含まない（`compression` は小さめに出る）。
 - `compression`：`agent_result_bytes ÷ subagent_tool_bytes`（小さいほど、委譲で本体の文脈を守れている。分母が 0 なら null）。
 - `main_tool_bytes`：本体（`Agent` の結果を除く）のツール結果のバイト数。`sidechain` は含めない。
 - `unlinked`：meta.json と対応づけられなかったファイルの数。
@@ -208,7 +208,7 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 
 ### `restart`
 
-- `kind`：`resume_worker`（最初の人の発言が `resume_markers` のどれかで始まる。`hc-supervisor resume-worker` の `【再開】<handoff の path>`）、`resume_supervisor`（本体の最初の `resume_window` リクエストの中で、`supervisor_handoff_paths` のどれかを含む path を `Read` するか、それを含む `Bash` を実行した。`hc-supervisor restart` 後の監督役）、`fresh`（どちらでもない）。`resume_worker` を先に判定する。
+- `kind`：`resume_worker`（最初の人の発言のいずれかの行が `resume_markers` のどれかで始まる（hc は依頼を `<pasted_content>`・`<hc …>` で包むので、先頭の行とは限らない）。`hc-supervisor resume-worker` の `【再開】<handoff の path>`）、`resume_supervisor`（本体の最初の `resume_window` リクエストの中で、`supervisor_handoff_paths` のどれかを含む path を `Read` するか、それを含む `Bash` を実行した（失敗した呼び出しは数えない）。`hc-supervisor restart` 後の監督役）、`fresh`（どちらでもない）。`resume_worker` を先に判定する。
 - `startup_requests`：最初の編集系ツール（`Edit`・`MultiEdit`・`Write`・`NotebookEdit`）か `git commit` を含む `Bash` を出したリクエストより前のリクエスト数（そのリクエストは含めない）。`startup_cap` で打ち切る。編集がないセッション（調査だけ）は全リクエスト、または `startup_cap` まで伸びる近似である。
 - `startup_cost`：上のリクエストの重み付きコストの合計（文脈を作り直すのにかかった分）。
 - `ended_with_handoff`：最後の `handoff_tail` リクエストの中に、`handoff_write_paths` のどれかを含む path への `Write`・`Edit` がある。

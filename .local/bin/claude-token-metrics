@@ -879,12 +879,14 @@ def delegation_metrics(path: Path, streams: list[tuple[str, str, Stream]], weigh
 def restart_metrics(main: Stream, weights: dict, config: dict) -> dict:
     """セッションが作り直し（handoff からの再開・監督役の再起動）か、立ち上げにかかったコスト（Issue #47）。"""
     requests = main.requests
+    errors = {result["id"] for result in main.results if result["is_error"]}
     calls = []  # (リクエストの位置, ツール名, input)
     for tool_id in main.tool_order:
         index = main.tool_request.get(tool_id)
         if index is not None:
             name, tool_input = main.tools[tool_id]
-            calls.append((index, name, tool_input if isinstance(tool_input, dict) else {}))
+            if tool_id not in errors:  # 失敗した呼び出し（無いファイルの Read など）は数えない
+                calls.append((index, name, tool_input if isinstance(tool_input, dict) else {}))
 
     def touches(name: str, tool_input: dict, paths: list[str], names: tuple[str, ...]) -> bool:
         target = tool_input.get("file_path") if name in names else None
@@ -892,8 +894,9 @@ def restart_metrics(main: Stream, weights: dict, config: dict) -> dict:
         return any((isinstance(target, str) and path in target) or (isinstance(command, str) and path in command)
                    for path in paths)
 
-    first = (main.first_human or "").lstrip()
-    if any(first.startswith(marker) for marker in config["resume_markers"]):
+    # hc は依頼を <pasted_content>・<hc …> で包むので、マーカーは先頭でなくいずれかの行の頭にあればよい
+    lines = [line.lstrip() for line in (main.first_human or "").splitlines()]
+    if any(line.startswith(marker) for line in lines for marker in config["resume_markers"]):
         kind = "resume_worker"
     elif any(index < config["resume_window"]
              and touches(name, tool_input, config["supervisor_handoff_paths"], ("Read", "Bash"))

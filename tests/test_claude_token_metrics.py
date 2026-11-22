@@ -736,9 +736,6 @@ class WasteCliTest(FixtureCase):
         self.assertEqual(waste["hints"]["requests_after_budget"], 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # ---- 委譲（delegation）・作り直し（restart）・over_delegation（#47） -----------------
 
@@ -827,3 +824,7 @@ class DelegationConfigTest(FixtureCase):
         self.assertEqual(data["delegation"]["unlinked"], 1)  # agent-a1.jsonl に meta.json がない
         self.assertEqual(data["restart"]["kind"], "fresh")
         self.assertIn("over_delegation", data["waste"]["rules"])
+
+
+if __name__ == "__main__":
+    unittest.main()

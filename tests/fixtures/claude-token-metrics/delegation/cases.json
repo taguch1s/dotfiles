@@ -282,6 +282,26 @@
       "expected": {"restart": {"kind": "resume_worker", "startup_requests": 2, "startup_cost": 1575, "ended_with_handoff": false}, "rules": {}}
     },
     {
+      "name": "restart_resume_worker_wrapped",
+      "note": "hc の実際の経路では最初の人の発言が <pasted_content> と <hc …> で包まれ、【再開】 は 3 行目以降にある。それでも resume_worker",
+      "events": [
+        {"user": "<pasted_content id=\"1\">\n<hc from=\"s supervisor\">依頼</hc>\n\n【再開】/x/codex-handoffs/h.md\n</pasted_content id=\"1\">"},
+        {"req": "A", "u": [0, 1000, 0, 10]}
+      ],
+      "expected": {"restart": {"kind": "resume_worker"}, "rules": {}}
+    },
+    {
+      "name": "restart_supervisor_failed_read",
+      "note": "handoff.md の Read が is_error（ファイルが無い）なら再開とは数えず fresh",
+      "events": [
+        {"user": "起動"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Read", {"file_path": "/h/.local/share/hc-supervisor/handoff.md"}]]},
+        {"res": "t1", "fill": "e", "bytes": 50, "err": true},
+        {"req": "B", "u": [0, 0, 1100, 10]}
+      ],
+      "expected": {"restart": {"kind": "fresh"}, "rules": {}}
+    },
+    {
       "name": "restart_resume_supervisor",
       "note": "最初の 5 リクエストの中で hc-supervisor/handoff.md を Read すれば resume_supervisor",
       "events": [
