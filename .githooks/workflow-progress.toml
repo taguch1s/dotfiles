@@ -45,3 +45,7 @@ handoff = "issue-47-delegation-restart.md"
 [[issue_branch]]
 branch = "feature/issue-48-task-records"
 handoff = "issue-48-task-records.md"
+
+[[issue_branch]]
+branch = "feature/issue-44-hc-read-outside"
+handoff = "issue-44-hc-read-outside.md"

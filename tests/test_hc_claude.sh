@@ -148,6 +148,30 @@ assert any("hc-permission" in c and c.endswith(" hook") for c in commands)
 assert "PermissionRequest" not in s["hooks"]
 EOF
 
+# 作業ディレクトリの外の記録（#44）。~/.claude/settings.json の blockReadsOutsideWorkingDirectories: true は
+# どの設定ファイルの false でも外せないので、hc のセッションだけ読める範囲を additionalDirectories で足す
+# （リストは設定ファイルの間で足し合わされる）。手動セッション（ユーザー設定）の読み取り制限は弱めない。
+# --add-dir は対話セッションで信頼の確認を出しうるので、hc-claude の引数では足さない（上のワーカー・監督役の
+# 引数の完全一致の検査が、--add-dir を渡さないことも確かめている）。
+python3 - "$repository_root/.config/herdr-core/claude/session-settings.json" "$repository_root/.claude/settings.json" <<'EOF' \
+  && ok 'session-settings: 計測の記録（~/.claude/projects・claude-token-metrics・hc-supervisor）を additionalDirectories で読める範囲に足し、ユーザー設定の読み取り制限は変えない' \
+  || ng 'session-settings の読める範囲（additionalDirectories）か、ユーザー設定の読み取り制限が違う'
+import json, sys
+session = json.load(open(sys.argv[1]))
+user = json.load(open(sys.argv[2]))
+permissions = session["permissions"]
+assert permissions["additionalDirectories"] == [
+    "~/.claude/projects",
+    "~/.local/share/claude-token-metrics",
+    "~/.local/share/hc-supervisor",
+], permissions["additionalDirectories"]
+# 読み取りを広げるのは上の 3 つだけ。block を false にする（効かない上に誤解を招く）・allow で広げることはしない。
+assert set(permissions) == {"defaultMode", "additionalDirectories"}, sorted(permissions)
+# 手動セッションの正本（リポジトリ版 .claude/settings.json）は、外の読み取りを止めたまま、読める範囲を足さない。
+assert user["permissions"]["blockReadsOutsideWorkingDirectories"] is True
+assert "additionalDirectories" not in user["permissions"]
+EOF
+
 # 文脈予算 hook とトークン記録。ユーザー設定（リポジトリ版 .claude/settings.json → ~/.claude/settings.json）
 # と同じ command 文字列にしておくと、Claude Code が同じ hook として 1 回だけ実行する。
 python3 - "$repository_root/.config/herdr-core/claude/session-settings.json" "$repository_root/.claude/settings.json" <<'EOF' \

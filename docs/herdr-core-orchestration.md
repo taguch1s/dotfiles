@@ -76,14 +76,36 @@ supervisor（dev、role=supervisor、親なし）
 | [hc-supervisor](../.local/bin/hc-supervisor) | 監督役の起動・状態表示・停止と、引き継いだワーカーの起動し直し（`resume-worker`）。dev でだけ起動する |
 | [hc-permission](../.local/bin/hc-permission) | 事故よけの deny リスト（`hook` / `check`） |
 | [templates/claude-supervisor.md](../.config/herdr-core/templates/claude-supervisor.md) / [claude-worker.md](../.config/herdr-core/templates/claude-worker.md) / [claude-worker-sonnet.md](../.config/herdr-core/templates/claude-worker-sonnet.md) | `hc run` のテンプレート（`command: hc-claude supervisor|worker`、Sonnet のワーカーは `hc-claude worker --model sonnet`） |
-| [claude/session-settings.json](../.config/herdr-core/claude/session-settings.json) | hc 上のセッションの設定（`defaultMode: bypassPermissions`、`sandbox.enabled: false`、`PreToolUse` Bash → `hc-permission hook`、`UserPromptSubmit`・`PostToolUse` → `claude-context-guard`、`SessionEnd` → `claude-token-metrics record`） |
+| [claude/session-settings.json](../.config/herdr-core/claude/session-settings.json) | hc 上のセッションの設定（`defaultMode: bypassPermissions`、`additionalDirectories`（計測の記録。下記「作業ディレクトリの外の読み取り」）、`sandbox.enabled: false`、`PreToolUse` Bash → `hc-permission hook`、`UserPromptSubmit`・`PostToolUse` → `claude-context-guard`、`SessionEnd` → `claude-token-metrics record`） |
 | [claude/supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) / [worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) | 役割のシステムプロンプト |
 | [herdr-app/mods/supervisor-board](../.config/herdr-app/mods/supervisor-board/main.js) / [layouts/board.json](../.config/herdr-app/layouts/board.json) | Herdr app の監督役ボード。`board` レイアウト（main の複製）で Changes パネルの中身をこの mod に替える |
 
 - bypassPermissions・sandbox なしは **hc-claude で起動したセッション（監督役・ワーカー）だけ**です。Herdr app で手動で開いたセッションや VS Code の Claude Code は、各ディストリの `~/.claude/settings.json` のまま動きます。
 - `--settings` は user / project の設定より上、managed より下で効きます。`skipDangerousModePermissionPrompt`（bypassPermissions の初回確認を出さない）は `--settings` からは効かないため、dev の `~/.claude/settings.json` に `setup-dev-distro.sh` が入れます。
-- `permissions.blockReadsOutsideWorkingDirectories: true` を `~/.claude/settings.json` に入れている場合、どの scope からも外せません。ワーカーのファイルツール（Read など）は worktree の外で止まります（Bash は対象外）。
+- `permissions.blockReadsOutsideWorkingDirectories: true` を `~/.claude/settings.json` に入れている場合、どの scope からも外せません。ファイルツール（Read など）は作業ディレクトリの外で拒否され、Bash も `bypassPermissions` のまま許可の確認で止まることがあります。hc のセッションでの扱いは下の「作業ディレクトリの外の読み取り」。
 - 報告先は名前の `supervisor` に固定しています。監督役を作り直しても、ワーカーの報告は新しい監督役に届きます。
+
+### 作業ディレクトリの外の読み取り
+
+`~/.claude/settings.json` の `permissions.blockReadsOutsideWorkingDirectories: true` は、手動のセッションで作業ディレクトリの外を読ませないための設定です。hc のセッションも同じファイルを読むので、`bypassPermissions` でも次のように止まります（Issue #44。#17 の実機確認ではワーカーが約 10 回止まり、そのたびに監督役が `hc keys` で答えた）。
+
+- ファイルツール（Read・Grep・Glob）: 作業ディレクトリの外は拒否。
+- Bash（sandbox なしの hc のセッション）: 作業ディレクトリの外の path を引数・リダイレクト先に書いたコマンド、実行時に決まる path（シェル変数、`$(…)`、`xargs`）、インタープリタへのその場のコード（`python3 -c`、`python3 -` とヒアドキュメント、`bash -c` など）、解析器が追えないコマンド（`cd` を何度もする、サブシェル）、安全と分からない環境変数の前置き、許可リストにない `sed` のスクリプトは、許可の確認（ask）になる。この確認は auto mode の分類器でも通せず、sandbox がこの block を強制しているときだけ出ない。hc のセッションは sandbox なし（上記「なぜ sandbox をやめたか」）なので出る。
+
+hc のセッションでの扱い:
+
+| 方法 | 採否 | 根拠 |
+| --- | --- | --- |
+| `session-settings.json` で `blockReadsOutsideWorkingDirectories: false` | 採らない（効かない） | settings reference の Scope: "A `true` in any file applies"、`false` は "the same as unset; the block still applies if another file sets `true`"。settings の "Exceptions to managed settings precedence" でも `true` from any scope（v2.1.257 以降） |
+| `session-settings.json` の `permissions.additionalDirectories` で計測の記録を足す | 採る | settings の "Lists merge instead of overriding"（リストは設定ファイルの間で足し合わされる。ユーザー設定の `additionalDirectories` は消えない）。`--settings` は user・project・local より上、managed より下。block の対象外になる作業ディレクトリから除かれるのは、リポジトリの設定（`.claude/settings.json` と追跡された `.claude/settings.local.json`）が足したものだけ |
+| `hc-claude` の引数に `--add-dir` | 採らない | 対話セッションで信頼されていないフォルダを足すと、先に信頼の確認を出す（permissions の Working directories の注、v2.1.326 以降）。ワーカーが起動時に止まりうる。足したフォルダの `.claude/skills` なども読み込む |
+| hc のセッションで sandbox を有効にする | 採らない | #26 の判断（上記「なぜ sandbox をやめたか」）と逆になる |
+
+足したのは `~/.claude/projects`（transcript）、`~/.local/share/claude-token-metrics`（トークン記録）、`~/.local/share/hc-supervisor`（監督役の判断・ボード・handoff）の 3 つです。ユーザー設定（リポジトリ版 `.claude/settings.json`）は変えないので、手動で開いたセッションの読み取りの制限は弱まりません。`tests/test_hc_claude.sh` が、`session-settings.json` の `additionalDirectories` がこの 3 つだけであること、ユーザー設定の block が `true` のままであることを検査します（`hc-claude` が `--add-dir` を渡さないことは、起動引数の完全一致の検査で確かめています）。
+
+`additionalDirectories` では、実行時に決まる path・その場のコード・解析器が追えないコマンドの確認は消えません。ワーカーには [worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) の「作業ディレクトリの外を読む」で、集計を scratchpad のスクリプト 1 本にして変数も `cd` もない 1 コマンドで実行する、`sed -i` ではなく Edit ツールを使う、などの書き方を指示しています。スクリプトで読むのも作業ディレクトリと上の 3 つだけにし、それ以外の外を読む必要があるときは監督役に相談させます。
+
+根拠（2026-11-22 に確認、Claude Code 2.1.330）: [settings](https://code.claude.com/docs/en/settings)（"Lists merge instead of overriding"、"Exceptions to managed settings precedence"、`--settings` の位置）、[settings reference](https://code.claude.com/docs/en/settings-reference)（`permissions.additionalDirectories`、`permissions.blockReadsOutsideWorkingDirectories`、"Let one directory through the read or write block"）、[permissions](https://code.claude.com/docs/en/permissions)（"Working directories"、"Block file-tool reads and writes outside the working directories"）。Bash の確認の種類は、インストール済みの 2.1.330 のメッセージ（"names a path that is computed at run time"、"runs inline code"、"a command the shell parser cannot analyze asks the person"）で確かめました。
 
 ### 事故よけの deny リスト
 
@@ -324,7 +346,7 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
 
 ## 確認状況
 
-- テスト（`make check` で実行）: 事故よけのルールと hook の入出力は `tests/test_hc_permission.py`、起動ラッパーの role 判定・引数・ワーカーのモデル（`--model` の検査とテンプレート）・役割ごとの閾値と、`session-settings.json` の hook は `tests/test_hc_claude.sh`、`hc-supervisor`（`resume-worker` の引数検査・止める順序・引き継ぎ回数・モデルの引き継ぎを含む）は `tests/test_hc_supervisor.sh`（偽の `hc` を使用）。
+- テスト（`make check` で実行）: 事故よけのルールと hook の入出力は `tests/test_hc_permission.py`、起動ラッパーの role 判定・引数・ワーカーのモデル（`--model` の検査とテンプレート）・役割ごとの閾値と、`session-settings.json` の hook・読める範囲（`additionalDirectories`）は `tests/test_hc_claude.sh`、`hc-supervisor`（`resume-worker` の引数検査・止める順序・引き継ぎ回数・モデルの引き継ぎを含む）は `tests/test_hc_supervisor.sh`（偽の `hc` を使用）。
 - 実機で確認済み（hc 0.1.21、2026-11-14、旧構成で確認したもの）: `hc get --json` の形、Herdr app のラベル `herdr.space` / `herdr.tab` による配置、trust ダイアログ中は `hc run` の最初の依頼文が届かない（`first_message.sent: false`）こと。
 - dev の境界（sbx-test、2026-11-14）: [wsl-dev-distro.md](wsl-dev-distro.md) の「確認済みのこと」。
 - dev での実機確認が必要なもの（#26 の最後の受け入れ条件）:
@@ -338,4 +360,5 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
 - 導入後の計測が必要なもの（#32）: [worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) の「ツール出力を絞る」。導入後のワーカー数件で、`claude-token-metrics session` / `report` の L2（`by_tool` の Bash の `raw_bytes` 中央値、`new_info_rate`）と 1 リクエストあたりの文脈増分を導入前（#32 の本文の値）と比べます。下がらなければ、hook で出力を切り詰める対策を別 Issue にします。
 - dev での実機確認と導入後の計測が必要なもの（#33）: 監督役が `claude-worker-sonnet` で起動したワーカーの transcript の model が Sonnet になること、`claude-worker` では Opus のままであること（hc のテンプレートの `command` に `--model sonnet` を足しても引数として渡ることは、偽の `hc` でしか確かめていません）。導入後、Sonnet で実行した Issue の PR までの完了率・差し戻しの回数と Issue 1 件あたりのコスト（`by_model`）を、Opus の場合と比べます。
 - dev での実機確認が必要なもの（#48）: 上の「実機で確かめる」のタスク単位の記録。ワーカーの SessionEnd の行に `git.*`・`hc.role` = worker・`hc.terminal` が入り、`report --by task` にその Issue の行が出ること。過去の transcript での確認（2026-11-22、一時の `XDG_DATA_HOME` で `rescan --since 2026-11-21` → `report --by task`）: 28 セッションを 19 タスクにまとめ、`mlbot-dev#238`・`dotfiles#48` などが Issue ごとの行になり、`restart.kind` は fresh 15・resume_worker 8・resume_supervisor 5、`cache_rewrite_by_cause` は idle 4・tool_wait 5 でした。#48 より前の記録には `hc` が無いので、監督役のセッションは `supervisor` ではなく `cwd:~/.local/share/hc-supervisor` の行になり、merge 後に worktree を消した #46・#47 は `git.repo` が取れず `?#46`・`?#47` になります。
+- dev での実機確認が必要なもの（#44）: cwd が dotfiles の worktree のワーカーで、`~/.claude/projects` の transcript と `~/.local/share/claude-token-metrics/sessions.jsonl` を読む集計（Read ツールと、scratchpad のスクリプトを `python3 <絶対 path>` で実行する Bash の両方）が許可の確認なしで通ること。`--settings` の `additionalDirectories` が block の対象外になることは公式ドキュメントの記述（リストの足し合わせと、除かれるのはリポジトリの設定だけ）とインストール済みの 2.1.330 のコードの読解からの判断で、hc のワーカーではまだ確かめていません。`~/` で書いた entry が展開されることも同時に確かめます（ユーザー設定の `additionalDirectories` は `~/` の entry で効いている）。通らなければ `hc-claude` で `--add-dir` を渡す案（信頼の確認が出ないか確かめる）に切り替えます。
 - 導入後の計測が必要なもの（#34）: 上の「報告・相談の形と受理の確認」。導入後の監督役で、`claude-token-metrics report` の受理 1 件あたりのリクエスト数と平均文脈を、導入前（#34 の本文の値: 103 リクエスト・平均文脈 109k、31 リクエスト・平均 80k）と比べます。受理の確認の `gh pr view --jq` は、CI の無い PR（このリポジトリ）と CI のある公開リポジトリの PR（成功・失敗・実行中・StatusContext の `PENDING`）で出力を確かめました。

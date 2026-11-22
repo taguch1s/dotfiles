@@ -1,7 +1,12 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
-    "defaultMode": "bypassPermissions"
+    "defaultMode": "bypassPermissions",
+    "additionalDirectories": [
+      "~/.claude/projects",
+      "~/.local/share/claude-token-metrics",
+      "~/.local/share/hc-supervisor"
+    ]
   },
   "sandbox": {
     "enabled": false
