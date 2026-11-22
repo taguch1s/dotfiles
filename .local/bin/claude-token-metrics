@@ -24,7 +24,10 @@ assistant 行は 1 リクエストが複数行に分かれるので requestId �
   claude-token-metrics waste [--json] [--waste-config <path>] <transcript.jsonl>
       無駄検出の結果をルール別の表で出す。設定は ${XDG_CONFIG_HOME:-~/.config}/claude-token-metrics/waste.json
   claude-token-metrics record [--foreground]   SessionEnd hook 用（stdin の JSON を読む）
-  claude-token-metrics report [--since YYYY-MM-DD] [--json]
+  claude-token-metrics report [--by session|task] [--since YYYY-MM-DD] [--json]
+      記録の表。--by task はタスク（Issue）ごとにまとめる
+  claude-token-metrics rescan --since YYYY-MM-DD [--projects <dir>]
+      --since 以降に更新された transcript を集計し直して記録に追記する
   claude-token-metrics calibrate [--since YYYY-MM-DD] [--json] [--write]
       claude-statusline が記録した使用率の変化から、トークン種類ごとの重みを推定する
 記録先: ${XDG_DATA_HOME:-~/.local/share}/claude-token-metrics/sessions.jsonl
@@ -217,6 +220,12 @@ class Transcript:
         self.version: str | None = None
         self.session_id: str | None = None
         self.timestamps: list[str] = []
+        self.branches: dict[str, int] = {}  # 本体の行の gitBranch -> 行数（出た順を保つ）
+        self.cwds: dict[str, int] = {}  # 本体の行の cwd -> 行数
+
+    def most_common(self, counts: dict[str, int]) -> str | None:
+        """最も多い値。同数なら先に出た方。"""
+        return max(counts, key=lambda key: counts[key], default=None) if counts else None
 
     def read(self, path: Path, *, split_sidechain: bool) -> tuple[Stream, Stream]:
         """1 ファイルを読み、(本体, sidechain) の Stream を返す。split しないときは本体だけに入れる。"""
@@ -248,6 +257,13 @@ class Transcript:
                 self.session_id = line["sessionId"]
             if isinstance(line.get("timestamp"), str):
                 self.timestamps.append(line["timestamp"])
+            if not line.get("isSidechain"):
+                branch, cwd = line.get("gitBranch"), line.get("cwd")
+                # HEAD は detached か git の外（hc の監督役の作業場所など）なのでブランチとみなさない
+                if isinstance(branch, str) and branch and branch != "HEAD":
+                    self.branches[branch] = self.branches.get(branch, 0) + 1
+                if isinstance(cwd, str) and cwd:
+                    self.cwds[cwd] = self.cwds.get(cwd, 0) + 1
 
     def _line(self, line: dict, stream: Stream, tools: dict) -> None:
         kind, message = line.get("type"), line.get("message")
@@ -455,6 +471,8 @@ DEFAULT_WASTE = {
     "startup_cap": 20,
     "handoff_tail": 10,
     "handoff_write_paths": ["codex-handoffs/", "hc-supervisor/handoff.md"],
+    # タスク（Issue）単位の集計（report --by task、#48）。最初のグループを Issue の番号とみなす
+    "task_branch_pattern": r"(?:^|/)(?:issue|epic)-(\d+)",
 }
 LIST_KEYS = ("exempt_keys", "exempt_agent_types", "resume_markers", "supervisor_handoff_paths",
              "handoff_write_paths")
@@ -471,6 +489,15 @@ def _is_int(value: object) -> bool:
 
 def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _valid_branch_pattern(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return re.compile(value).groups >= 1
+    except re.error:
+        return False
 
 
 def _waste_value(key: str, value: object) -> object:
@@ -490,6 +517,7 @@ def _waste_value(key: str, value: object) -> object:
         "startup_cap": (lambda v: _is_int(v) and v >= 1, "1 以上の整数"),
         "handoff_tail": (lambda v: _is_int(v) and v >= 1, "1 以上の整数"),
     }
+    checks["task_branch_pattern"] = (_valid_branch_pattern, "グループを 1 つ以上持つ正規表現の文字列")
     for list_key in LIST_KEYS:
         checks[list_key] = (lambda v: isinstance(v, list) and all(isinstance(item, str) for item in v),
                             "文字列の配列")
@@ -1048,6 +1076,11 @@ def session_waste(transcript_path: str | Path, weights: dict, waste_options: dic
 def session_metrics(transcript_path: str | Path, weights: dict, weights_source: str,
                     waste_options: dict | None = None) -> dict:
     """1 セッション分の指標を求める。出力の形は SCHEMA（claude-token-metrics/v1）。"""
+    return _session_metrics(transcript_path, weights, weights_source, waste_options)[0]
+
+
+def _session_metrics(transcript_path: str | Path, weights: dict, weights_source: str,
+                     waste_options: dict | None = None) -> tuple[dict, Transcript]:
     path = Path(transcript_path)
     options = waste_options or default_waste_options()
     transcript, streams, file_count = read_session(path)
@@ -1076,7 +1109,7 @@ def session_metrics(transcript_path: str | Path, weights: dict, weights_source: 
         "restart": restart_metrics(main, weights, options["config"]),
         "waste": waste_metrics(streams, weights, options["config"], options["source"],
                                total["weighted_cost"], options.get("budget"), delegation),
-    }
+    }, transcript
 
 
 # ---- サブコマンド -----------------------------------------------------------
@@ -1161,6 +1194,40 @@ def command_waste(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     return 0
 
 
+def _git(cwd: str, *args: str) -> str | None:
+    """git -C <cwd> <args> の 1 行目。git が無い・cwd が無い・失敗・空なら None。"""
+    if not cwd or not Path(cwd).is_dir():
+        return None
+    try:
+        # 親の git（hook など）の GIT_DIR・GIT_INDEX_FILE などが残っていると、cwd ではなくそちらを見てしまう
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        result = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=10,
+                                check=False, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = result.stdout.strip().splitlines()
+    if result.returncode != 0 or not lines:
+        return None
+    return lines[0].strip() or None
+
+
+def git_repo(cwd: str | None) -> str | None:
+    """worktree でも本体のリポジトリ名になるよう、共通の git ディレクトリの親の名前を返す。"""
+    common = _git(cwd or "", "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return (Path(common).parent.name or None) if common else None
+
+
+def git_info(cwd: str | None, transcript_branch: str | None, *, use_git_branch: bool = True) -> dict:
+    """record の git。branch は git のブランチ、取れなければ transcript の本体の行で最も多い gitBranch。"""
+    branch = _git(cwd or "", "branch", "--show-current") if use_git_branch else None
+    source = "git" if branch else ("transcript" if transcript_branch else None)
+    return {"repo": git_repo(cwd), "branch": branch or transcript_branch, "branch_source": source}
+
+
+def hc_info() -> dict:
+    return {"terminal": os.environ.get("HC_TERMINAL_ID") or None, "role": os.environ.get("HC_CLAUDE_ROLE") or None}
+
+
 def record_waste_options() -> dict:
     """record 用の設定。不正な設定は既定値にし、理由を stderr（record.log）に残す。"""
     try:
@@ -1185,15 +1252,30 @@ def record_foreground(raw: str) -> None:
     if not isinstance(transcript, str) or not Path(transcript).is_file():
         raise ValueError(f"transcript_path がありません: {transcript!r}")
     weights, source = load_weights()
-    metrics = session_metrics(transcript, weights, source, record_waste_options())
+    options = record_waste_options()
+    metrics, parsed = _session_metrics(transcript, weights, source, options)
     if isinstance(payload.get("session_id"), str):
         metrics["session_id"] = payload["session_id"]
-    metrics.update({"recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-                    "reason": payload.get("reason"), "cwd": payload.get("cwd")})
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+    try:
+        git = git_info(cwd or parsed.most_common(parsed.cwds), parsed.most_common(parsed.branches))
+    except Exception:  # noqa: BLE001 - git の情報が取れなくても記録は止めない
+        git = {"repo": None, "branch": None, "branch_source": None}
+    metrics.update({"recorded_at": now_text(), "reason": payload.get("reason"), "cwd": payload.get("cwd"),
+                    "git": git, "hc": hc_info(), "ctx_budget": options["budget"]})
+    append_records([metrics])
+
+
+def now_text() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def append_records(records: list[dict]) -> None:
     path = sessions_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(metrics, ensure_ascii=False) + "\n")
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def record_detached(raw: str) -> None:
@@ -1260,10 +1342,23 @@ def _count(value: object) -> str:
     return f"{value:,.0f}" if isinstance(value, (int, float)) else "-"
 
 
-def command_report(args: argparse.Namespace) -> int:
-    rows = [report_row(record) for record in load_records(sessions_path())]
+def _started(record: dict) -> str:
+    return record.get("started_at") or record.get("recorded_at") or ""
+
+
+def command_report(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    records = load_records(sessions_path())
     if args.since:
-        rows = [row for row in rows if (row["started_at"] or row["recorded_at"] or "")[:10] >= args.since]
+        records = [record for record in records if _started(record)[:10] >= args.since]
+    if args.by == "task":
+        try:
+            config, _, warnings = load_waste_config()
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
+        for warning in warnings:
+            print(f"claude-token-metrics: {warning}", file=sys.stderr)
+        return print_task_report(task_rows(records, config["task_branch_pattern"]), args.json)
+    rows = [report_row(record) for record in records]
     rows.sort(key=lambda row: row["started_at"] or row["recorded_at"] or "")
     if args.json:
         print(json.dumps(rows, ensure_ascii=False))
@@ -1279,6 +1374,144 @@ def command_report(args: argparse.Namespace) -> int:
     for line in lines:
         print("  ".join(cell.ljust(width) for cell, width in zip(line, widths)) + "  " + line[-1])
     return 0
+
+
+# ---- タスク（Issue）単位の集計（report --by task、rescan。#48） ------------------------
+
+def task_key(record: dict, pattern: str) -> str:
+    """記録からタスクの key を決める（record・rescan・古い記録に同じ規則を使う純粋な関数）。
+
+    1. hc.role が supervisor → "supervisor"
+    2. ブランチが pattern に当たる → "<repo>#<番号>"
+    3. ブランチがあり main・master でない → "<repo>:<branch>"
+    4. それ以外 → "cwd:<cwd>"
+    repo が分からないときは "?" を使う。"""
+    hc, git = record.get("hc") or {}, record.get("git") or {}
+    if hc.get("role") == "supervisor":
+        return "supervisor"
+    branch, repo = git.get("branch"), git.get("repo") or "?"
+    if isinstance(branch, str) and branch:
+        match = re.search(pattern, branch)
+        if match:
+            return f"{repo}#{int(match.group(1))}"
+        if branch not in ("main", "master"):
+            return f"{repo}:{branch}"
+    return f"cwd:{record.get('cwd')}"
+
+
+def _cost(value: object) -> float:
+    return value if _is_number(value) else 0.0
+
+
+def _share(numerator: float, denominator: float) -> float | None:
+    return round(numerator / denominator, 6) if denominator else None
+
+
+def task_rows(records: list[dict], pattern: str) -> list[dict]:
+    """セッションの記録をタスクごとに 1 行にまとめる。始まりの早いタスクから並べる。"""
+    groups: dict[str, list[dict]] = {}
+    for record in sorted(records, key=_started):
+        groups.setdefault(task_key(record, pattern), []).append(record)
+    rows = []
+    for key, items in groups.items():
+        cost = sum(_cost((item.get("total") or {}).get("weighted_cost")) for item in items)
+        with_restart = [item for item in items if isinstance(item.get("restart"), dict)]
+        resumed = [item for item in with_restart if str(item["restart"].get("kind", "")).startswith("resume_")]
+        with_waste = [item for item in items if isinstance(item.get("waste"), dict)]
+        rules: dict[str, float] = {}
+        for item in with_waste:
+            for rule, totals in (item["waste"].get("rules") or {}).items():
+                rules[rule] = rules.get(rule, 0.0) + _cost((totals or {}).get("weighted_cost"))
+        hashes = sorted({item["waste"]["config_hash"] for item in with_waste
+                         if isinstance(item["waste"].get("config_hash"), str)})
+        contexts = [(((item.get("main") or {}).get("L1") or {}).get("context") or {}).get("max") for item in items]
+        contexts = [value for value in contexts if _is_number(value)]
+        models = {model for item in items for scope in ("main", "sidechain", "subagents")
+                  for model in ((item.get(scope) or {}).get("by_model") or {})}
+        sub_cost = sum(_cost(((item.get("subagents") or {}).get("L0") or {}).get("weighted_cost")) for item in items)
+        rows.append({
+            "task": key,
+            "sessions": len(items),
+            "resumed": len(resumed) if with_restart else None,
+            "requests": int(sum(_cost((item.get("total") or {}).get("requests")) for item in items)),
+            "weighted_cost": round(cost, 4),
+            "restart_ratio": _share(sum(_cost(item["restart"].get("startup_cost")) for item in resumed), cost)
+            if with_restart else None,
+            "subagent_cost_share": _share(sub_cost, cost),
+            "waste_share": _share(sum(_cost((item["waste"].get("total") or {}).get("weighted_cost"))
+                                      for item in with_waste), cost) if with_waste else None,
+            "waste_top": [rule for rule, value in sorted(rules.items(), key=lambda pair: (-pair[1], pair[0]))
+                          if value > 0][:3],
+            "context_max": max(contexts, default=None),
+            "models": sorted(models - {SYNTHETIC_MODEL}),
+            "config_hashes": hashes,
+            "sessions_without_waste": len(items) - len(with_waste),
+            "started_at": _started(items[0]) or None,
+            "session_ids": [item["session_id"] for item in items],
+        })
+    return rows
+
+
+def print_task_report(rows: list[dict], as_json: bool) -> int:
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False))
+        return 0
+    header = ("task", "sess", "resumed", "req", "cost", "restart", "subagent", "waste", "no_waste", "ctx_max",
+              "models", "waste_top")
+    lines = [header]
+    for row in rows:
+        lines.append((row["task"], str(row["sessions"]), _short(row["resumed"], 7), _count(row["requests"]),
+                      _count(row["weighted_cost"]), _percent(row["restart_ratio"]),
+                      _percent(row["subagent_cost_share"]),
+                      _percent(row["waste_share"]) + ("*" if len(row["config_hashes"]) > 1 else ""),
+                      str(row["sessions_without_waste"]), _count(row["context_max"]),
+                      ",".join(row["models"]) or "-", ", ".join(row["waste_top"]) or "-"))
+    widths = [max(len(line[column]) for line in lines) for column in range(len(header) - 1)]
+    for line in lines:
+        print("  ".join(cell.ljust(width) for cell, width in zip(line, widths)) + "  " + line[-1])
+    if any(len(row["config_hashes"]) > 1 for row in rows):
+        print("* waste の設定（config_hash）が違う記録が混ざっている。比べるときは注意する", file=sys.stderr)
+    return 0
+
+
+def rescan_targets(projects: Path, since: str) -> list[Path]:
+    """--since の日（UTC）以降に更新された本体の transcript（<projects>/<dir>/*.jsonl）。"""
+    start = dt.datetime.fromisoformat(since).replace(tzinfo=dt.timezone.utc).timestamp()
+    return sorted(path for path in projects.glob("*/*.jsonl") if path.is_file() and path.stat().st_mtime >= start)
+
+
+def command_rescan(args: argparse.Namespace) -> int:
+    """transcript を集計し直して sessions.jsonl に追記する。hc.*・ctx_budget などは既存の記録から引き継ぐ。"""
+    projects = Path(args.projects) if args.projects else projects_dir()
+    if not projects.is_dir():
+        print(f"claude-token-metrics rescan: ディレクトリがありません: {projects}", file=sys.stderr)
+        return 1
+    existing = {record["session_id"]: record for record in load_records(sessions_path())}
+    weights, source = load_weights()
+    options = record_waste_options()
+    options.pop("budget")
+    written, failed = [], 0
+    for path in rescan_targets(projects, args.since):
+        try:
+            previous = existing.get(path.stem) or {}
+            budget = previous.get("ctx_budget") if _is_int(previous.get("ctx_budget")) else None
+            metrics, parsed = _session_metrics(path, weights, source, {**options, "budget": budget})
+            previous = existing.get(metrics["session_id"]) or previous
+            cwd = parsed.most_common(parsed.cwds) or previous.get("cwd")
+            git = git_info(cwd, parsed.most_common(parsed.branches), use_git_branch=False)
+            if git["repo"] is None:
+                git["repo"] = (previous.get("git") or {}).get("repo")
+            metrics.update({"recorded_at": now_text(), "reason": previous.get("reason"),
+                            "cwd": previous.get("cwd") or cwd, "git": git,
+                            "hc": previous.get("hc") or {"terminal": None, "role": None},
+                            "ctx_budget": budget, "rescanned": True})
+            written.append(metrics)
+        except Exception as error:  # noqa: BLE001 - 1 件の失敗で他の再集計を止めない
+            failed += 1
+            print(f"claude-token-metrics rescan: {path}: {error}", file=sys.stderr)
+    append_records(written)
+    print(f"rescan: {len(written)} 件を追記しました（失敗 {failed} 件）")
+    return 1 if failed else 0
 
 
 # ---- 重みの推定（calibrate） --------------------------------------------------
@@ -1644,6 +1877,11 @@ def main(argv: list[str] | None = None) -> int:
     report = commands.add_parser("report", help="記録したセッションの一覧を出す")
     report.add_argument("--since", type=since_date, help="この日（UTC）以降に始まったセッションだけ出す")
     report.add_argument("--json", action="store_true", help="表ではなく JSON の配列で出す")
+    report.add_argument("--by", choices=("session", "task"), default="session",
+                        help="session: セッションごと（既定）、task: タスク（Issue）ごとにまとめる")
+    rescan = commands.add_parser("rescan", help="--since 以降に更新された transcript を集計し直して追記する")
+    rescan.add_argument("--since", type=since_date, required=True, help="この日（UTC）以降に更新された transcript")
+    rescan.add_argument("--projects", help="トランスクリプトの場所（既定: ~/.claude/projects）")
     calibrate_parser = commands.add_parser(
         "calibrate", help="statusline が記録した使用率の変化から、トークン種類ごとの重みを推定する")
     calibrate_parser.add_argument("--since", type=since_date, help="この日（UTC）以降の記録だけ使う")
@@ -1666,7 +1904,9 @@ def main(argv: list[str] | None = None) -> int:
         return command_record(args)
     if args.command == "calibrate":
         return command_calibrate(args)
-    return command_report(args)
+    if args.command == "rescan":
+        return command_rescan(args)
+    return command_report(args, report)
 
 
 if __name__ == "__main__":

@@ -88,6 +88,8 @@ elif [[ -n "$ctx_override" ]]; then
   printf 'hc-claude: %s=%s は正の整数ではないので、既定の %s を使います。\n' "$ctx_var" "$ctx_override" "$ctx_tokens" >&2
 fi
 export CLAUDE_CTX_GUARD_TOKENS="$ctx_tokens"
+# 役割: SessionEnd の claude-token-metrics record が hc.role に記録し、タスク単位の集計で監督役を分ける（#48）。
+export HC_CLAUDE_ROLE="$role"
 
 claude_args=(--model "$model" --effort "$effort" --permission-mode bypassPermissions
   --settings "$settings" --append-system-prompt-file "$prompt")

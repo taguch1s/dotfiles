@@ -101,7 +101,7 @@ hc 上の監督役・ワーカーでは、`session-settings.json` の hook で�
 | 何を | hook | 結果 |
 | --- | --- | --- |
 | 文脈予算の警告 | `UserPromptSubmit`・`PostToolUse` → [claude-context-guard](../.local/bin/claude-context-guard) | 直近リクエストの文脈（input + cache 作成 + cache 読み込み）が閾値を超えると、handoff を促す警告が `additionalContext` としてセッションに入る。以後は前回の警告から `CLAUDE_CTX_GUARD_INTERVAL`（既定 50000）増えるたびに再警告する |
-| トークン記録 | `SessionEnd` → [claude-token-metrics](../.local/bin/claude-token-metrics) `record` | セッションの終了時に `~/.local/share/claude-token-metrics/sessions.jsonl` へ 1 行追記する（`cwd` はそのセッションの作業ディレクトリ）。`claude-token-metrics report` で一覧できる。詳しくは [claude-token-metrics.md](claude-token-metrics.md) |
+| トークン記録 | `SessionEnd` → [claude-token-metrics](../.local/bin/claude-token-metrics) `record` | セッションの終了時に `~/.local/share/claude-token-metrics/sessions.jsonl` へ 1 行追記する（`cwd` はそのセッションの作業ディレクトリ。`git.repo`・`git.branch`・`hc.terminal`・`hc.role`（`hc-claude` が export する `HC_CLAUDE_ROLE`）も入る）。`claude-token-metrics report` で一覧、`report --by task` で Issue ごとにまとめて見られる。詳しくは [claude-token-metrics.md](claude-token-metrics.md) |
 
 閾値は `hc-claude` が役割ごとに `CLAUDE_CTX_GUARD_TOKENS` として渡します。
 
@@ -131,6 +131,15 @@ hc run --name ctx-check --cwd ~/dotfiles -- env HC_CLAUDE_WORKER_CTX_GUARD_TOKEN
 grep -l 'claude-context-guard' ~/.claude/projects/-home-issei-dotfiles/*.jsonl
 # Herdr app か hc attach ctx-check で開き、/exit で終了する（SessionEnd で記録される）
 claude-token-metrics report --since "$(date +%F)"   # ctx-check のセッションが cwd ~/dotfiles で 1 行出る
+```
+
+タスク単位の記録（#48）は、Issue のワーカーを 1 件動かして確かめます。
+
+```bash
+# ワーカーの SessionEnd の後（監督役がワーカーの terminal を閉じた後）
+tail -n 1 ~/.local/share/claude-token-metrics/sessions.jsonl | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["git"], r["hc"], r["ctx_budget"])'
+# git.repo・git.branch（feature/issue-<n>-…）、hc.role = worker、hc.terminal（tN）、ctx_budget 120000 が入る
+claude-token-metrics report --by task --since "$(date +%F)"   # <repo>#<n> の行が出る（監督役は supervisor の行）
 ```
 
 `make link` で `~/.local/bin/claude-context-guard` と `~/.local/bin/claude-token-metrics` がリンクされている必要があります。
@@ -328,4 +337,5 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
 - dev での実機確認が必要なもの（#31）: 「ワーカーの引き継ぎ」の「実機で確かめる」の 3 点。`resume-worker` が使う `hc get --json` のラベル（`role`・`handoffs`）と `status.state`、`hc run --timeout` の振る舞いは偽の `hc` でしか確かめていません。導入後、mlbot の Issue 数件で Issue 1 件あたりの重み付きコストと平均文脈を導入前（#17 のコメントの値）と比べ、引き継ぎ 1 回の追加コストより平均文脈の低下で得る分が大きいかを確かめます。
 - 導入後の計測が必要なもの（#32）: [worker-prompt.md](../.config/herdr-core/claude/worker-prompt.md) の「ツール出力を絞る」。導入後のワーカー数件で、`claude-token-metrics session` / `report` の L2（`by_tool` の Bash の `raw_bytes` 中央値、`new_info_rate`）と 1 リクエストあたりの文脈増分を導入前（#32 の本文の値）と比べます。下がらなければ、hook で出力を切り詰める対策を別 Issue にします。
 - dev での実機確認と導入後の計測が必要なもの（#33）: 監督役が `claude-worker-sonnet` で起動したワーカーの transcript の model が Sonnet になること、`claude-worker` では Opus のままであること（hc のテンプレートの `command` に `--model sonnet` を足しても引数として渡ることは、偽の `hc` でしか確かめていません）。導入後、Sonnet で実行した Issue の PR までの完了率・差し戻しの回数と Issue 1 件あたりのコスト（`by_model`）を、Opus の場合と比べます。
+- dev での実機確認が必要なもの（#48）: 上の「実機で確かめる」のタスク単位の記録。ワーカーの SessionEnd の行に `git.*`・`hc.role` = worker・`hc.terminal` が入り、`report --by task` にその Issue の行が出ること。
 - 導入後の計測が必要なもの（#34）: 上の「報告・相談の形と受理の確認」。導入後の監督役で、`claude-token-metrics report` の受理 1 件あたりのリクエスト数と平均文脈を、導入前（#34 の本文の値: 103 リクエスト・平均文脈 109k、31 リクエスト・平均 80k）と比べます。受理の確認の `gh pr view --jq` は、CI の無い PR（このリポジトリ）と CI のある公開リポジトリの PR（成功・失敗・実行中・StatusContext の `PENDING`）で出力を確かめました。
