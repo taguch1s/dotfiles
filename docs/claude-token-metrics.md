@@ -123,7 +123,8 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 
 - `reread_file` の行の範囲は、開始が `offset`（既定 1）、行数が結果の中の行番号つきの行（`N<tab>` / `N→`）の数。失敗した `Read` は記録しない。編集系ツールの結果が来ると、その path の `Read` の記録を消す。`Bash` の command にその path の文字列があっても消す（見逃し側に倒す）。
 - `repeated_failure` の記録は、編集系ツールの結果で全部消す（TDD の Red や、修正のたびに test を流す反復は数えない）。
-- `hints.failure_streaks`：同じ `command_key` の結果が、成功を挟まず `failure_streak` 回以上続けて `is_error` だったもの（他のツールの結果は挟んでよい）。トークンは数えず、`key`、`count`、最初と最後の `tool_use_id` を出す。
+- `hints.failure_streaks`：同じ `command_key` の結果が、成功を挟まず `failure_streak` 回以上続けて `is_error` だったもの（他のツールの結果は挟んでよい）。hints 自体はトークンを数えず、`key`、`count`、最初と最後の `tool_use_id` を出す（streak の中の失敗も、`repeated_failure` の条件に当たればそちらで数える）。
+- `duplicate_result` は、同じ path への連続した `Edit` の成功メッセージ（同じ本文で 200 バイトを超えることがある）も数える。避けられない出力なので、気になる場合は `exempt_keys` に `Edit` などを入れる。
 - `cache_rewrite` の `cause`：間隔（両リクエストの最初の行の `timestamp` の差）が TTL を超え、R_j の直前が人の発言なら `idle`、ツール結果なら `tool_wait`。間隔が TTL 以下か取れなければ `break`（system prompt やツール定義の変化など）。TTL は、そのストリームでそれまでに 1h cache を書いていれば 3600 秒、なければ 300 秒（`cache_ttl_seconds` で固定できる）。
 - `context_bloat` の予算は、`record` のときは環境変数 `CLAUDE_CTX_GUARD_TOKENS`（hc の監督役 150000、ワーカー 120000）、無ければ `context_budget`。`session` / `waste` は常に `context_budget` を使う。`hints.requests_after_budget` は最初に予算を超えたリクエストより後の本体のリクエスト数。
 

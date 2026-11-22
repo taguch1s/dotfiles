@@ -294,6 +294,32 @@
                                 ["context_bloat", 1, 205, 20.5, null]]}
     },
     {
+      "name": "context_bloat_at_budget",
+      "note": "予算 1000 ちょうどの文脈は超過ではないので数えず、予算超過後のリクエストも 0",
+      "config": {"context_budget": 1000},
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10]},
+        {"user": "next"},
+        {"req": "B", "u": [0, 0, 1000, 10]}
+      ],
+      "expected": {"rules": {}, "after_budget": 0}
+    },
+    {
+      "name": "duplicate_at_min_bytes",
+      "note": "min_bytes（200）ちょうどは対象。Δ と滞在は duplicate_hit と同じ",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "git status"}]]},
+        {"res": "t1", "fill": "s", "bytes": 200},
+        {"req": "B", "u": [0, 200, 1000, 10], "tools": [["t2", "Bash", {"command": "git status"}]]},
+        {"res": "t2", "fill": "s", "bytes": 200},
+        {"req": "C", "u": [0, 200, 1200, 10]}
+      ],
+      "expected": {"rules": {"duplicate_result": [1, 190]},
+                   "findings": [["duplicate_result", "t2", 190, 237.5, "delta"]]}
+    },
+    {
       "name": "sidechain_is_independent",
       "note": "本体と sidechain の同じ出力は別ストリームなので重複にしない",
       "events": [
