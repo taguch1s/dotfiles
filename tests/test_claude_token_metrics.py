@@ -875,6 +875,12 @@ class TaskKeyTest(unittest.TestCase):
             with self.subTest(record=record):
                 self.assertEqual(METRICS.task_key(record, PATTERN), expected)
 
+    def test_non_numeric_group_and_broken_fields_do_not_crash(self):
+        record = {"git": {"repo": "r", "branch": "feature/issue-abc"}, "cwd": "/x"}
+        self.assertEqual(METRICS.task_key(record, r"(issue-\w+)"), "r:feature/issue-abc")
+        self.assertEqual(METRICS.task_key({"git": {"repo": "r", "branch": "epic"}}, r"issue-(\d+)|epic"), "r:epic")
+        self.assertEqual(METRICS.task_key({"hc": "x", "git": "y", "cwd": "/x"}, PATTERN), "cwd:/x")
+
     def test_pattern_is_validated(self):
         for value in ("issue-\\d+", "(", 3):
             with self.subTest(value=value), self.assertRaises(ValueError):

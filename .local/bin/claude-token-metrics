@@ -1386,13 +1386,15 @@ def task_key(record: dict, pattern: str) -> str:
     3. ブランチがあり main・master でない → "<repo>:<branch>"
     4. それ以外 → "cwd:<cwd>"
     repo が分からないときは "?" を使う。"""
-    hc, git = record.get("hc") or {}, record.get("git") or {}
+    hc, git = record.get("hc"), record.get("git")
+    hc, git = (hc if isinstance(hc, dict) else {}), (git if isinstance(git, dict) else {})
     if hc.get("role") == "supervisor":
         return "supervisor"
     branch, repo = git.get("branch"), git.get("repo") or "?"
     if isinstance(branch, str) and branch:
         match = re.search(pattern, branch)
-        if match:
+        # グループが空や数字でない（設定の正規表現による）ときは番号とみなさず、次の規則に回す
+        if match and isinstance(match.group(1), str) and match.group(1).isdigit():
             return f"{repo}#{int(match.group(1))}"
         if branch not in ("main", "master"):
             return f"{repo}:{branch}"
