@@ -33,3 +33,7 @@ handoff = "issue-34-short-reports.md"
 [[out_of_scope_branch]]
 branch = "main"
 reason = "個人利用のため main へ直接 push する"
+
+[[issue_branch]]
+branch = "feature/issue-46-token-waste-rules"
+handoff = "issue-46-token-waste-rules.md"
