@@ -738,3 +738,92 @@ class WasteCliTest(FixtureCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- 委譲（delegation）・作り直し（restart）・over_delegation（#47） -----------------
+
+DELEGATION_CASES = ROOT / "tests" / "fixtures" / "claude-token-metrics" / "delegation" / "cases.json"
+
+
+def write_delegation_case(directory, case):
+    """case の本体 events とサブエージェントのファイル・meta.json を書き、transcript の path を返す。"""
+    path = Path(directory) / case["name"] / f"{SESSION}.jsonl"
+    write_jsonl(path, expand_events(case["events"]))
+    for name, sub in case.get("subagents", {}).items():
+        folder = path.with_suffix("") / "subagents"
+        write_jsonl(folder / f"{name}.jsonl", expand_events(sub["events"]))
+        meta = sub["meta"]
+        if meta is not None:
+            (folder / f"{name}.meta.json").write_text(meta if isinstance(meta, str) else json.dumps(meta))
+    return path
+
+
+class DelegationCasesTest(unittest.TestCase):
+    """cases.json の各 fixture で、delegation・restart・over_delegation が期待値と一致する。"""
+
+    def test_cases(self):
+        cases = json.loads(DELEGATION_CASES.read_text())["cases"]
+        with tempfile.TemporaryDirectory() as directory:
+            for case in cases:
+                with self.subTest(case["name"]):
+                    path = write_delegation_case(directory, case)
+                    weights = dict(METRICS.DEFAULT_WEIGHTS)
+                    options = waste_options(case.get("config"))
+                    metrics = METRICS.session_metrics(path, weights, "default", options)
+                    waste = METRICS.session_waste(path, weights, options)
+                    self.assertEqual(waste["rules"], metrics["waste"]["rules"])
+                    self.assert_case(metrics, case["expected"])
+
+    def assert_case(self, metrics, expected):
+        waste = metrics["waste"]
+        if "delegation" in expected:
+            self.assert_subset(metrics["delegation"], expected["delegation"])
+        if "restart" in expected:
+            self.assert_subset(metrics["restart"], expected["restart"])
+        for rule in METRICS.WASTE_RULES:
+            if rule == "over_delegation" or rule in expected["rules"]:
+                count, tokens = expected["rules"].get(rule, [0, 0])
+                self.assertEqual(waste["rules"][rule]["count"], count, rule)
+                if tokens is not None:
+                    self.assertAlmostEqual(waste["rules"][rule]["tokens"], tokens, places=3, msg=rule)
+        if "over_delegation_cost" in expected:
+            self.assertAlmostEqual(waste["rules"]["over_delegation"]["weighted_cost"],
+                                   expected["over_delegation_cost"], places=3)
+        for kind, count in expected.get("kinds", {}).items():
+            self.assertEqual(waste["rules"]["over_delegation"]["by_kind"][kind]["count"], count, kind)
+        for tool_id, first in expected.get("duplicate_of", {}).items():
+            agent = next(item for item in metrics["delegation"]["agents"] if item["tool_use_id"] == tool_id)
+            self.assertEqual(agent["duplicate_of"], first, tool_id)
+        if "under_delegation" in expected:
+            self.assertEqual(waste["hints"]["under_delegation"], expected["under_delegation"])
+        total = sum(waste["rules"][rule]["weighted_cost"] for rule in METRICS.WASTE_RULES)
+        self.assertAlmostEqual(waste["total"]["weighted_cost"], total, places=3)
+
+    def assert_subset(self, actual, expected):
+        for key, want in expected.items():
+            got = actual[key]
+            if key == "agents":
+                self.assertEqual(len(got), len(want))
+                for item, sub in zip(got, want):
+                    self.assert_subset(item, sub)
+            elif isinstance(want, float):
+                self.assertAlmostEqual(got, want, places=4, msg=key)
+            else:
+                self.assertEqual(got, want, key)
+
+
+class DelegationConfigTest(FixtureCase):
+    def test_new_config_keys_are_validated_and_listed(self):
+        for key, value in (("trivial_requests", -1), ("resume_window", 0), ("resume_markers", "x"),
+                           ("exempt_agent_types", [1]), ("startup_cap", True)):
+            with self.subTest(key), self.assertRaises(ValueError):
+                METRICS._waste_value(key, value)
+        self.assertEqual(METRICS.DEFAULT_WASTE["exempt_keys"], ["Edit", "MultiEdit", "NotebookEdit", "Write"])
+
+    def test_session_cli_has_delegation_and_restart(self):
+        result = self.run_cli("session", str(self.transcript))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["delegation"]["unlinked"], 1)  # agent-a1.jsonl に meta.json がない
+        self.assertEqual(data["restart"]["kind"], "fresh")
+        self.assertIn("over_delegation", data["waste"]["rules"])

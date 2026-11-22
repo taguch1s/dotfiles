@@ -206,6 +206,8 @@ class Stream:
         self.compact_after: list[int] = []  # compact_boundary の直前のリクエストの位置
         self.tool_request: dict[str, int] = {}  # tool_use_id -> 呼び出しを出したリクエストの位置
         self.last_kind: str | None = None  # 直前の行: human / tool_result / assistant
+        self.tool_order: list[str] = []  # tool_use_id を出た順に（delegation / restart 用）
+        self.first_human: str | None = None  # 最初の人の発言の本文（restart 用）
 
 
 class Transcript:
@@ -261,6 +263,7 @@ class Transcript:
             for block in blocks:
                 if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
                     tools[block["id"]] = (str(block.get("name", "unknown")), block.get("input"))
+                    stream.tool_order.append(block["id"])
                     tool_ids.append(block["id"])
             usage = message.get("usage")
             if not isinstance(usage, dict):
@@ -300,6 +303,8 @@ class Transcript:
                 stream.last_kind = "tool_result"
             elif not line.get("isMeta"):
                 stream.last_kind = "human"
+                if stream.first_human is None:
+                    stream.first_human = result_bytes(content).decode(errors="replace")
 
 
 # ---- 指標の計算 -------------------------------------------------------------
@@ -422,21 +427,37 @@ def total_metrics(scopes: list[dict], all_requests: list[dict], weights: dict) -
 
 WASTE_SCHEMA = "claude-token-metrics/waste/v1"
 WASTE_RULES = ("oversized_output", "duplicate_result", "reread_file", "repeated_failure",
-               "cache_rewrite", "context_bloat")
+               "cache_rewrite", "context_bloat", "over_delegation")
+OVER_DELEGATION_KINDS = ("trivial", "duplicate")
+AGENT_TOOLS = ("Agent", "Task")
 CACHE_CAUSES = ("idle", "tool_wait", "break")
 EDIT_TOOLS = ("Edit", "MultiEdit", "Write", "NotebookEdit")
 TTL_5M, TTL_1H = 300, 3600
 DEFAULT_WASTE = {
     "oversized_bytes": 20000,
     "min_bytes": 200,
-    "exempt_keys": [],
+    "exempt_keys": ["Edit", "MultiEdit", "NotebookEdit", "Write"],  # 編集の成功メッセージは避けられない
     "failure_streak": 3,
     "cache_miss_ratio": 0.5,
     "cache_ttl_seconds": None,  # None なら 1h cache を書いていれば 3600 秒、なければ 300 秒
     "context_budget": 150000,
     "findings_limit": 50,
     "bytes_per_token": 2.2,  # 根拠は docs/claude-token-metrics.md
+    # 委譲（over_delegation、hints.under_delegation）
+    "trivial_requests": 3,
+    "trivial_tool_calls": 2,
+    "exempt_agent_types": ["web-fetch"],  # ツールの代わりとして使う型
+    "under_delegation_bytes": 400000,
+    # 作り直し（restart）
+    "resume_markers": ["【再開】"],
+    "resume_window": 5,
+    "supervisor_handoff_paths": ["hc-supervisor/handoff.md"],
+    "startup_cap": 20,
+    "handoff_tail": 10,
+    "handoff_write_paths": ["codex-handoffs/", "hc-supervisor/handoff.md"],
 }
+LIST_KEYS = ("exempt_keys", "exempt_agent_types", "resume_markers", "supervisor_handoff_paths",
+             "handoff_write_paths")
 READ_LINE = re.compile(rb"^\s*\d+(?:\t|\xe2\x86\x92)", re.MULTILINE)  # Read の結果の行番号（N\t か N→）
 
 
@@ -462,13 +483,20 @@ def _waste_value(key: str, value: object) -> object:
         "cache_miss_ratio": (lambda v: _is_number(v) and 0 < v <= 1, "0 より大きく 1 以下の数値"),
         "cache_ttl_seconds": (lambda v: v is None or (_is_number(v) and v > 0), "null か 0 より大きい数値"),
         "bytes_per_token": (lambda v: _is_number(v) and v > 0, "0 より大きい数値"),
-        "exempt_keys": (lambda v: isinstance(v, list) and all(isinstance(item, str) for item in v),
-                        "文字列の配列"),
+        "trivial_requests": (lambda v: _is_int(v) and v >= 0, "0 以上の整数"),
+        "trivial_tool_calls": (lambda v: _is_int(v) and v >= 0, "0 以上の整数"),
+        "under_delegation_bytes": (lambda v: _is_int(v) and v >= 0, "0 以上の整数"),
+        "resume_window": (lambda v: _is_int(v) and v >= 1, "1 以上の整数"),
+        "startup_cap": (lambda v: _is_int(v) and v >= 1, "1 以上の整数"),
+        "handoff_tail": (lambda v: _is_int(v) and v >= 1, "1 以上の整数"),
     }
+    for list_key in LIST_KEYS:
+        checks[list_key] = (lambda v: isinstance(v, list) and all(isinstance(item, str) for item in v),
+                            "文字列の配列")
     check, expected = checks[key]
     if not check(value):
         raise ValueError(f"waste の {key} は{expected}にしてください: {value!r}")
-    return sorted(set(value)) if key == "exempt_keys" else value
+    return sorted(set(value)) if key in LIST_KEYS else value
 
 
 def _waste_overrides(path: Path, *, required: bool) -> dict | None:
@@ -767,6 +795,149 @@ class StreamWaste:
         return 0 if first_over is None else len(requests) - first_over - 1
 
 
+# ---- 委譲（delegation）と作り直し（restart） --------------------------------------
+
+def _agent_meta(path: Path) -> dict | None:
+    """agent-<id>.meta.json を読む。無い・読めない・形が違うときは None（unlinked に倒す）。"""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _bytes_sum(stream: Stream, keep) -> int:
+    return sum(len(result["data"]) for result in stream.results if keep(result["id"]))
+
+
+def delegation_metrics(path: Path, streams: list[tuple[str, str, Stream]], weights: dict,
+                       session_cost: float) -> dict:
+    """本体の Agent 呼び出しとサブエージェントの対応づけ、委譲の量と効果（Issue #47）。"""
+    main = streams[0][2]
+    subagents = [(file, stream) for scope, file, stream in streams if scope == "subagents"]
+    is_agent = lambda tool_id: main.tools.get(tool_id, ("", None))[0] in AGENT_TOOLS  # noqa: E731
+    calls = [tool_id for tool_id in main.tool_order if is_agent(tool_id)]
+    errors = {result["id"] for result in main.results if result["is_error"]}
+    result_size = {result["id"]: len(result["data"]) for result in main.results}
+
+    # 同じ prompt と subagent_type の Agent 呼び出し。前の呼び出しが失敗していれば、やり直しとして数えない。
+    duplicate_of: dict[str, str] = {}
+    last: dict[tuple[str, str], str] = {}
+    for tool_id in calls:
+        tool_input = main.tools[tool_id][1]
+        if not isinstance(tool_input, dict) or not isinstance(tool_input.get("prompt"), str):
+            continue
+        key = (hashlib.sha256(tool_input["prompt"].encode()).hexdigest(), str(tool_input.get("subagent_type")))
+        if key in last and last[key] not in errors:
+            duplicate_of[tool_id] = last[key]
+        last[key] = tool_id
+
+    agents, unlinked = [], 0
+    for file, stream in subagents:
+        meta = _agent_meta(path.parent / path.stem / "subagents" / (Path(file).stem + ".meta.json"))
+        tool_id = meta.get("toolUseId") if meta and isinstance(meta.get("toolUseId"), str) else None
+        if tool_id is None:
+            unlinked += 1
+        call = main.tools.get(tool_id, ("", None))[1] if tool_id else None
+        agent_type = meta.get("agentType") if meta else None
+        if not isinstance(agent_type, str):
+            agent_type = call.get("subagent_type") if isinstance(call, dict) and isinstance(
+                call.get("subagent_type"), str) else None
+        base = l0(stream.requests, weights)
+        tokens = base["tokens"]
+        first = stream.requests[0] if stream.requests else None
+        cold = ({"input": first["input"], "cache_creation_5m": first["cache_creation_5m"],
+                 "cache_creation_1h": first["cache_creation_1h"]} if first else None)
+        agents.append({
+            "file": file, "tool_use_id": tool_id, "agent_type": agent_type,
+            "model": meta.get("model") if meta and isinstance(meta.get("model"), str) else None,
+            "requests": len(stream.requests), "tool_calls": len(stream.tool_request),
+            "weighted_cost": round(base["weighted_cost"], 4),
+            "tokens": sum(tokens[key] for key in ("input", "cache_creation", "cache_read", "output")),
+            "cold_start_tokens": sum(cold.values()) if cold else 0,
+            "cold_start_cost": round(sum(weights[key] * value for key, value in cold.items()), 4) if cold else 0,
+            "result_bytes": result_size.get(tool_id) if tool_id else None,
+            "duplicate_of": duplicate_of.get(tool_id) if tool_id else None,
+        })
+    agents.sort(key=lambda item: (item["tool_use_id"] is None, item["file"]))
+
+    sub_cost = sum(item["weighted_cost"] for item in agents)
+    sub_bytes = sum(_bytes_sum(stream, lambda _: True) for _, stream in subagents)
+    agent_bytes = _bytes_sum(main, is_agent)
+    return {
+        "agent_calls": len(calls),
+        "subagent_cost_share": round(sub_cost / session_cost, 6) if session_cost else None,
+        "subagent_tool_bytes": sub_bytes,
+        "agent_result_bytes": agent_bytes,
+        "compression": round(agent_bytes / sub_bytes, 6) if sub_bytes else None,
+        "main_tool_bytes": _bytes_sum(main, lambda tool_id: not is_agent(tool_id)),
+        "unlinked": unlinked,
+        "agents": agents,
+    }
+
+
+def restart_metrics(main: Stream, weights: dict, config: dict) -> dict:
+    """セッションが作り直し（handoff からの再開・監督役の再起動）か、立ち上げにかかったコスト（Issue #47）。"""
+    requests = main.requests
+    calls = []  # (リクエストの位置, ツール名, input)
+    for tool_id in main.tool_order:
+        index = main.tool_request.get(tool_id)
+        if index is not None:
+            name, tool_input = main.tools[tool_id]
+            calls.append((index, name, tool_input if isinstance(tool_input, dict) else {}))
+
+    def touches(name: str, tool_input: dict, paths: list[str], names: tuple[str, ...]) -> bool:
+        target = tool_input.get("file_path") if name in names else None
+        command = tool_input.get("command") if name == "Bash" and "Bash" in names else None
+        return any((isinstance(target, str) and path in target) or (isinstance(command, str) and path in command)
+                   for path in paths)
+
+    first = (main.first_human or "").lstrip()
+    if any(first.startswith(marker) for marker in config["resume_markers"]):
+        kind = "resume_worker"
+    elif any(index < config["resume_window"]
+             and touches(name, tool_input, config["supervisor_handoff_paths"], ("Read", "Bash"))
+             for index, name, tool_input in calls):
+        kind = "resume_supervisor"
+    else:
+        kind = "fresh"
+
+    def starts_work(name: str, tool_input: dict) -> bool:
+        return name in EDIT_TOOLS or (name == "Bash" and "git commit" in str(tool_input.get("command", "")))
+
+    work = [index for index, name, tool_input in calls if starts_work(name, tool_input)]
+    startup = min(min(work, default=len(requests)), config["startup_cap"], len(requests))
+    startup_cost = sum(l0([request], weights)["weighted_cost"] for request in requests[:startup])
+    tail = len(requests) - config["handoff_tail"]
+    ended = any(index >= tail and touches(name, tool_input, config["handoff_write_paths"], ("Write", "Edit"))
+                for index, name, tool_input in calls)
+    return {"kind": kind, "startup_requests": startup, "startup_cost": round(startup_cost, 4),
+            "ended_with_handoff": ended}
+
+
+def over_delegation_findings(delegation: dict, config: dict) -> list[dict]:
+    """サブエージェント単位の無駄（trivial: cold start だけ、duplicate: 全部）。duplicate が優先。"""
+    findings = []
+    for agent in delegation["agents"]:
+        if agent["tool_use_id"] is None or agent["requests"] == 0:
+            continue  # 本体の呼び出しと対応づけられない（型も分からない）ものは数えない
+        if agent["duplicate_of"]:
+            kind, tokens, cost = "duplicate", agent["tokens"], agent["weighted_cost"]
+            detail = {"first_tool_use_id": agent["duplicate_of"]}
+        elif (agent["requests"] <= config["trivial_requests"] and agent["tool_calls"] <= config["trivial_tool_calls"]
+              and agent["agent_type"] not in config["exempt_agent_types"]):
+            kind, tokens, cost = "trivial", agent["cold_start_tokens"], agent["cold_start_cost"]
+            detail = {"requests": agent["requests"], "tool_calls": agent["tool_calls"]}
+        else:
+            continue
+        findings.append({"rule": "over_delegation", "scope": "subagents", "file": agent["file"],
+                         "request_index": 0, "timestamp": None, "tool_use_id": agent["tool_use_id"],
+                         "key": f"Agent:{agent['agent_type']}", "tokens": tokens, "token_source": None,
+                         "weighted_cost": cost, "detail": {"kind": kind, "agent_type": agent["agent_type"],
+                                                           **detail}})
+    return findings
+
+
 def _rule_total() -> dict:
     return {"count": 0, "tokens": 0.0, "weighted_cost": 0.0}
 
@@ -782,8 +953,9 @@ def _rounded(value: object, digits: int) -> object:
 
 
 def waste_metrics(streams: list[tuple[str, str, Stream]], weights: dict, config: dict, source: str,
-                  session_cost: float, budget: int | None = None) -> dict:
-    """streams は (scope, file, Stream) の一覧。budget が None なら config の context_budget を使う。"""
+                  session_cost: float, budget: int | None = None, delegation: dict | None = None) -> dict:
+    """streams は (scope, file, Stream) の一覧。budget が None なら config の context_budget を使う。
+    delegation（delegation_metrics の結果）があれば over_delegation と under_delegation のヒントを足す。"""
     budget_source = "config" if budget is None else "env"
     budget = config["context_budget"] if budget is None else budget
     findings, streaks, after_budget = [], [], 0
@@ -796,15 +968,26 @@ def waste_metrics(streams: list[tuple[str, str, Stream]], weights: dict, config:
         findings.extend(detector.findings)
         streaks.extend(detector.streaks)
 
+    over = over_delegation_findings(delegation, config) if delegation else []
+    # duplicate に当たったサブエージェントの中の finding は数えない（over_delegation.duplicate が優先）。
+    skipped = {item["file"] for item in over if item["detail"]["kind"] == "duplicate"}
+    findings = [item for item in findings if not (item["scope"] == "subagents" and item["file"] in skipped)]
+    streaks = [item for item in streaks if not (item["scope"] == "subagents" and item["file"] in skipped)]
+    findings.extend(over)
+
     rules = {rule: _rule_total() for rule in WASTE_RULES}
+    by_kind = {kind: _rule_total() for kind in OVER_DELEGATION_KINDS}
     causes = {cause: _rule_total() for cause in CACHE_CAUSES}
     for finding in findings:
         _add(rules[finding["rule"]], finding)
         if finding["rule"] == "cache_rewrite":
             _add(causes[finding["detail"]["cause"]], finding)
-    for totals in (*rules.values(), *causes.values()):
+        elif finding["rule"] == "over_delegation":
+            _add(by_kind[finding["detail"]["kind"]], finding)
+    for totals in (*rules.values(), *causes.values(), *by_kind.values()):
         totals["tokens"], totals["weighted_cost"] = round(totals["tokens"], 1), round(totals["weighted_cost"], 4)
     rules["context_bloat"].update(budget=budget, budget_source=budget_source)
+    rules["over_delegation"]["by_kind"] = by_kind
     tokens = sum(rules[rule]["tokens"] for rule in WASTE_RULES)
     cost = sum(rules[rule]["weighted_cost"] for rule in WASTE_RULES)
 
@@ -827,7 +1010,9 @@ def waste_metrics(streams: list[tuple[str, str, Stream]], weights: dict, config:
         "total": {"tokens": round(tokens, 1), "weighted_cost": round(cost, 4),
                   "share": round(cost / session_cost, 6) if session_cost else None},
         "findings": findings[:config["findings_limit"]],
-        "hints": {"failure_streaks": streaks, "requests_after_budget": after_budget},
+        "hints": {"failure_streaks": streaks, "requests_after_budget": after_budget,
+                  "under_delegation": bool(delegation) and delegation["agent_calls"] == 0
+                  and delegation["main_tool_bytes"] > config["under_delegation_bytes"]},
     }
 
 
@@ -852,8 +1037,9 @@ def session_waste(transcript_path: str | Path, weights: dict, waste_options: dic
     options = waste_options or default_waste_options()
     _, streams, _ = read_session(Path(transcript_path))
     requests = [request for _, _, stream in streams for request in stream.requests]
-    return waste_metrics(streams, weights, options["config"], options["source"],
-                         l0(requests, weights)["weighted_cost"], options.get("budget"))
+    cost = l0(requests, weights)["weighted_cost"]
+    return waste_metrics(streams, weights, options["config"], options["source"], cost, options.get("budget"),
+                         delegation_metrics(Path(transcript_path), streams, weights, cost))
 
 
 def session_metrics(transcript_path: str | Path, weights: dict, weights_source: str,
@@ -869,6 +1055,7 @@ def session_metrics(transcript_path: str | Path, weights: dict, weights_source: 
               "subagents": {"files": file_count, **scope_metrics(subagents, weights)}}
     all_requests = [request for stream in (main, side, *subagents) for request in stream.requests]
     total = total_metrics(list(scopes.values()), all_requests, weights)
+    delegation = delegation_metrics(path, streams, weights, total["weighted_cost"])
     return {
         "schema": SCHEMA,
         "session_id": transcript.session_id or path.stem,
@@ -882,8 +1069,10 @@ def session_metrics(transcript_path: str | Path, weights: dict, weights_source: 
         "skipped": transcript.skipped,
         **scopes,
         "total": total,
+        "delegation": delegation,
+        "restart": restart_metrics(main, weights, options["config"]),
         "waste": waste_metrics(streams, weights, options["config"], options["source"],
-                               total["weighted_cost"], options.get("budget")),
+                               total["weighted_cost"], options.get("budget"), delegation),
     }
 
 
@@ -932,10 +1121,14 @@ def print_waste(waste: dict) -> None:
             note = ", ".join(f"{cause} {value['count']}" for cause, value in waste["cache_rewrite_by_cause"].items())
         elif rule == "context_bloat":
             note = f"予算 {totals['budget']}（{totals['budget_source']}）"
+        elif rule == "over_delegation":
+            note = ", ".join(f"{kind} {value['count']}" for kind, value in totals["by_kind"].items())
         rows.append((rule, str(totals["count"]), _count(totals["tokens"]), _count(totals["weighted_cost"]), note))
     _table(rows)
     hints = waste["hints"]
     print(f"予算を超えた後のリクエスト: {hints['requests_after_budget']}")
+    if hints["under_delegation"]:
+        print("委譲不足の可能性: 本体のツール結果が大きいのに Agent を使っていない（ヒント。無駄には数えない）")
     for streak in hints["failure_streaks"]:
         print(f"続いた失敗: {streak['key']} × {streak['count']}（{streak['scope']} {streak['first_tool_use_id']}〜）")
     if not waste["findings"]:
