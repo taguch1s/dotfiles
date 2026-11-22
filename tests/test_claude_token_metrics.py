@@ -549,5 +549,192 @@ class NnlsTest(unittest.TestCase):
         self.assertEqual(METRICS.nnls([[1, 2], [3, 4]], [0, 0]), [0, 0])
 
 
+# ---- 無駄検出（waste） ------------------------------------------------------------
+
+WASTE_CASES = ROOT / "tests" / "fixtures" / "claude-token-metrics" / "waste" / "cases.json"
+WASTE_BASE = 1_763_082_000  # 2025-11-14T01:00:00Z
+
+
+def waste_timestamp(seconds):
+    return iso(WASTE_BASE + seconds, z=True)
+
+
+def expand_events(events):
+    """cases.json の events を transcript の行に展開する。"""
+    lines, moment = [], -1
+    for event in events:
+        moment = event.get("t", moment + 1)
+        common = {"isSidechain": bool(event.get("side")), "sessionId": SESSION, "version": VERSION,
+                  "timestamp": waste_timestamp(moment)}
+        if "user" in event:
+            lines.append({"type": "user", **common, "message": {"role": "user", "content": event["user"]}})
+        elif "req" in event:
+            inp, cc, cr, out = event["u"]
+            use = usage(inp, cc, cr, out, cc5=0 if event.get("h1") else cc, cc1=cc if event.get("h1") else 0)
+            content = [tool_use(tool_id, name, tool_input) for tool_id, name, tool_input in event.get("tools", [])]
+            lines.append({"type": "assistant", "requestId": event["req"], **common,
+                          "message": {"id": f"msg_{event['req']}", "model": "m1", "role": "assistant",
+                                      "content": content or [{"type": "text", "text": "ok"}], "usage": use}})
+        elif "res" in event:
+            if "lines" in event:
+                start, end = event["lines"]
+                text = "\n".join(f"{number}\t{event['fill'] * 20}" for number in range(start, end + 1))
+            elif "fill" in event:
+                text = event["fill"] * event["bytes"]
+            else:
+                text = event["text"]
+            block = {"type": "tool_result", "tool_use_id": event["res"], "content": text}
+            if event.get("err"):
+                block["is_error"] = True
+            lines.append({"type": "user", **common, "message": {"role": "user", "content": [block]}})
+        elif event.get("compact"):
+            lines.append({"type": "system", "subtype": "compact_boundary", **common, "content": "Conversation compacted"})
+    return lines
+
+
+def waste_options(overrides=None):
+    config = json.loads(json.dumps(METRICS.DEFAULT_WASTE))
+    config.update(overrides or {})
+    return {"config": config, "source": "cli" if overrides else "default", "budget": None}
+
+
+class WasteCasesTest(unittest.TestCase):
+    """cases.json の各 fixture で、ルールごとの件数・トークン数が期待値と一致する。"""
+
+    def test_cases(self):
+        cases = json.loads(WASTE_CASES.read_text())["cases"]
+        self.assertGreaterEqual(len(cases), 20)
+        with tempfile.TemporaryDirectory() as directory:
+            for case in cases:
+                with self.subTest(case["name"]):
+                    path = Path(directory) / case["name"] / f"{SESSION}.jsonl"
+                    write_jsonl(path, expand_events(case["events"]))
+                    waste = METRICS.session_waste(path, dict(METRICS.DEFAULT_WEIGHTS),
+                                                  waste_options(case.get("config")))
+                    self.assert_case(waste, case["expected"])
+
+    def assert_case(self, waste, expected):
+        for rule in METRICS.WASTE_RULES:
+            count, tokens = expected["rules"].get(rule, [0, 0])
+            self.assertEqual(waste["rules"][rule]["count"], count, rule)
+            self.assertAlmostEqual(waste["rules"][rule]["tokens"], tokens, places=3, msg=rule)
+        for cause in METRICS.CACHE_CAUSES:
+            count, tokens = expected.get("causes", {}).get(cause, [0, 0])
+            self.assertEqual(waste["cache_rewrite_by_cause"][cause]["count"], count, cause)
+            self.assertAlmostEqual(waste["cache_rewrite_by_cause"][cause]["tokens"], tokens, places=3, msg=cause)
+        if "streaks" in expected:
+            self.assertEqual([[item["key"], item["count"]] for item in waste["hints"]["failure_streaks"]],
+                             expected["streaks"])
+        self.assertEqual(waste["hints"]["requests_after_budget"], expected.get("after_budget", 0))
+        if "findings" in expected:
+            actual = [[item["rule"], item["tool_use_id"] or item["request_index"], item["tokens"],
+                       item["weighted_cost"], item["token_source"]] for item in waste["findings"]]
+            self.assertEqual(len(actual), len(expected["findings"]))
+            for got, want in zip(actual, expected["findings"]):
+                self.assertEqual(got[:2] + got[4:], want[:2] + want[4:])
+                self.assertAlmostEqual(got[2], want[2], places=3)
+                self.assertAlmostEqual(got[3], want[3], places=3)
+        total = sum(waste["rules"][rule]["weighted_cost"] for rule in METRICS.WASTE_RULES)
+        self.assertAlmostEqual(waste["total"]["weighted_cost"], total, places=3)
+
+
+class WasteHelpersTest(unittest.TestCase):
+    def test_overlap_uses_union_of_ranges(self):
+        self.assertEqual(METRICS._overlap(1, 10, [(3, 5), (4, 8)]), 6)
+        self.assertEqual(METRICS._overlap(1, 10, [(11, 20)]), 0)
+
+    def test_read_range_counts_numbered_lines(self):
+        data = "\n".join(f"{n}\tx" for n in range(5, 9)).encode() + b"\n\n<system-reminder>x</system-reminder>"
+        self.assertEqual(METRICS._read_range({"offset": 5}, data), (5, 4))
+        self.assertEqual(METRICS._read_range({}, "1→a\n2→b".encode()), (1, 2))
+
+    def test_invalid_values_are_rejected(self):
+        for key, value in (("oversized_bytes", -1), ("cache_miss_ratio", 0), ("failure_streak", 1),
+                           ("exempt_keys", "Bash:git"), ("bytes_per_token", True), ("context_budget", 1.5)):
+            with self.subTest(key), self.assertRaises(ValueError):
+                METRICS._waste_value(key, value)
+
+
+class WasteCliTest(FixtureCase):
+    """session / waste / record の waste と設定の扱い。"""
+
+    def setUp(self):
+        super().setUp()
+        case = next(case for case in json.loads(WASTE_CASES.read_text())["cases"]
+                    if case["name"] == "precedence_failure_over_duplicate_and_oversized")
+        self.waste_transcript = self.root / "projects" / "-home-w" / f"{SESSION}.jsonl"
+        write_jsonl(self.waste_transcript, expand_events(case["events"]))
+        self.waste_file = self.root / "config" / "claude-token-metrics" / "waste.json"
+
+    def waste_json(self, *args):
+        result = self.run_cli("waste", "--json", *args, str(self.waste_transcript))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def write_config(self, path, overrides):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"waste": overrides, "note": "読み飛ばす"}))
+
+    def test_session_has_waste_and_same_result_twice(self):
+        outputs = [self.run_cli("session", str(self.waste_transcript)) for _ in range(2)]
+        for output in outputs:
+            self.assertEqual(output.returncode, 0, output.stderr)
+        first, second = (json.loads(output.stdout)["waste"] for output in outputs)
+        self.assertEqual(first, second)
+        self.assertEqual(first["schema"], "claude-token-metrics/waste/v1")
+        self.assertEqual(first["config_source"], "default")
+        self.assertEqual(first["rules"]["repeated_failure"]["count"], 1)
+        self.assertEqual(first["rules"]["oversized_output"]["count"], 0)  # 既定の 20000 バイトは超えない
+        data = json.loads(outputs[0].stdout)
+        self.assertAlmostEqual(first["total"]["share"], first["total"]["weighted_cost"] / data["total"]["weighted_cost"],
+                               places=5)
+        self.assertEqual(self.waste_json(), first)
+
+    def test_config_file_and_cli_change_result_and_hash(self):
+        default = self.waste_json()
+        self.write_config(self.waste_file, {"oversized_bytes": 300})
+        from_file = self.waste_json()
+        self.assertEqual(from_file["config_source"], "file")
+        self.assertEqual(from_file["rules"]["oversized_output"]["count"], 1)
+        self.assertNotEqual(from_file["config_hash"], default["config_hash"])
+        cli_path = self.root / "cli.json"
+        self.write_config(cli_path, {"oversized_bytes": 100000, "min_bytes": 100000})
+        from_cli = self.waste_json("--waste-config", str(cli_path))
+        self.assertEqual(from_cli["config_source"], "cli")
+        self.assertEqual(from_cli["config"]["oversized_bytes"], 100000)
+        self.assertEqual(from_cli["rules"]["oversized_output"]["count"], 0)
+        self.assertNotIn(from_cli["config_hash"], (default["config_hash"], from_file["config_hash"]))
+
+    def test_invalid_config_exits_2_and_unknown_key_warns(self):
+        self.write_config(self.waste_file, {"oversized_bytes": "big"})
+        self.assertEqual(self.run_cli("session", str(self.waste_transcript)).returncode, 2)
+        self.assertEqual(self.run_cli("waste", str(self.waste_transcript)).returncode, 2)
+        self.assertEqual(self.run_cli("waste", "--waste-config", str(self.root / "missing.json"),
+                                      str(self.waste_transcript)).returncode, 2)
+        self.write_config(self.waste_file, {"no_such_key": 1})
+        result = self.run_cli("waste", str(self.waste_transcript))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no_such_key", result.stderr)
+        self.assertIn("repeated_failure", result.stdout)
+
+    def test_record_uses_env_budget_and_defaults_on_invalid_config(self):
+        self.write_config(self.waste_file, {"min_bytes": -1})
+        env = dict(self.env, CLAUDE_CTX_GUARD_TOKENS="1200")
+        payload = json.dumps({"session_id": SESSION, "transcript_path": str(self.waste_transcript)})
+        result = subprocess.run([sys.executable, str(SCRIPT), "record", "--foreground"], input=payload,
+                                capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("既定値で集計", result.stderr)
+        record = json.loads((self.root / "data" / "claude-token-metrics" / "sessions.jsonl").read_text())
+        waste = record["waste"]
+        self.assertEqual(waste["config_source"], "default")
+        self.assertEqual((waste["rules"]["context_bloat"]["budget"], waste["rules"]["context_bloat"]["budget_source"]),
+                         (1200, "env"))
+        # B は 1300 − 1200 = 100。C は 1600 − 1200 − 文脈に残る repeated_failure の 290 = 110
+        self.assertEqual(waste["rules"]["context_bloat"]["count"], 2)
+        self.assertAlmostEqual(waste["rules"]["context_bloat"]["tokens"], 210)
+        self.assertEqual(waste["hints"]["requests_after_budget"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

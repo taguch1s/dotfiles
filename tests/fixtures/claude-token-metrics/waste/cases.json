@@ -1,0 +1,311 @@
+{
+  "_format": [
+    "無駄検出（waste）の fixture。events を tests/test_claude_token_metrics.py の expand_events が transcript の行に展開する。",
+    "user: 人の発言。req: リクエスト（u = [input, cache 作成, cache 読み込み, output]、h1 = cache 作成を 1h とする、tools = [[id, name, input]]）。",
+    "res: ツール結果（fill を bytes 回、または lines = [開始, 終了] の行番号つき行、err = is_error）。compact: compact_boundary。t: 秒（省略時は前 + 1）。",
+    "expected.rules はルール名 -> [件数, トークン]。書かないルールは [0, 0]。重みは既定（cc5m 1.25、cc1h 2、cr 0.1、out 5）。",
+    "文脈 = input + cache 作成 + cache 読み込み。Δ = 文脈(次) − 文脈(前) − output(前)。滞在込みのコスト = t × (w_cc + 0.1 × (n − 1))。"
+  ],
+  "cases": [
+    {
+      "name": "oversized_hit",
+      "note": "Δ = 2000 − 1000 − 10 = 990。閾値を超えた分 990 × 1000 / 2000 = 495。B と C で読まれ n = 2、コスト 495 × 1.35",
+      "config": {"oversized_bytes": 1000},
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "cat big.log"}]]},
+        {"res": "t1", "fill": "a", "bytes": 2000},
+        {"req": "B", "u": [0, 1000, 1000, 10]},
+        {"req": "C", "u": [0, 0, 2000, 10]}
+      ],
+      "expected": {"rules": {"oversized_output": [1, 495]},
+                   "findings": [["oversized_output", "t1", 495, 668.25, "delta"]]}
+    },
+    {
+      "name": "oversized_exact_threshold",
+      "note": "閾値ちょうど（1000 バイト）は超えていないので数えない",
+      "config": {"oversized_bytes": 1000},
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "cat big.log"}]]},
+        {"res": "t1", "fill": "a", "bytes": 1000},
+        {"req": "B", "u": [0, 1000, 1000, 10]}
+      ],
+      "expected": {"rules": {}}
+    },
+    {
+      "name": "oversized_exempt_key",
+      "note": "exempt_keys の command_key は数えない",
+      "config": {"oversized_bytes": 1000, "exempt_keys": ["Bash:cat"]},
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "cat big.log"}]]},
+        {"res": "t1", "fill": "a", "bytes": 2000},
+        {"req": "B", "u": [0, 1000, 1000, 10]}
+      ],
+      "expected": {"rules": {}}
+    },
+    {
+      "name": "oversized_without_next_request",
+      "note": "次のリクエストが無いので bytes ÷ bytes_per_token（2）= 1000、超えた分 500。文脈に入らないのでコスト 0",
+      "config": {"oversized_bytes": 1000, "bytes_per_token": 2},
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "cat big.log"}]]},
+        {"res": "t1", "fill": "a", "bytes": 2000}
+      ],
+      "expected": {"rules": {"oversized_output": [1, 500]},
+                   "findings": [["oversized_output", "t1", 500, 0, "bytes"]]}
+    },
+    {
+      "name": "duplicate_hit",
+      "note": "同じ 400 バイトを 2 回。2 回目は Δ = 1400 − 1200 − 10 = 190、C だけで読まれ n = 1、コスト 190 × 1.25",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "git status"}]]},
+        {"res": "t1", "fill": "s", "bytes": 400},
+        {"req": "B", "u": [0, 200, 1000, 10], "tools": [["t2", "Bash", {"command": "git status"}]]},
+        {"res": "t2", "fill": "s", "bytes": 400},
+        {"req": "C", "u": [0, 200, 1200, 10]}
+      ],
+      "expected": {"rules": {"duplicate_result": [1, 190]},
+                   "findings": [["duplicate_result", "t2", 190, 237.5, "delta"]]}
+    },
+    {
+      "name": "duplicate_below_min_bytes",
+      "note": "min_bytes（200）未満は対象外",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "git status"}]]},
+        {"res": "t1", "fill": "s", "bytes": 199},
+        {"req": "B", "u": [0, 200, 1000, 10], "tools": [["t2", "Bash", {"command": "git status"}]]},
+        {"res": "t2", "fill": "s", "bytes": 199},
+        {"req": "C", "u": [0, 200, 1200, 10]}
+      ],
+      "expected": {"rules": {}}
+    },
+    {
+      "name": "duplicate_across_compact",
+      "note": "compact_boundary をまたぐ同じ出力は数えない",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "git status"}]]},
+        {"res": "t1", "fill": "s", "bytes": 400},
+        {"req": "B", "u": [0, 200, 1000, 10], "tools": [["t2", "Bash", {"command": "git status"}]]},
+        {"compact": true},
+        {"res": "t2", "fill": "s", "bytes": 400},
+        {"req": "C", "u": [0, 300, 0, 10]}
+      ],
+      "expected": {"rules": {}}
+    },
+    {
+      "name": "reread_hit",
+      "note": "1〜10 行の後に 6〜15 行（本文は別）。重なり 5 行。Δ = 1200 − 1100 − 10 = 90、90 × 5 / 10 = 45、コスト 45 × 1.25",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Read", {"file_path": "/f.py"}]]},
+        {"res": "t1", "lines": [1, 10], "fill": "x"},
+        {"req": "B", "u": [0, 100, 1000, 10], "tools": [["t2", "Read", {"file_path": "/f.py", "offset": 6}]]},
+        {"res": "t2", "lines": [6, 15], "fill": "y"},
+        {"req": "C", "u": [0, 100, 1100, 10]}
+      ],
+      "expected": {"rules": {"reread_file": [1, 45]},
+                   "findings": [["reread_file", "t2", 45, 56.25, "delta"]]}
+    },
+    {
+      "name": "reread_no_overlap",
+      "note": "範囲が重ならない（1〜10 行と 11〜20 行）",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Read", {"file_path": "/f.py"}]]},
+        {"res": "t1", "lines": [1, 10], "fill": "x"},
+        {"req": "B", "u": [0, 100, 1000, 10], "tools": [["t2", "Read", {"file_path": "/f.py", "offset": 11}]]},
+        {"res": "t2", "lines": [11, 20], "fill": "y"},
+        {"req": "C", "u": [0, 100, 1100, 10]}
+      ],
+      "expected": {"rules": {}}
+    },
+    {
+      "name": "reread_after_edit",
+      "note": "間に同じ path の Edit があれば数えない",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Read", {"file_path": "/f.py"}]]},
+        {"res": "t1", "lines": [1, 10], "fill": "x"},
+        {"req": "B", "u": [0, 100, 1000, 10], "tools": [["t2", "Edit", {"file_path": "/f.py", "old_string": "x", "new_string": "y"}]]},
+        {"res": "t2", "text": "ok"},
+        {"req": "C", "u": [0, 100, 1100, 10], "tools": [["t3", "Read", {"file_path": "/f.py"}]]},
+        {"res": "t3", "lines": [1, 10], "fill": "y"},
+        {"req": "D", "u": [0, 100, 1200, 10]}
+      ],
+      "expected": {"rules": {}}
+    },
+    {
+      "name": "reread_after_bash_with_path",
+      "note": "間にその path を含む Bash があれば数えない",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Read", {"file_path": "/f.py"}]]},
+        {"res": "t1", "lines": [1, 10], "fill": "x"},
+        {"req": "B", "u": [0, 100, 1000, 10], "tools": [["t2", "Bash", {"command": "python3 fix.py /f.py"}]]},
+        {"res": "t2", "text": "done"},
+        {"req": "C", "u": [0, 100, 1100, 10], "tools": [["t3", "Read", {"file_path": "/f.py"}]]},
+        {"res": "t3", "lines": [1, 10], "fill": "y"},
+        {"req": "D", "u": [0, 100, 1200, 10]}
+      ],
+      "expected": {"rules": {}}
+    },
+    {
+      "name": "repeated_failure_hit",
+      "note": "同じ呼び出しが 2 回失敗。2 回目は Δ = 1200 − 1100 − 20 = 80 と、呼び出した B の output 20。コスト 80 × 1.25 + 20 × 5",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "make test"}]]},
+        {"res": "t1", "fill": "e", "bytes": 100, "err": true},
+        {"req": "B", "u": [0, 100, 1000, 20], "tools": [["t2", "Bash", {"command": "make test"}]]},
+        {"res": "t2", "fill": "e", "bytes": 100, "err": true},
+        {"req": "C", "u": [0, 100, 1100, 10]}
+      ],
+      "expected": {"rules": {"repeated_failure": [1, 100]},
+                   "findings": [["repeated_failure", "t2", 100, 200, "delta"]]}
+    },
+    {
+      "name": "repeated_failure_after_edit",
+      "note": "間に Edit があれば数えない（TDD の Red など）。失敗 2 回は failure_streak（3）未満",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "make test"}]]},
+        {"res": "t1", "fill": "e", "bytes": 100, "err": true},
+        {"req": "B", "u": [0, 100, 1000, 10], "tools": [["t2", "Edit", {"file_path": "/f.py", "old_string": "a", "new_string": "b"}]]},
+        {"res": "t2", "text": "ok"},
+        {"req": "C", "u": [0, 100, 1100, 10], "tools": [["t3", "Bash", {"command": "make test"}]]},
+        {"res": "t3", "fill": "e", "bytes": 100, "err": true},
+        {"req": "D", "u": [0, 100, 1200, 10]}
+      ],
+      "expected": {"rules": {}, "streaks": []}
+    },
+    {
+      "name": "failure_streak_hint",
+      "note": "Edit を挟んで同じ command_key が 3 回続けて失敗。トークンは数えず hints に出す",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "pytest -q"}]]},
+        {"res": "t1", "fill": "e", "bytes": 100, "err": true},
+        {"req": "B", "u": [0, 100, 1000, 10], "tools": [["t2", "Edit", {"file_path": "/f.py", "old_string": "a", "new_string": "b"}]]},
+        {"res": "t2", "text": "ok"},
+        {"req": "C", "u": [0, 100, 1100, 10], "tools": [["t3", "Bash", {"command": "pytest -q"}]]},
+        {"res": "t3", "fill": "f", "bytes": 100, "err": true},
+        {"req": "D", "u": [0, 100, 1200, 10], "tools": [["t4", "Edit", {"file_path": "/f.py", "old_string": "b", "new_string": "c"}]]},
+        {"res": "t4", "text": "ok"},
+        {"req": "E", "u": [0, 100, 1300, 10], "tools": [["t5", "Bash", {"command": "pytest -q"}]]},
+        {"res": "t5", "fill": "g", "bytes": 100, "err": true},
+        {"req": "F", "u": [0, 100, 1400, 10]}
+      ],
+      "expected": {"rules": {}, "streaks": [["Bash:pytest", 3]]}
+    },
+    {
+      "name": "precedence_failure_over_duplicate_and_oversized",
+      "note": "t2 は失敗の繰り返し・重複・大きすぎるの全部に当たるが repeated_failure だけで数える（290 + output 10）。t1 は初回の失敗なので oversized（290 × 300 / 600 = 145）",
+      "config": {"oversized_bytes": 300},
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "make big"}]]},
+        {"res": "t1", "fill": "z", "bytes": 600, "err": true},
+        {"req": "B", "u": [0, 300, 1000, 10], "tools": [["t2", "Bash", {"command": "make big"}]]},
+        {"res": "t2", "fill": "z", "bytes": 600, "err": true},
+        {"req": "C", "u": [0, 300, 1300, 10]}
+      ],
+      "expected": {"rules": {"oversized_output": [1, 145], "repeated_failure": [1, 300]},
+                   "findings": [["repeated_failure", "t2", 300, 412.5, "delta"],
+                                ["oversized_output", "t1", 145, 195.75, "delta"]]}
+    },
+    {
+      "name": "cache_rewrite_idle",
+      "note": "人の発言まで 1000 秒（> 300）。cache 読み込み 0 < 1000 × 0.5、min(1100, 1000 − 0) = 1000、コスト 1000 × (1.25 − 0.1)",
+      "events": [
+        {"user": "go", "t": 0},
+        {"req": "A", "u": [0, 1000, 0, 10], "t": 1},
+        {"user": "next", "t": 1000},
+        {"req": "B", "u": [0, 1100, 0, 10], "t": 1001}
+      ],
+      "expected": {"rules": {"cache_rewrite": [1, 1000]}, "causes": {"idle": [1, 1000]},
+                   "findings": [["cache_rewrite", 1, 1000, 1150, null]]}
+    },
+    {
+      "name": "cache_rewrite_tool_wait",
+      "note": "ツール結果を 900 秒待った後の書き直しは tool_wait",
+      "events": [
+        {"user": "go", "t": 0},
+        {"req": "A", "u": [0, 1000, 0, 10], "t": 1, "tools": [["t1", "Bash", {"command": "sleep 900"}]]},
+        {"res": "t1", "text": "done", "t": 900},
+        {"req": "B", "u": [0, 1100, 0, 10], "t": 901}
+      ],
+      "expected": {"rules": {"cache_rewrite": [1, 1000]}, "causes": {"tool_wait": [1, 1000]}}
+    },
+    {
+      "name": "cache_rewrite_within_1h_ttl",
+      "note": "1h cache を書いた後の 1000 秒（≤ 3600）は break。コスト 1000 × (2 − 0.1)",
+      "events": [
+        {"user": "go", "t": 0},
+        {"req": "A", "u": [0, 1000, 0, 10], "h1": true, "t": 1},
+        {"user": "next", "t": 1000},
+        {"req": "B", "u": [0, 1100, 0, 10], "h1": true, "t": 1001}
+      ],
+      "expected": {"rules": {"cache_rewrite": [1, 1000]}, "causes": {"break": [1, 1000]},
+                   "findings": [["cache_rewrite", 1, 1000, 1900, null]]}
+    },
+    {
+      "name": "cache_rewrite_exact_ratio",
+      "note": "cache 読み込み 500 = 1000 × 0.5 は「未満」ではないので数えない",
+      "events": [
+        {"user": "go", "t": 0},
+        {"req": "A", "u": [0, 1000, 0, 10], "t": 1},
+        {"user": "next", "t": 1000},
+        {"req": "B", "u": [0, 600, 500, 10], "t": 1001}
+      ],
+      "expected": {"rules": {}}
+    },
+    {
+      "name": "cache_rewrite_after_compact",
+      "note": "間に compact_boundary があれば数えない",
+      "events": [
+        {"user": "go", "t": 0},
+        {"req": "A", "u": [0, 1000, 0, 10], "t": 1},
+        {"compact": true, "t": 2},
+        {"user": "next", "t": 1000},
+        {"req": "B", "u": [0, 1100, 0, 10], "t": 1001}
+      ],
+      "expected": {"rules": {}}
+    },
+    {
+      "name": "context_bloat_subtracts_other_rules",
+      "note": "予算 1000。t1 は oversized 590 × 1000 / 2000 = 295（B で文脈に入る）。肥大は B 1500 − 1000 − 295 = 205、C 1600 − 1000 − 295 = 305。予算超過後のリクエストは C の 1",
+      "config": {"context_budget": 1000, "oversized_bytes": 1000},
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 900, 0, 10], "tools": [["t1", "Bash", {"command": "cat big.log"}]]},
+        {"res": "t1", "fill": "a", "bytes": 2000},
+        {"req": "B", "u": [0, 600, 900, 10]},
+        {"req": "C", "u": [0, 100, 1500, 10]}
+      ],
+      "expected": {"rules": {"oversized_output": [1, 295], "context_bloat": [2, 510]}, "after_budget": 1,
+                   "findings": [["oversized_output", "t1", 295, 398.25, "delta"],
+                                ["context_bloat", 2, 305, 30.5, null],
+                                ["context_bloat", 1, 205, 20.5, null]]}
+    },
+    {
+      "name": "sidechain_is_independent",
+      "note": "本体と sidechain の同じ出力は別ストリームなので重複にしない",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "git status"}]]},
+        {"res": "t1", "fill": "s", "bytes": 400},
+        {"req": "S", "u": [0, 1000, 0, 10], "side": true, "tools": [["t2", "Bash", {"command": "git status"}]]},
+        {"res": "t2", "fill": "s", "bytes": 400, "side": true},
+        {"req": "S2", "u": [0, 0, 1000, 10], "side": true},
+        {"req": "B", "u": [0, 200, 1000, 10]}
+      ],
+      "expected": {"rules": {}}
+    }
+  ]
+}

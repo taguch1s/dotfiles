@@ -19,7 +19,10 @@ assistant 行は 1 リクエストが複数行に分かれるので requestId �
   "weights" 以外のキーは無視するので、推定の根拠などを併記してよい）
 
 使い方:
-  claude-token-metrics session [--weights k=v,...] <transcript.jsonl>   1 行の JSON を出す
+  claude-token-metrics session [--weights k=v,...] [--waste-config <path>] <transcript.jsonl>
+      1 行の JSON を出す（waste に無駄検出の結果が入る）
+  claude-token-metrics waste [--json] [--waste-config <path>] <transcript.jsonl>
+      無駄検出の結果をルール別の表で出す。設定は ${XDG_CONFIG_HOME:-~/.config}/claude-token-metrics/waste.json
   claude-token-metrics record [--foreground]   SessionEnd hook 用（stdin の JSON を読む）
   claude-token-metrics report [--since YYYY-MM-DD] [--json]
   claude-token-metrics calibrate [--since YYYY-MM-DD] [--json] [--write]
@@ -33,6 +36,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import datetime as dt
+import hashlib
 import json
 import lzma
 import math
@@ -196,6 +200,12 @@ class Stream:
         self.tool_results: list[tuple[str, bytes]] = []
         self.compact_boundaries = 0
         self.tools = tools  # tool_use_id -> (name, input)。同じファイル内で共有する
+        # 無駄検出（waste）用。results は tool_results と同じ順で、is_error・timestamp と、
+        # 直前のリクエストの位置（after。無ければ -1）を持つ。
+        self.results: list[dict] = []
+        self.compact_after: list[int] = []  # compact_boundary の直前のリクエストの位置
+        self.tool_request: dict[str, int] = {}  # tool_use_id -> 呼び出しを出したリクエストの位置
+        self.last_kind: str | None = None  # 直前の行: human / tool_result / assistant
 
 
 class Transcript:
@@ -244,10 +254,14 @@ class Transcript:
         blocks = [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
         if kind == "system" and line.get("subtype") == "compact_boundary":
             stream.compact_boundaries += 1
+            stream.compact_after.append(len(stream.requests) - 1)
         elif kind == "assistant":
+            previous_kind, stream.last_kind = stream.last_kind, "assistant"
+            tool_ids = []
             for block in blocks:
                 if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
                     tools[block["id"]] = (str(block.get("name", "unknown")), block.get("input"))
+                    tool_ids.append(block["id"])
             usage = message.get("usage")
             if not isinstance(usage, dict):
                 self.skipped["no_usage"] += 1
@@ -260,16 +274,32 @@ class Transcript:
             key = line.get("requestId") or message.get("id")
             request.update(timestamp=line.get("timestamp"), request_id=key if isinstance(key, str) else None)
             if isinstance(key, str) and key in stream.request_index:
-                stream.requests[stream.request_index[key]] = request  # 同じリクエストは後の行を採用する
-                return
-            if isinstance(key, str):
-                stream.request_index[key] = len(stream.requests)
-            stream.requests.append(request)
+                index = stream.request_index[key]
+                first = stream.requests[index]
+                request.update(prev=first["prev"], first_timestamp=first["first_timestamp"])
+                stream.requests[index] = request  # 同じリクエストは後の行を採用する
+            else:
+                index = len(stream.requests)
+                if isinstance(key, str):
+                    stream.request_index[key] = index
+                request.update(prev=previous_kind, first_timestamp=line.get("timestamp"))
+                stream.requests.append(request)
+            for tool_id in tool_ids:
+                stream.tool_request[tool_id] = index
         elif kind == "user":
+            has_result = False
             for block in blocks:
                 if block.get("type") == "tool_result":
-                    stream.tool_results.append((str(block.get("tool_use_id", "")),
-                                                result_bytes(block.get("content"))))
+                    has_result = True
+                    tool_id, data = str(block.get("tool_use_id", "")), result_bytes(block.get("content"))
+                    stream.tool_results.append((tool_id, data))
+                    stream.results.append({"id": tool_id, "data": data, "is_error": block.get("is_error") is True,
+                                           "timestamp": line.get("timestamp"),
+                                           "after": len(stream.requests) - 1})
+            if has_result:
+                stream.last_kind = "tool_result"
+            elif not line.get("isMeta"):
+                stream.last_kind = "human"
 
 
 # ---- 指標の計算 -------------------------------------------------------------
@@ -385,17 +415,460 @@ def total_metrics(scopes: list[dict], all_requests: list[dict], weights: dict) -
             "low_new_info": _low_list(low)}
 
 
-def session_metrics(transcript_path: str | Path, weights: dict, weights_source: str) -> dict:
-    """1 セッション分の指標を求める。出力の形は SCHEMA（claude-token-metrics/v1）。"""
-    path = Path(transcript_path)
+# ---- 無駄の検出（waste） -----------------------------------------------------
+#
+# transcript の項目（ツール結果のバイト列とハッシュ、ツールの input、is_error、usage、時刻）と
+# 設定の閾値だけで、決定的に無駄なトークンを数える。ルールはストリームごとに独立に適用する。
+
+WASTE_SCHEMA = "claude-token-metrics/waste/v1"
+WASTE_RULES = ("oversized_output", "duplicate_result", "reread_file", "repeated_failure",
+               "cache_rewrite", "context_bloat")
+CACHE_CAUSES = ("idle", "tool_wait", "break")
+EDIT_TOOLS = ("Edit", "MultiEdit", "Write", "NotebookEdit")
+TTL_5M, TTL_1H = 300, 3600
+DEFAULT_WASTE = {
+    "oversized_bytes": 20000,
+    "min_bytes": 200,
+    "exempt_keys": [],
+    "failure_streak": 3,
+    "cache_miss_ratio": 0.5,
+    "cache_ttl_seconds": None,  # None なら 1h cache を書いていれば 3600 秒、なければ 300 秒
+    "context_budget": 150000,
+    "findings_limit": 50,
+    "bytes_per_token": 2.2,  # 根拠は docs/claude-token-metrics.md
+}
+READ_LINE = re.compile(rb"^\s*\d+(?:\t|\xe2\x86\x92)", re.MULTILINE)  # Read の結果の行番号（N\t か N→）
+
+
+def waste_config_path() -> Path:
+    return config_path().with_name("waste.json")
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _waste_value(key: str, value: object) -> object:
+    checks = {
+        "oversized_bytes": (lambda v: _is_int(v) and v >= 0, "0 以上の整数"),
+        "min_bytes": (lambda v: _is_int(v) and v >= 0, "0 以上の整数"),
+        "failure_streak": (lambda v: _is_int(v) and v >= 2, "2 以上の整数"),
+        "findings_limit": (lambda v: _is_int(v) and v >= 0, "0 以上の整数"),
+        "context_budget": (lambda v: _is_int(v) and v >= 1, "1 以上の整数"),
+        "cache_miss_ratio": (lambda v: _is_number(v) and 0 < v <= 1, "0 より大きく 1 以下の数値"),
+        "cache_ttl_seconds": (lambda v: v is None or (_is_number(v) and v > 0), "null か 0 より大きい数値"),
+        "bytes_per_token": (lambda v: _is_number(v) and v > 0, "0 より大きい数値"),
+        "exempt_keys": (lambda v: isinstance(v, list) and all(isinstance(item, str) for item in v),
+                        "文字列の配列"),
+    }
+    check, expected = checks[key]
+    if not check(value):
+        raise ValueError(f"waste の {key} は{expected}にしてください: {value!r}")
+    return sorted(set(value)) if key == "exempt_keys" else value
+
+
+def _waste_overrides(path: Path, *, required: bool) -> dict | None:
+    """waste.json の形のファイルから "waste" を読む。無ければ None。"""
+    if not path.is_file():
+        if required:
+            raise ValueError(f"{path}: ファイルがありません")
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{path}: JSON として読めません（{error}）") from None
+    overrides = data.get("waste", {}) if isinstance(data, dict) else None
+    if not isinstance(overrides, dict):
+        raise ValueError(f"{path}: {{\"waste\": {{...}}}} の形にしてください")
+    return overrides
+
+
+def load_waste_config(cli_path: str | None = None, path: Path | None = None) -> tuple[dict, str, list[str]]:
+    """無駄検出の設定を既定値 < waste.json < --waste-config の順で決め、(設定, 出所, 警告) を返す。
+
+    型・範囲が不正なら ValueError。知らないキーは警告にして無視する。"""
+    config, source, warnings = json.loads(json.dumps(DEFAULT_WASTE)), "default", []
+    for candidate, required, name in ((waste_config_path() if path is None else path, False, "file"),
+                                      (Path(cli_path) if cli_path else None, True, "cli")):
+        if candidate is None:
+            continue
+        overrides = _waste_overrides(candidate, required=required)
+        if overrides is None:
+            continue
+        for key, value in overrides.items():
+            if key not in DEFAULT_WASTE:
+                warnings.append(f"{candidate}: 知らないキー waste.{key} を無視します")
+                continue
+            config[key] = _waste_value(key, value)
+        source = name
+    return config, source, warnings
+
+
+def config_hash(config: dict) -> str:
+    text = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+def context_budget_from_env() -> tuple[int | None, str | None]:
+    """record 時の CLAUDE_CTX_GUARD_TOKENS を読む。(値, 不正なときの警告) を返す。"""
+    raw = os.environ.get("CLAUDE_CTX_GUARD_TOKENS")
+    if raw is None or not raw.strip():
+        return None, None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        return None, f"CLAUDE_CTX_GUARD_TOKENS が 1 以上の整数ではないため無視します: {raw!r}"
+    return value, None
+
+
+def _cc_weight(request: dict, weights: dict) -> float:
+    """cache 作成の多い方（5m / 1h）の重み。"""
+    if request["cache_creation_1h"] > request["cache_creation_5m"]:
+        return weights["cache_creation_1h"]
+    return weights["cache_creation_5m"]
+
+
+def _segments(stream: Stream) -> tuple[list[int], list[int], int]:
+    """リクエストごとの区切りの番号、その区切りの最後のリクエストの位置、末尾の後の区切り番号を返す。
+
+    区切りは compact_boundary か、文脈の急減（L1 の drops と同じ条件）。"""
+    requests, compact = stream.requests, set(stream.compact_after)
+    segment, current = [], 0
+    for index, request in enumerate(requests):
+        if index:
+            before, now = requests[index - 1]["context"], request["context"]
+            if index - 1 in compact or (now < before * DROP_RATIO and before - now >= DROP_MIN_TOKENS):
+                current += 1
+        segment.append(current)
+    last = {value: index for index, value in enumerate(segment)}
+    tail = current + 1 if requests and len(requests) - 1 in compact else current
+    return segment, [last[value] for value in segment], tail
+
+
+def _estimates(stream: Stream, segment: list[int], bytes_per_token: float) -> list[tuple[float, str]]:
+    """ツール結果ごとの (推定トークン数, delta|bytes)。
+
+    呼び出しを出したリクエスト R_k と次のリクエスト R_k+1 が同じ区切りにあり、
+    Δ = 文脈(R_k+1) − 文脈(R_k) − output(R_k) > 0 なら、その間のツール結果に Δ をバイト数の比で配る。"""
+    requests, results = stream.requests, stream.results
+    groups: dict[int, list[int]] = {}
+    for index, result in enumerate(results):
+        groups.setdefault(result["after"], []).append(index)
+    estimates: list[tuple[float, str]] = [(0.0, "bytes")] * len(results)
+    for after, indexes in groups.items():
+        total = sum(len(results[index]["data"]) for index in indexes)
+        delta = 0
+        if 0 <= after and after + 1 < len(requests) and segment[after] == segment[after + 1]:
+            delta = requests[after + 1]["context"] - requests[after]["context"] - requests[after]["output"]
+        for index in indexes:
+            size = len(results[index]["data"])
+            if delta > 0 and total > 0:
+                estimates[index] = (delta * size / total, "delta")
+            else:
+                estimates[index] = (size / bytes_per_token, "bytes")
+    return estimates
+
+
+def _read_range(tool_input: object, data: bytes) -> tuple[int, int]:
+    """Read の (開始行, 行数)。開始行は offset（既定 1）、行数は結果の行番号つきの行の数。"""
+    offset = tool_input.get("offset") if isinstance(tool_input, dict) else None
+    start = offset if _is_int(offset) and offset >= 1 else 1
+    count = len(READ_LINE.findall(data))
+    if not count and data:
+        count = data.count(b"\n") + (0 if data.endswith(b"\n") else 1)
+    return start, count
+
+
+def _overlap(start: int, end: int, ranges: list[tuple[int, int]]) -> int:
+    """[start, end] のうち、ranges（閉区間）の和集合に入る行数。"""
+    covered, cursor = 0, start
+    for low, high in sorted(ranges):
+        low, high = max(low, cursor), min(high, end)
+        if low <= high:
+            covered += high - low + 1
+            cursor = high + 1
+    return covered
+
+
+class StreamWaste:
+    """1 ストリームの無駄を数える。"""
+
+    def __init__(self, stream: Stream, scope: str, file: str, weights: dict, config: dict):
+        self.stream, self.scope, self.file = stream, scope, file
+        self.weights, self.config = weights, config
+        self.segment, self.segment_end, self.tail = _segments(stream)
+        self.findings: list[dict] = []
+        self.streaks: list[dict] = []
+        # リクエストの位置 -> そのリクエストで文脈に入った、ツール結果のルールで数えたトークン
+        self.resident: dict[int, float] = {}
+
+    # -- 共通 --
+    def residence_cost(self, tokens: float, read: int | None) -> float:
+        """t × (w_cc + w_cr × (n − 1))。n は R_k+1 から区切り（なければ末尾）までのリクエスト数。"""
+        if read is None:
+            return 0.0  # 次のリクエストがない（文脈に入らずに終わった）
+        reads = self.segment_end[read] - read + 1
+        request = self.stream.requests[read]
+        return tokens * (_cc_weight(request, self.weights) + self.weights["cache_read"] * (reads - 1))
+
+    def finding(self, rule: str, *, index: int | None, timestamp: object, tool_use_id: str | None,
+                key: str | None, tokens: float, source: str | None, cost: float, detail: dict) -> None:
+        self.findings.append({"rule": rule, "scope": self.scope, "file": self.file, "request_index": index,
+                              "timestamp": timestamp, "tool_use_id": tool_use_id, "key": key,
+                              "tokens": tokens, "token_source": source, "weighted_cost": cost,
+                              "detail": detail})
+
+    # -- ツール結果のルール --
+    def tool_rules(self) -> None:
+        stream, config = self.stream, self.config
+        requests, results = stream.requests, stream.results
+        estimates = _estimates(stream, self.segment, config["bytes_per_token"])
+        exempt = set(config["exempt_keys"])
+        current = None
+        hashes: dict[str, str] = {}  # sha256 -> 最初の tool_use_id（今の区切りの中）
+        reads: dict[str, list[tuple[int, int, str, str]]] = {}  # path -> (開始, 終了, sha256, tool_use_id)
+        failures: dict[str, str] = {}  # 正規化した呼び出し -> 最初に失敗した tool_use_id
+        runs: dict[str, dict] = {}  # command_key -> 続いている失敗
+        outputs_counted: set[int] = set()
+        for position, result in enumerate(results):
+            tool_id, data = result["id"], result["data"]
+            name, tool_input = stream.tools.get(tool_id, ("unknown", None))
+            key = command_key(name, tool_input)
+            read = result["after"] + 1 if result["after"] + 1 < len(requests) else None
+            segment = self.segment[read] if read is not None else self.tail
+            if segment != current:
+                current = segment
+                hashes.clear()
+                reads.clear()
+            size, digest = len(data), hashlib.sha256(data).hexdigest()
+            tokens, source = estimates[position]
+            owner = stream.tool_request.get(tool_id, result["after"] if result["after"] >= 0 else None)
+            match = None  # (rule, 数えたツール結果のトークン, 追加の output, detail)
+
+            if result["is_error"]:
+                signature = name + "\0" + json.dumps(tool_input, sort_keys=True, ensure_ascii=False)
+                if signature in failures:
+                    match = ("repeated_failure", tokens, 0, {"first_tool_use_id": failures[signature]})
+                else:
+                    failures[signature] = tool_id
+                run = runs.setdefault(key, {"count": 0, "first": tool_id, "position": position})
+                run["count"] += 1
+                run["last"] = tool_id
+            elif key in runs:
+                self.close_run(key, runs.pop(key))
+
+            if size >= config["min_bytes"]:
+                if digest in hashes and match is None and key not in exempt:
+                    match = ("duplicate_result", tokens, 0,
+                             {"bytes": size, "sha256": digest[:12], "first_tool_use_id": hashes[digest]})
+                hashes.setdefault(digest, tool_id)
+
+            path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+            if name == "Read" and isinstance(path, str) and not result["is_error"]:
+                start, count = _read_range(tool_input, data)
+                end = start + count - 1
+                previous = reads.setdefault(path, [])
+                if match is None and count and previous and all(item[2] != digest for item in previous):
+                    overlap = _overlap(start, end, [(item[0], item[1]) for item in previous])
+                    if overlap:
+                        match = ("reread_file", tokens * overlap / count, 0,
+                                 {"path": path, "lines": [start, end], "overlap_lines": overlap,
+                                  "first_tool_use_id": previous[0][3]})
+                previous.append((start, end, digest, tool_id))
+
+            limit = config["oversized_bytes"]
+            if match is None and size > limit and key not in exempt:
+                match = ("oversized_output", tokens * (size - limit) / size, 0,
+                         {"bytes": size, "threshold": limit})
+
+            if match is not None:
+                rule, counted, extra, detail = match
+                cost = self.residence_cost(counted, read)
+                if rule == "repeated_failure" and owner is not None and owner not in outputs_counted:
+                    outputs_counted.add(owner)
+                    extra = requests[owner]["output"]
+                    cost += extra * self.weights["output"]
+                if rule == "repeated_failure":
+                    detail.update(tool_tokens=counted, output_tokens=extra)
+                if read is not None:
+                    self.resident[read] = self.resident.get(read, 0.0) + counted
+                self.finding(rule, index=owner, timestamp=result["timestamp"], tool_use_id=tool_id, key=key,
+                             tokens=counted + extra, source=source, cost=cost, detail=detail)
+
+            # 変更の可能性がある呼び出しの後は、読み直し・失敗の繰り返しとみなさない。
+            if name in EDIT_TOOLS:
+                failures.clear()
+                if isinstance(tool_input, dict):
+                    reads.pop(tool_input.get("file_path") or tool_input.get("notebook_path"), None)
+            elif name == "Bash" and isinstance(tool_input, dict):
+                command = str(tool_input.get("command", ""))
+                for target in [target for target in reads if target in command]:
+                    del reads[target]
+        for key in list(runs):
+            self.close_run(key, runs.pop(key))
+
+    def close_run(self, key: str, run: dict) -> None:
+        if run["count"] >= self.config["failure_streak"]:
+            self.streaks.append({"scope": self.scope, "file": self.file, "key": key, "count": run["count"],
+                                 "first_tool_use_id": run["first"], "last_tool_use_id": run["last"],
+                                 "_position": run["position"]})
+
+    # -- cache 切れ後の書き直し --
+    def cache_rewrite(self) -> None:
+        requests, weights, config = self.stream.requests, self.weights, self.config
+        compact = set(self.stream.compact_after)
+        wrote_1h = False
+        for index in range(1, len(requests)):
+            before, request = requests[index - 1], requests[index]
+            wrote_1h = wrote_1h or before["cache_creation_1h"] > 0
+            if index - 1 in compact or not request["cache_read"] < before["context"] * config["cache_miss_ratio"]:
+                continue
+            created = request["cache_creation_5m"] + request["cache_creation_1h"]
+            tokens = min(created, before["context"] - request["cache_read"])
+            if tokens <= 0:
+                continue
+            ttl = config["cache_ttl_seconds"] or (TTL_1H if wrote_1h else TTL_5M)
+            start, end = epoch(before.get("first_timestamp")), epoch(request.get("first_timestamp"))
+            gap = end - start if start is not None and end is not None else None
+            if gap is None or gap <= ttl:
+                cause = "break"
+            else:
+                cause = "idle" if request.get("prev") == "human" else "tool_wait"
+            cost = tokens * (_cc_weight(request, weights) - weights["cache_read"])
+            self.finding("cache_rewrite", index=index, timestamp=request.get("first_timestamp"),
+                         tool_use_id=None, key=None, tokens=tokens, source=None, cost=cost,
+                         detail={"cause": cause, "gap_seconds": gap, "ttl_seconds": ttl,
+                                 "cache_read": request["cache_read"], "previous_context": before["context"]})
+
+    # -- 文脈の肥大（本体だけ） --
+    def context_bloat(self, budget: int) -> int:
+        """予算を超えた分から、他のルールで数えて文脈に残っている分を引いて数える。
+        予算を最初に超えたリクエストより後のリクエスト数を返す。"""
+        current, resident, first_over = None, 0.0, None
+        requests = self.stream.requests
+        for index, request in enumerate(requests):
+            if self.segment[index] != current:
+                current, resident = self.segment[index], 0.0
+            resident += self.resident.get(index, 0.0)
+            excess = request["context"] - budget - resident
+            if excess > 0:
+                self.finding("context_bloat", index=index, timestamp=request.get("first_timestamp"),
+                             tool_use_id=None, key=None, tokens=excess, source=None,
+                             cost=excess * self.weights["cache_read"],
+                             detail={"context": request["context"], "budget": budget, "resident_waste": resident})
+            if request["context"] > budget and first_over is None:
+                first_over = index
+        return 0 if first_over is None else len(requests) - first_over - 1
+
+
+def _rule_total() -> dict:
+    return {"count": 0, "tokens": 0.0, "weighted_cost": 0.0}
+
+
+def _add(total: dict, finding: dict) -> None:
+    total["count"] += 1
+    total["tokens"] += finding["tokens"]
+    total["weighted_cost"] += finding["weighted_cost"]
+
+
+def _rounded(value: object, digits: int) -> object:
+    return round(value, digits) if isinstance(value, float) else value
+
+
+def waste_metrics(streams: list[tuple[str, str, Stream]], weights: dict, config: dict, source: str,
+                  session_cost: float, budget: int | None = None) -> dict:
+    """streams は (scope, file, Stream) の一覧。budget が None なら config の context_budget を使う。"""
+    budget_source = "config" if budget is None else "env"
+    budget = config["context_budget"] if budget is None else budget
+    findings, streaks, after_budget = [], [], 0
+    for scope, file, stream in streams:
+        detector = StreamWaste(stream, scope, file, weights, config)
+        detector.tool_rules()
+        detector.cache_rewrite()
+        if scope == "main":
+            after_budget = detector.context_bloat(budget)
+        findings.extend(detector.findings)
+        streaks.extend(detector.streaks)
+
+    rules = {rule: _rule_total() for rule in WASTE_RULES}
+    causes = {cause: _rule_total() for cause in CACHE_CAUSES}
+    for finding in findings:
+        _add(rules[finding["rule"]], finding)
+        if finding["rule"] == "cache_rewrite":
+            _add(causes[finding["detail"]["cause"]], finding)
+    for totals in (*rules.values(), *causes.values()):
+        totals["tokens"], totals["weighted_cost"] = round(totals["tokens"], 1), round(totals["weighted_cost"], 4)
+    rules["context_bloat"].update(budget=budget, budget_source=budget_source)
+    tokens = sum(rules[rule]["tokens"] for rule in WASTE_RULES)
+    cost = sum(rules[rule]["weighted_cost"] for rule in WASTE_RULES)
+
+    scope_order = {"main": 0, "sidechain": 1, "subagents": 2}
+    findings.sort(key=lambda item: (-item["weighted_cost"], scope_order.get(item["scope"], 3), item["file"],
+                                    item["request_index"] if item["request_index"] is not None else -1,
+                                    item["tool_use_id"] or "", WASTE_RULES.index(item["rule"])))
+    for finding in findings:
+        finding["tokens"] = round(finding["tokens"], 1)
+        finding["weighted_cost"] = round(finding["weighted_cost"], 4)
+        finding["detail"] = {key: _rounded(value, 1) for key, value in finding["detail"].items()}
+    streaks.sort(key=lambda item: (scope_order.get(item["scope"], 3), item["file"], item["_position"]))
+    for streak in streaks:
+        del streak["_position"]
+    return {
+        "schema": WASTE_SCHEMA,
+        "config": config, "config_hash": config_hash(config), "config_source": source,
+        "rules": rules,
+        "cache_rewrite_by_cause": causes,
+        "total": {"tokens": round(tokens, 1), "weighted_cost": round(cost, 4),
+                  "share": round(cost / session_cost, 6) if session_cost else None},
+        "findings": findings[:config["findings_limit"]],
+        "hints": {"failure_streaks": streaks, "requests_after_budget": after_budget},
+    }
+
+
+# ---- セッションの集計 -----------------------------------------------------------
+
+def read_session(path: Path) -> tuple[Transcript, list[tuple[str, str, Stream]], int]:
+    """本体と subagents を読み、(Transcript, [(scope, file, Stream)], subagents のファイル数) を返す。"""
     transcript = Transcript()
     main, side = transcript.read(path, split_sidechain=True)
     files = sorted((path.parent / path.stem / "subagents").glob("*.jsonl"))
-    subagents = [transcript.read(file, split_sidechain=False)[0] for file in files]
+    streams = [("main", path.name, main), ("sidechain", path.name, side)]
+    streams += [("subagents", file.name, transcript.read(file, split_sidechain=False)[0]) for file in files]
+    return transcript, streams, len(files)
+
+
+def default_waste_options() -> dict:
+    return {"config": json.loads(json.dumps(DEFAULT_WASTE)), "source": "default", "budget": None}
+
+
+def session_waste(transcript_path: str | Path, weights: dict, waste_options: dict | None = None) -> dict:
+    """waste だけを求める（L2 の圧縮を計算しない）。"""
+    options = waste_options or default_waste_options()
+    _, streams, _ = read_session(Path(transcript_path))
+    requests = [request for _, _, stream in streams for request in stream.requests]
+    return waste_metrics(streams, weights, options["config"], options["source"],
+                         l0(requests, weights)["weighted_cost"], options.get("budget"))
+
+
+def session_metrics(transcript_path: str | Path, weights: dict, weights_source: str,
+                    waste_options: dict | None = None) -> dict:
+    """1 セッション分の指標を求める。出力の形は SCHEMA（claude-token-metrics/v1）。"""
+    path = Path(transcript_path)
+    options = waste_options or default_waste_options()
+    transcript, streams, file_count = read_session(path)
+    main, side = streams[0][2], streams[1][2]
+    subagents = [stream for _, _, stream in streams[2:]]
 
     scopes = {"main": scope_metrics([main], weights), "sidechain": scope_metrics([side], weights),
-              "subagents": {"files": len(files), **scope_metrics(subagents, weights)}}
+              "subagents": {"files": file_count, **scope_metrics(subagents, weights)}}
     all_requests = [request for stream in (main, side, *subagents) for request in stream.requests]
+    total = total_metrics(list(scopes.values()), all_requests, weights)
     return {
         "schema": SCHEMA,
         "session_id": transcript.session_id or path.stem,
@@ -408,22 +881,104 @@ def session_metrics(transcript_path: str | Path, weights: dict, weights_source: 
         "weights_source": weights_source,
         "skipped": transcript.skipped,
         **scopes,
-        "total": total_metrics(list(scopes.values()), all_requests, weights),
+        "total": total,
+        "waste": waste_metrics(streams, weights, options["config"], options["source"],
+                               total["weighted_cost"], options.get("budget")),
     }
 
 
 # ---- サブコマンド -----------------------------------------------------------
 
-def command_session(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+def _cli_settings(args: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[dict, str, dict]:
+    """--weights と --waste-config を読む。不正なら exit 2。"""
     try:
         weights, source = load_weights(args.weights)
+        config, waste_source, warnings = load_waste_config(args.waste_config)
     except (ValueError, OSError) as error:
         parser.error(str(error))
+    for warning in warnings:
+        print(f"claude-token-metrics: {warning}", file=sys.stderr)
+    return weights, source, {"config": config, "source": waste_source, "budget": None}
+
+
+def command_session(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    weights, source, waste_options = _cli_settings(args, parser)
     if not Path(args.transcript).is_file():
         print(f"claude-token-metrics: トランスクリプトがありません: {args.transcript}", file=sys.stderr)
         return 1
-    print(json.dumps(session_metrics(args.transcript, weights, source), ensure_ascii=False))
+    print(json.dumps(session_metrics(args.transcript, weights, source, waste_options), ensure_ascii=False))
     return 0
+
+
+def _short(value: object, width: int) -> str:
+    text = "-" if value is None else str(value)
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def _table(rows: list[tuple]) -> None:
+    widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]) - 1)]
+    for row in rows:
+        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)) + "  " + row[-1])
+
+
+def print_waste(waste: dict) -> None:
+    total = waste["total"]
+    print(f"無駄: {_count(total['tokens'])} トークン、重み付きコスト {_count(total['weighted_cost'])}"
+          f"（セッションの {_percent(total['share'])}）  config {waste['config_hash']}（{waste['config_source']}）")
+    rows = [("rule", "count", "tokens", "cost", "")]
+    for rule, totals in waste["rules"].items():
+        note = ""
+        if rule == "cache_rewrite":
+            note = ", ".join(f"{cause} {value['count']}" for cause, value in waste["cache_rewrite_by_cause"].items())
+        elif rule == "context_bloat":
+            note = f"予算 {totals['budget']}（{totals['budget_source']}）"
+        rows.append((rule, str(totals["count"]), _count(totals["tokens"]), _count(totals["weighted_cost"]), note))
+    _table(rows)
+    hints = waste["hints"]
+    print(f"予算を超えた後のリクエスト: {hints['requests_after_budget']}")
+    for streak in hints["failure_streaks"]:
+        print(f"続いた失敗: {streak['key']} × {streak['count']}（{streak['scope']} {streak['first_tool_use_id']}〜）")
+    if not waste["findings"]:
+        return
+    print()
+    rows = [("rule", "scope", "req", "key", "tokens", "cost", "src", "tool_use_id / detail")]
+    for finding in waste["findings"]:
+        detail = finding["detail"]
+        target = finding["tool_use_id"] or ""
+        extra = detail.get("path") or detail.get("cause") or detail.get("sha256") or ""
+        rows.append((finding["rule"], finding["scope"], _count(finding["request_index"]),
+                     _short(finding["key"], 24), _count(finding["tokens"]), _count(finding["weighted_cost"]),
+                     finding["token_source"] or "-", " ".join(filter(None, (target, str(extra))))))
+    _table(rows)
+
+
+def command_waste(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    weights, _, waste_options = _cli_settings(args, parser)
+    if not Path(args.transcript).is_file():
+        print(f"claude-token-metrics: トランスクリプトがありません: {args.transcript}", file=sys.stderr)
+        return 1
+    waste = session_waste(args.transcript, weights, waste_options)
+    if args.json:
+        print(json.dumps(waste, ensure_ascii=False))
+    else:
+        print_waste(waste)
+    return 0
+
+
+def record_waste_options() -> dict:
+    """record 用の設定。不正な設定は既定値にし、理由を stderr（record.log）に残す。"""
+    try:
+        config, source, warnings = load_waste_config()
+    except (ValueError, OSError) as error:
+        print(f"claude-token-metrics record: waste の設定が不正なため既定値で集計します: {error}", file=sys.stderr)
+        options, warnings = default_waste_options(), []
+    else:
+        options = {"config": config, "source": source, "budget": None}
+    budget, warning = context_budget_from_env()
+    for message in (*warnings, *([warning] if warning else [])):
+        print(f"claude-token-metrics record: {message}", file=sys.stderr)
+    options["budget"] = budget
+    return options
 
 
 def record_foreground(raw: str) -> None:
@@ -434,7 +989,7 @@ def record_foreground(raw: str) -> None:
     if not isinstance(transcript, str) or not Path(transcript).is_file():
         raise ValueError(f"transcript_path がありません: {transcript!r}")
     weights, source = load_weights()
-    metrics = session_metrics(transcript, weights, source)
+    metrics = session_metrics(transcript, weights, source, record_waste_options())
     if isinstance(payload.get("session_id"), str):
         metrics["session_id"] = payload["session_id"]
     metrics.update({"recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -881,7 +1436,13 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     session = commands.add_parser("session", help="1 セッションの指標を 1 行の JSON で出す")
     session.add_argument("--weights", help="重みの上書き（例: input=1,output=5）")
+    session.add_argument("--waste-config", help="無駄検出の設定ファイル（waste.json と同じ形）")
     session.add_argument("transcript")
+    waste = commands.add_parser("waste", help="1 セッションの無駄（waste）をルール別の表で出す")
+    waste.add_argument("--weights", help="重みの上書き（例: input=1,output=5）")
+    waste.add_argument("--waste-config", help="無駄検出の設定ファイル（waste.json と同じ形）")
+    waste.add_argument("--json", action="store_true", help="waste を JSON で出す")
+    waste.add_argument("transcript")
     record = commands.add_parser("record", help="SessionEnd hook 用。stdin の transcript_path を集計して追記する")
     record.add_argument("--foreground", action="store_true", help="切り離さずにその場で集計する")
     report = commands.add_parser("report", help="記録したセッションの一覧を出す")
@@ -903,6 +1464,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "session":
         return command_session(args, session)
+    if args.command == "waste":
+        return command_waste(args, waste)
     if args.command == "record":
         return command_record(args)
     if args.command == "calibrate":
