@@ -37,3 +37,7 @@ reason = "個人利用のため main へ直接 push する"
 [[issue_branch]]
 branch = "feature/issue-46-token-waste-rules"
 handoff = "issue-46-token-waste-rules.md"
+
+[[issue_branch]]
+branch = "feature/issue-47-delegation-restart"
+handoff = "issue-47-delegation-restart.md"

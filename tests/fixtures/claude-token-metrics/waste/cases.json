@@ -332,6 +332,33 @@
         {"req": "B", "u": [0, 200, 1000, 10]}
       ],
       "expected": {"rules": {}}
+    },
+    {
+      "name": "edit_success_message_is_exempt_by_default",
+      "note": "編集の成功メッセージは同じ本文で 200 バイトを超えることがある。exempt_keys の既定に Edit があるので数えない",
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Edit", {"file_path": "/x/a.py"}]]},
+        {"res": "t1", "fill": "s", "bytes": 400},
+        {"req": "B", "u": [0, 200, 1000, 10], "tools": [["t2", "Edit", {"file_path": "/x/a.py"}]]},
+        {"res": "t2", "fill": "s", "bytes": 400},
+        {"req": "C", "u": [0, 200, 1200, 10]}
+      ],
+      "expected": {"rules": {}}
+    },
+    {
+      "name": "edit_success_message_counts_when_not_exempt",
+      "note": "exempt_keys を空にすれば、同じ Edit の重複を数える（Δ = 1400 − 1200 − 10 = 190、コスト 190 × 1.25）",
+      "config": {"exempt_keys": []},
+      "events": [
+        {"user": "go"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Edit", {"file_path": "/x/a.py"}]]},
+        {"res": "t1", "fill": "s", "bytes": 400},
+        {"req": "B", "u": [0, 200, 1000, 10], "tools": [["t2", "Edit", {"file_path": "/x/a.py"}]]},
+        {"res": "t2", "fill": "s", "bytes": 400},
+        {"req": "C", "u": [0, 200, 1200, 10]}
+      ],
+      "expected": {"rules": {"duplicate_result": [1, 190]}, "findings": [["duplicate_result", "t2", 190, 237.5, "delta"]]}
     }
   ]
 }

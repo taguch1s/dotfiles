@@ -118,13 +118,14 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 | `repeated_failure` | `is_error` のツール結果で、ツール名と input（key 順で正規化した JSON）が同じ呼び出しが同じストリームで前にも失敗しており、間に編集系ツールがない。1 回目は数えない | 推定トークン + 呼び出しを出したリクエストの output（同じリクエストは 1 回だけ） | 滞在込み + output × w_out |
 | `cache_rewrite` | 連続するリクエスト R_j−1、R_j で cache 読み込み(R_j) < 文脈(R_j−1) × `cache_miss_ratio`、間に `compact_boundary` がない | min(cache 作成(R_j), 文脈(R_j−1) − cache 読み込み(R_j)) | 無駄トークン × (w_cc − w_cr) |
 | `context_bloat` | 本体のリクエストの文脈が予算を超える | Σ max(0, 文脈 − 予算 − 他のルールで数えて文脈に残っている分) | 無駄トークン × w_cr |
+| `over_delegation` | サブエージェント単位。`trivial` と `duplicate`（下の「委譲と作り直し」） | trivial: cold start のトークン。duplicate: そのサブエージェントの総トークン | trivial: cold start の換算。duplicate: そのサブエージェントの重み付きコスト全部 |
 
 実装の細部：
 
 - `reread_file` の行の範囲は、開始が `offset`（既定 1）、行数が結果の中の行番号つきの行（`N<tab>` / `N→`）の数。失敗した `Read` は記録しない。編集系ツールの結果が来ると、その path の `Read` の記録を消す。`Bash` の command にその path の文字列があっても消す（見逃し側に倒す）。
 - `repeated_failure` の記録は、編集系ツールの結果で全部消す（TDD の Red や、修正のたびに test を流す反復は数えない）。
 - `hints.failure_streaks`：同じ `command_key` の結果が、成功を挟まず `failure_streak` 回以上続けて `is_error` だったもの（他のツールの結果は挟んでよい）。hints 自体はトークンを数えず、`key`、`count`、最初と最後の `tool_use_id` を出す（streak の中の失敗も、`repeated_failure` の条件に当たればそちらで数える）。
-- `duplicate_result` は、同じ path への連続した `Edit` の成功メッセージ（同じ本文で 200 バイトを超えることがある）も数える。避けられない出力なので、気になる場合は `exempt_keys` に `Edit` などを入れる。
+- `duplicate_result` は、同じ path への連続した `Edit` の成功メッセージ（同じ本文で 200 バイトを超えることがある）も数える。避けられない出力なので、`exempt_keys` の既定に編集系ツール（`Edit`・`MultiEdit`・`Write`・`NotebookEdit`）を入れてあり、数えない（数えたいときは `exempt_keys` を上書きして外す）。
 - `cache_rewrite` の `cause`：間隔（両リクエストの最初の行の `timestamp` の差）が TTL を超え、R_j の直前が人の発言なら `idle`、ツール結果なら `tool_wait`。間隔が TTL 以下か取れなければ `break`（system prompt やツール定義の変化など）。TTL は、そのストリームでそれまでに 1h cache を書いていれば 3600 秒、なければ 300 秒（`cache_ttl_seconds` で固定できる）。
 - `context_bloat` の予算は、`record` のときは環境変数 `CLAUDE_CTX_GUARD_TOKENS`（hc の監督役 150000、ワーカー 120000）、無ければ `context_budget`。`session` / `waste` は常に `context_budget` を使う。`hints.requests_after_budget` は最初に予算を超えたリクエストより後の本体のリクエスト数。
 
@@ -133,7 +134,7 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 `${XDG_CONFIG_HOME:-~/.config}/claude-token-metrics/waste.json`。既定値 < 設定ファイル < `--waste-config <path>` の順に上書きする。一部のキーだけでよく、`waste` 以外のキーは読み飛ばす。
 
 ```json
-{"waste": {"oversized_bytes": 20000, "min_bytes": 200, "exempt_keys": [], "failure_streak": 3,
+{"waste": {"oversized_bytes": 20000, "min_bytes": 200, "exempt_keys": ["Edit", "MultiEdit", "NotebookEdit", "Write"], "failure_streak": 3,
            "cache_miss_ratio": 0.5, "cache_ttl_seconds": null, "context_budget": 150000,
            "findings_limit": 50, "bytes_per_token": 2.2}}
 ```
@@ -142,13 +143,23 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 |---|---|---|
 | `oversized_bytes` | 20000 | 0 以上の整数 |
 | `min_bytes` | 200 | 0 以上の整数（`duplicate_result` の対象の下限） |
-| `exempt_keys` | `[]` | `command_key`（`Bash:<先頭語>` かツール名）の配列。`oversized_output` と `duplicate_result` で共有 |
+| `exempt_keys` | `["Edit", "MultiEdit", "NotebookEdit", "Write"]` | `command_key`（`Bash:<先頭語>` かツール名）の配列。`oversized_output` と `duplicate_result` で共有 |
 | `failure_streak` | 3 | 2 以上の整数 |
 | `cache_miss_ratio` | 0.5 | 0 より大きく 1 以下 |
 | `cache_ttl_seconds` | `null` | `null`（自動）か 0 より大きい数値 |
 | `context_budget` | 150000 | 1 以上の整数 |
 | `findings_limit` | 50 | 0 以上の整数 |
 | `bytes_per_token` | 2.2 | 0 より大きい数値 |
+| `trivial_requests` | 3 | 0 以上の整数（`over_delegation.trivial`、下の「委譲と作り直し」） |
+| `trivial_tool_calls` | 2 | 0 以上の整数 |
+| `exempt_agent_types` | `["web-fetch"]` | 文字列の配列（trivial に数えない型） |
+| `under_delegation_bytes` | 400000 | 0 以上の整数 |
+| `resume_markers` | `["【再開】"]` | 文字列の配列 |
+| `resume_window` | 5 | 1 以上の整数 |
+| `supervisor_handoff_paths` | `["hc-supervisor/handoff.md"]` | 文字列の配列 |
+| `startup_cap` | 20 | 1 以上の整数 |
+| `handoff_tail` | 10 | 1 以上の整数 |
+| `handoff_write_paths` | `["codex-handoffs/", "hc-supervisor/handoff.md"]` | 文字列の配列 |
 
 知らないキーは stderr に警告して無視する。型・範囲が不正な値や読めないファイルは、`session` / `waste` では exit 2、`record` では既定値で集計して `record.log` に理由を残す。
 
@@ -161,6 +172,44 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 - `cache_rewrite_by_cause`：`idle` / `tool_wait` / `break` ごとの同じ集計。
 - `total`：`tokens`、`weighted_cost`、`share`（無駄の重み付きコスト ÷ セッションの `total.weighted_cost`。0 なら null）。
 - `findings`：`rule`、`scope`、`file`、`request_index`、`timestamp`、`tool_use_id`、`key`、`tokens`（小数 1 桁）、`token_source`（`delta` / `bytes`。ツール結果以外は null）、`weighted_cost`（小数 4 桁）、`detail`（ルールごとの補足。`Read` の path、ハッシュの先頭 12 文字、閾値、`first_tool_use_id` など。本文は入れない）。重み付きコストの降順、同じなら scope・file・`request_index`・`tool_use_id`・ルールの順で並べ、`findings_limit` 件まで出す。合計は件数を絞る前の全件で数える。
-- `hints`：`failure_streaks`、`requests_after_budget`。
+- `hints`：`failure_streaks`、`requests_after_budget`、`under_delegation`（真偽。下の「委譲と作り直し」）。
+- `rules.over_delegation` はさらに `by_kind`（`trivial` / `duplicate` ごとの `count`、`tokens`、`weighted_cost`）を持つ。finding の `scope` は `subagents`、`file` はサブエージェントのファイル、`tool_use_id` は本体の `Agent` の id、`key` は `Agent:<型>`、`detail.kind` が種類。
 
 同じ transcript と同じ設定なら、`findings` の順序まで同じ結果になる。
+
+## 委譲と作り直し（delegation・restart、#47）
+
+`session` と `record` の JSON に、`delegation`（サブエージェントへの委譲の量と効果）と `restart`（セッションの作り直し）が入る。どちらも transcript と設定の閾値だけで決まる。`over_delegation` は無駄検出のルール（上の表）。
+
+### meta.json との対応づけ
+
+サブエージェントのファイル `<session>/subagents/agent-<id>.jsonl` には `agent-<id>.meta.json` が並ぶ。`toolUseId`（本体の `Agent` の tool_use id）、`agentType`、`model` を読み、`toolUseId` で本体の `Agent`（旧名 `Task` も）と対応づける。`agentType` が無ければ `Agent` の input の `subagent_type` を使う。meta.json が無い・JSON として読めない・`toolUseId` が文字列でないファイルは `unlinked` に数え、`agents` には `tool_use_id: null` で入れる（Claude Code の版で形が変わると、まず `unlinked` が増えるので `versions` と合わせて見る）。`unlinked` のサブエージェントは型が分からないため `over_delegation` の対象にしない。
+
+### `delegation`
+
+- `agent_calls`：本体の `Agent` / `Task` の tool_use の数。
+- `subagent_cost_share`：subagents scope の重み付きコスト ÷ セッション全体（0 なら null）。
+- `subagent_tool_bytes`：サブエージェントのツール結果のバイト数の合計（本体に入らずに済んだ量の上限）。
+- `agent_result_bytes`：本体に返った `Agent` のツール結果のバイト数の合計。バックグラウンド実行のサブエージェントでは、起動時の受付メッセージだけで、後から `<task-notification>` として届く本当の結果は含まない（`compression` は小さめに出る）。
+- `compression`：`agent_result_bytes ÷ subagent_tool_bytes`（小さいほど、委譲で本体の文脈を守れている。分母が 0 なら null）。
+- `main_tool_bytes`：本体（`Agent` の結果を除く）のツール結果のバイト数。`sidechain` は含めない。
+- `unlinked`：meta.json と対応づけられなかったファイルの数。
+- `agents`：サブエージェントごとに `file`、`tool_use_id`、`agent_type`、`model`、`requests`、`tool_calls`、`weighted_cost`、`tokens`（input + cache 作成 + cache 読み込み + output）、`cold_start_tokens`（最初のリクエストの input + cache 作成）、`cold_start_cost`、`result_bytes`（本体に返った結果）、`duplicate_of`（下の `duplicate` の相手の tool_use_id。なければ null）。
+
+### `over_delegation`
+
+- `trivial`：サブエージェントの `requests` ≤ `trivial_requests` かつ `tool_calls` ≤ `trivial_tool_calls`。無駄トークンは `cold_start_tokens`、コストは cold start の換算（input と cache 作成を重みで）。`exempt_agent_types`（ツールの代わりに使う型。既定 `web-fetch`）は数えない。
+- `duplicate`：同じセッションで `prompt` の sha256 と `subagent_type` が、前の `Agent` 呼び出しと一致する。比べる相手は同じ組の直前の呼び出しで、それが `is_error` で終わっていれば、やり直しとして数えない。無駄トークンはそのサブエージェントの総トークン、コストはその重み付きコスト全部。
+- 二重計上：1 つのサブエージェントは 1 件だけ数え、`duplicate` が `trivial` に優先する。`duplicate` に当たったサブエージェントの中の finding（`duplicate_result` など）と failure streak は数えない（`over_delegation.duplicate` > A のルール）。`trivial` のサブエージェントの中の finding はそのまま数える。
+
+### `hints.under_delegation`
+
+`main_tool_bytes` > `under_delegation_bytes` かつ `agent_calls` = 0 のとき true。委譲すべきだったかは設計の判断（#35）なので、無駄トークンには入れず、数値（`delegation.main_tool_bytes`）と一緒に見るためのヒントとして出す。
+
+### `restart`
+
+- `kind`：`resume_worker`（最初の人の発言のいずれかの行が `resume_markers` のどれかで始まる（hc は依頼を `<pasted_content>`・`<hc …>` で包むので、先頭の行とは限らない）。`hc-supervisor resume-worker` の `【再開】<handoff の path>`）、`resume_supervisor`（本体の最初の `resume_window` リクエストの中で、`supervisor_handoff_paths` のどれかを含む path を `Read` するか、それを含む `Bash` を実行した（失敗した呼び出しは数えない）。`hc-supervisor restart` 後の監督役）、`fresh`（どちらでもない）。`resume_worker` を先に判定する。
+- `startup_requests`：最初の編集系ツール（`Edit`・`MultiEdit`・`Write`・`NotebookEdit`）か `git commit` を含む `Bash` を出したリクエストより前のリクエスト数（そのリクエストは含めない）。`startup_cap` で打ち切る。編集がないセッション（調査だけ）は全リクエスト、または `startup_cap` まで伸びる近似である。
+- `startup_cost`：上のリクエストの重み付きコストの合計（文脈を作り直すのにかかった分）。
+- `ended_with_handoff`：最後の `handoff_tail` リクエストの中に、`handoff_write_paths` のどれかを含む path への `Write`・`Edit` がある。
+- 対象は本体のストリームだけで、サブエージェントと `sidechain` は見ない。

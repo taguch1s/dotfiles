@@ -1,0 +1,409 @@
+{
+  "_format": [
+    "委譲・作り直し・over_delegation の fixture。events は waste/cases.json と同じ形（tests/test_claude_token_metrics.py の expand_events が展開する）。",
+    "subagents: ファイル名（agent-<id>）-> {meta, events}。meta は agent-<id>.meta.json の中身（オブジェクト。文字列ならそのまま書く。null なら meta.json を作らない）。",
+    "expected.delegation は部分一致（agents は先頭から順に部分一致）。rules は ルール名 -> [件数, トークン]（トークンが null なら件数だけ見る）。",
+    "kinds は over_delegation の種類別の件数。重みは既定（cc5m 1.25、cc1h 2、cr 0.1、out 5）。"
+  ],
+  "cases": [
+    {
+      "name": "delegation_basic_and_trivial",
+      "note": "ag1 は 2 リクエスト・ツール 1 回で trivial（cold start = 10 + 500 = 510 トークン、コスト 10 + 500 × 1.25 = 635）。ag2 は 4 リクエスト・ツール 3 回。",
+      "events": [
+        {"user": "go"},
+        {"req": "M1", "u": [0, 1000, 0, 10], "tools": [["ag1", "Agent", {"description": "d", "prompt": "p1", "subagent_type": "general-purpose"}], ["ag2", "Agent", {"description": "d", "prompt": "p2", "subagent_type": "Explore"}]]},
+        {"res": "ag1", "fill": "r", "bytes": 100},
+        {"res": "ag2", "fill": "q", "bytes": 300},
+        {"req": "M2", "u": [0, 700, 1000, 10], "tools": [["tb", "Bash", {"command": "git log"}]]},
+        {"res": "tb", "fill": "l", "bytes": 500},
+        {"req": "M3", "u": [0, 0, 1700, 10]}
+      ],
+      "subagents": {
+        "agent-a1": {
+          "meta": {"toolUseId": "ag1", "agentType": "general-purpose", "model": "m1", "spawnDepth": 1, "finished": true},
+          "events": [
+            {"req": "S1", "u": [10, 500, 0, 5], "tools": [["s1", "Bash", {"command": "ls"}]]},
+            {"res": "s1", "fill": "a", "bytes": 1000},
+            {"req": "S2", "u": [0, 0, 600, 5]}
+          ]
+        },
+        "agent-a2": {
+          "meta": {"toolUseId": "ag2", "agentType": "Explore", "model": "m1", "spawnDepth": 1, "finished": true},
+          "events": [
+            {"req": "S1", "u": [20, 800, 0, 5], "tools": [["t1", "Bash", {"command": "ls"}], ["t2", "Bash", {"command": "pwd"}]]},
+            {"res": "t1", "fill": "a", "bytes": 1000},
+            {"res": "t2", "fill": "b", "bytes": 500},
+            {"req": "S2", "u": [0, 0, 820, 5], "tools": [["t3", "Bash", {"command": "ls"}]]},
+            {"res": "t3", "fill": "c", "bytes": 300},
+            {"req": "S3", "u": [0, 0, 900, 5]},
+            {"req": "S4", "u": [0, 0, 950, 5]}
+          ]
+        }
+      },
+      "expected": {"delegation": {"agent_calls": 2, "subagent_tool_bytes": 2800, "agent_result_bytes": 400, "main_tool_bytes": 500, "compression": 0.14285714285714285, "unlinked": 0, "subagent_cost_share": 0.455847765661749, "agents": [{"tool_use_id": "ag1", "agent_type": "general-purpose", "model": "m1", "requests": 2, "tool_calls": 1, "weighted_cost": 745, "cold_start_tokens": 510, "result_bytes": 100}, {"tool_use_id": "ag2", "agent_type": "Explore", "model": "m1", "requests": 4, "tool_calls": 3, "weighted_cost": 1387, "cold_start_tokens": 820, "result_bytes": 300}]}, "rules": {"over_delegation": [1, 510]}, "over_delegation_cost": 635, "kinds": {"trivial": 1, "duplicate": 0}, "under_delegation": false}
+    },
+    {
+      "name": "trivial_boundary",
+      "note": "requests = trivial_requests かつ tool_calls = trivial_tool_calls ちょうどは trivial。requests が 1 つ多いと数えない",
+      "config": {"trivial_requests": 2, "trivial_tool_calls": 1},
+      "events": [
+        {"user": "go"},
+        {"req": "M1", "u": [0, 1000, 0, 10], "tools": [["ag1", "Agent", {"description": "d", "prompt": "p1", "subagent_type": "general-purpose"}], ["ag2", "Agent", {"description": "d", "prompt": "p2", "subagent_type": "Explore"}]]},
+        {"res": "ag1", "fill": "r", "bytes": 100},
+        {"res": "ag2", "fill": "q", "bytes": 300},
+        {"req": "M2", "u": [0, 700, 1000, 10], "tools": [["tb", "Bash", {"command": "git log"}]]},
+        {"res": "tb", "fill": "l", "bytes": 500},
+        {"req": "M3", "u": [0, 0, 1700, 10]}
+      ],
+      "subagents": {
+        "agent-a1": {
+          "meta": {"toolUseId": "ag1", "agentType": "general-purpose", "model": "m1", "spawnDepth": 1, "finished": true},
+          "events": [
+            {"req": "S1", "u": [10, 500, 0, 5], "tools": [["s1", "Bash", {"command": "ls"}]]},
+            {"res": "s1", "fill": "a", "bytes": 1000},
+            {"req": "S2", "u": [0, 0, 600, 5]}
+          ]
+        },
+        "agent-a2": {
+          "meta": {"toolUseId": "ag2", "agentType": "Explore", "model": "m1", "spawnDepth": 1, "finished": true},
+          "events": [
+            {"req": "S1", "u": [10, 500, 0, 5], "tools": [["s1", "Bash", {"command": "ls"}]]},
+            {"res": "s1", "fill": "z", "bytes": 1000},
+            {"req": "S2", "u": [0, 0, 600, 5]},
+            {"req": "S3", "u": [0, 0, 700, 5]}
+          ]
+        }
+      },
+      "expected": {"rules": {"over_delegation": [1, 510]}, "kinds": {"trivial": 1, "duplicate": 0}}
+    },
+    {
+      "name": "trivial_exempt_agent_type",
+      "note": "exempt_agent_types（既定 web-fetch）の型は trivial でも数えない",
+      "events": [
+        {"user": "go"},
+        {"req": "M1", "u": [0, 1000, 0, 10], "tools": [["ag1", "Agent", {"description": "d", "prompt": "p1", "subagent_type": "general-purpose"}], ["ag2", "Agent", {"description": "d", "prompt": "p2", "subagent_type": "web-fetch"}]]},
+        {"res": "ag1", "fill": "r", "bytes": 100},
+        {"res": "ag2", "fill": "q", "bytes": 300},
+        {"req": "M2", "u": [0, 700, 1000, 10], "tools": [["tb", "Bash", {"command": "git log"}]]},
+        {"res": "tb", "fill": "l", "bytes": 500},
+        {"req": "M3", "u": [0, 0, 1700, 10]}
+      ],
+      "subagents": {
+        "agent-a1": {
+          "meta": {"toolUseId": "ag1", "agentType": "web-fetch", "model": "m1", "spawnDepth": 1, "finished": true},
+          "events": [
+            {"req": "S1", "u": [10, 500, 0, 5], "tools": [["s1", "Bash", {"command": "ls"}]]},
+            {"res": "s1", "fill": "a", "bytes": 1000},
+            {"req": "S2", "u": [0, 0, 600, 5]}
+          ]
+        },
+        "agent-a2": {
+          "meta": {"toolUseId": "ag2", "agentType": "web-fetch", "model": "m1", "spawnDepth": 1, "finished": true},
+          "events": [
+            {"req": "S1", "u": [20, 800, 0, 5], "tools": [["t1", "Bash", {"command": "ls"}], ["t2", "Bash", {"command": "pwd"}]]},
+            {"res": "t1", "fill": "a", "bytes": 1000},
+            {"res": "t2", "fill": "b", "bytes": 500},
+            {"req": "S2", "u": [0, 0, 820, 5], "tools": [["t3", "Bash", {"command": "ls"}]]},
+            {"res": "t3", "fill": "c", "bytes": 300},
+            {"req": "S3", "u": [0, 0, 900, 5]},
+            {"req": "S4", "u": [0, 0, 950, 5]}
+          ]
+        }
+      },
+      "expected": {"rules": {}, "kinds": {"trivial": 0, "duplicate": 0}}
+    },
+    {
+      "name": "duplicate_agent_call",
+      "note": "prompt と subagent_type が同じ 2 件目（ag2）が duplicate。総トークン = (20 + 800 + 5) + (820 + 5) + (900 + 5) + (950 + 5) = 3510（input + cache 作成 + cache 読み込み + output）。ag2 の中で同じ出力を 2 回返しても duplicate_result は数えない",
+      "events": [
+        {"user": "go"},
+        {"req": "M1", "u": [0, 1000, 0, 10], "tools": [["ag1", "Agent", {"description": "d", "prompt": "same", "subagent_type": "Explore"}]]},
+        {"res": "ag1", "fill": "r", "bytes": 100},
+        {"req": "M2", "u": [0, 100, 1000, 10], "tools": [["ag2", "Agent", {"description": "d", "prompt": "same", "subagent_type": "Explore"}]]},
+        {"res": "ag2", "fill": "q", "bytes": 100},
+        {"req": "M3", "u": [0, 0, 1100, 10]}
+      ],
+      "subagents": {
+        "agent-a1": {
+          "meta": {"toolUseId": "ag1", "agentType": "Explore", "model": "m1", "spawnDepth": 1, "finished": true},
+          "events": [
+            {"req": "S1", "u": [20, 800, 0, 5], "tools": [["t1", "Bash", {"command": "ls"}], ["t2", "Bash", {"command": "pwd"}]]},
+            {"res": "t1", "fill": "a", "bytes": 1000},
+            {"res": "t2", "fill": "b", "bytes": 500},
+            {"req": "S2", "u": [0, 0, 820, 5], "tools": [["t3", "Bash", {"command": "ls"}]]},
+            {"res": "t3", "fill": "c", "bytes": 300},
+            {"req": "S3", "u": [0, 0, 900, 5]},
+            {"req": "S4", "u": [0, 0, 950, 5]}
+          ]
+        },
+        "agent-a2": {
+          "meta": {"toolUseId": "ag2", "agentType": "Explore", "model": "m1", "spawnDepth": 1, "finished": true},
+          "events": [
+            {"req": "S1", "u": [20, 800, 0, 5], "tools": [["t1", "Bash", {"command": "ls"}], ["t2", "Bash", {"command": "pwd"}]]},
+            {"res": "t1", "fill": "a", "bytes": 1000},
+            {"res": "t2", "fill": "b", "bytes": 500},
+            {"req": "S2", "u": [0, 0, 820, 5], "tools": [["t3", "Bash", {"command": "ls"}]]},
+            {"res": "t3", "fill": "a", "bytes": 1000},
+            {"req": "S3", "u": [0, 0, 900, 5]},
+            {"req": "S4", "u": [0, 0, 950, 5]}
+          ]
+        }
+      },
+      "expected": {"rules": {"over_delegation": [1, 3510]}, "kinds": {"trivial": 0, "duplicate": 1}, "duplicate_of": {"ag1": null, "ag2": "ag1"}}
+    },
+    {
+      "name": "duplicate_after_error_is_retry",
+      "note": "前の Agent 呼び出しが is_error なら、同じ prompt の再実行（やり直し）は数えない。ag2 の中の duplicate_result は数える",
+      "events": [
+        {"user": "go"},
+        {"req": "M1", "u": [0, 1000, 0, 10], "tools": [["ag1", "Agent", {"description": "d", "prompt": "same", "subagent_type": "Explore"}]]},
+        {"res": "ag1", "fill": "e", "bytes": 100, "err": true},
+        {"req": "M2", "u": [0, 100, 1000, 10], "tools": [["ag2", "Agent", {"description": "d", "prompt": "same", "subagent_type": "Explore"}]]},
+        {"res": "ag2", "fill": "q", "bytes": 100},
+        {"req": "M3", "u": [0, 0, 1100, 10]}
+      ],
+      "subagents": {
+        "agent-a1": {
+          "meta": {"toolUseId": "ag1", "agentType": "Explore", "model": "m1", "spawnDepth": 1, "finished": true},
+          "events": [
+            {"req": "S1", "u": [20, 800, 0, 5], "tools": [["t1", "Bash", {"command": "ls"}], ["t2", "Bash", {"command": "pwd"}]]},
+            {"res": "t1", "fill": "a", "bytes": 1000},
+            {"res": "t2", "fill": "b", "bytes": 500},
+            {"req": "S2", "u": [0, 0, 820, 5], "tools": [["t3", "Bash", {"command": "ls"}]]},
+            {"res": "t3", "fill": "c", "bytes": 300},
+            {"req": "S3", "u": [0, 0, 900, 5]},
+            {"req": "S4", "u": [0, 0, 950, 5]}
+          ]
+        },
+        "agent-a2": {
+          "meta": {"toolUseId": "ag2", "agentType": "Explore", "model": "m1", "spawnDepth": 1, "finished": true},
+          "events": [
+            {"req": "S1", "u": [20, 800, 0, 5], "tools": [["t1", "Bash", {"command": "ls"}], ["t2", "Bash", {"command": "pwd"}]]},
+            {"res": "t1", "fill": "a", "bytes": 1000},
+            {"res": "t2", "fill": "b", "bytes": 500},
+            {"req": "S2", "u": [0, 0, 820, 5], "tools": [["t3", "Bash", {"command": "ls"}]]},
+            {"res": "t3", "fill": "a", "bytes": 1000},
+            {"req": "S3", "u": [0, 0, 900, 5]},
+            {"req": "S4", "u": [0, 0, 950, 5]}
+          ]
+        }
+      },
+      "expected": {"rules": {"duplicate_result": [1, null]}, "kinds": {"trivial": 0, "duplicate": 0}, "duplicate_of": {"ag1": null, "ag2": null}}
+    },
+    {
+      "name": "unlinked_subagent_files",
+      "note": "meta.json が無い・壊れている・toolUseId がないファイルは unlinked に数え、集計は止まらない。over_delegation の対象にしない",
+      "events": [
+        {"user": "go"},
+        {"req": "M1", "u": [0, 1000, 0, 10], "tools": [["ag1", "Agent", {"description": "d", "prompt": "p1", "subagent_type": "general-purpose"}], ["ag2", "Agent", {"description": "d", "prompt": "p2", "subagent_type": "Explore"}]]},
+        {"res": "ag1", "fill": "r", "bytes": 100},
+        {"res": "ag2", "fill": "q", "bytes": 300},
+        {"req": "M2", "u": [0, 700, 1000, 10], "tools": [["tb", "Bash", {"command": "git log"}]]},
+        {"res": "tb", "fill": "l", "bytes": 500},
+        {"req": "M3", "u": [0, 0, 1700, 10]}
+      ],
+      "subagents": {
+        "agent-a1": {
+          "meta": null,
+          "events": [
+            {"req": "S1", "u": [10, 500, 0, 5], "tools": [["s1", "Bash", {"command": "ls"}]]},
+            {"res": "s1", "fill": "a", "bytes": 1000},
+            {"req": "S2", "u": [0, 0, 600, 5]}
+          ]
+        },
+        "agent-a2": {
+          "meta": "{not json",
+          "events": [
+            {"req": "S1", "u": [10, 500, 0, 5], "tools": [["s1", "Bash", {"command": "ls"}]]},
+            {"res": "s1", "fill": "z", "bytes": 1000},
+            {"req": "S2", "u": [0, 0, 600, 5]}
+          ]
+        },
+        "agent-a3": {
+          "meta": {"agentType": "Explore"},
+          "events": [
+            {"req": "S1", "u": [10, 500, 0, 5], "tools": [["s1", "Bash", {"command": "ls"}]]},
+            {"res": "s1", "fill": "y", "bytes": 1000},
+            {"req": "S2", "u": [0, 0, 600, 5]}
+          ]
+        },
+        "agent-a4": {
+          "meta": {"toolUseId": "ag2", "agentType": "Explore", "model": "m1", "spawnDepth": 1, "finished": true},
+          "events": [
+            {"req": "S1", "u": [20, 800, 0, 5], "tools": [["t1", "Bash", {"command": "ls"}], ["t2", "Bash", {"command": "pwd"}]]},
+            {"res": "t1", "fill": "a", "bytes": 1000},
+            {"res": "t2", "fill": "b", "bytes": 500},
+            {"req": "S2", "u": [0, 0, 820, 5], "tools": [["t3", "Bash", {"command": "ls"}]]},
+            {"res": "t3", "fill": "c", "bytes": 300},
+            {"req": "S3", "u": [0, 0, 900, 5]},
+            {"req": "S4", "u": [0, 0, 950, 5]}
+          ]
+        }
+      },
+      "expected": {"delegation": {"agent_calls": 2, "unlinked": 3, "agents": [{"tool_use_id": "ag2", "result_bytes": 300}, {"tool_use_id": null, "result_bytes": null, "file": "agent-a1.jsonl"}, {"tool_use_id": null, "result_bytes": null, "file": "agent-a2.jsonl"}, {"tool_use_id": null, "result_bytes": null, "file": "agent-a3.jsonl"}]}, "rules": {}, "kinds": {"trivial": 0, "duplicate": 0}}
+    },
+    {
+      "name": "under_delegation_hint",
+      "note": "Agent を使わず、本体のツール結果が under_delegation_bytes を超えるとヒントが立つ（無駄トークンには入れない）",
+      "config": {"under_delegation_bytes": 400},
+      "events": [
+        {"user": "go"},
+        {"req": "M1", "u": [0, 1000, 0, 10], "tools": [["tb", "Bash", {"command": "git log"}]]},
+        {"res": "tb", "fill": "l", "bytes": 500},
+        {"req": "M2", "u": [0, 700, 1000, 10]}
+      ],
+      "expected": {"delegation": {"agent_calls": 0, "main_tool_bytes": 500, "compression": null, "subagent_cost_share": 0}, "rules": {}, "under_delegation": true}
+    },
+    {
+      "name": "under_delegation_at_threshold",
+      "note": "main_tool_bytes がちょうど閾値なら立たない。Agent を使っていても立たない",
+      "config": {"under_delegation_bytes": 500},
+      "events": [
+        {"user": "go"},
+        {"req": "M1", "u": [0, 1000, 0, 10], "tools": [["tb", "Bash", {"command": "git log"}]]},
+        {"res": "tb", "fill": "l", "bytes": 500},
+        {"req": "M2", "u": [0, 700, 1000, 10]}
+      ],
+      "expected": {"rules": {}, "under_delegation": false}
+    },
+    {
+      "name": "restart_resume_worker",
+      "note": "最初の人の発言が 【再開】 で始まれば resume_worker。最初の Write までの 2 リクエストが startup",
+      "events": [
+        {"user": "【再開】/x/codex-handoffs/h.md を読んで続けて"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Read", {"file_path": "/x/codex-handoffs/h.md"}]]},
+        {"res": "t1", "fill": "h", "bytes": 300},
+        {"req": "B", "u": [0, 100, 1000, 10], "tools": [["t2", "Bash", {"command": "git status"}]]},
+        {"res": "t2", "fill": "g", "bytes": 100},
+        {"req": "C", "u": [0, 100, 1100, 10], "tools": [["t3", "Edit", {"file_path": "/x/a.py"}]]},
+        {"res": "t3", "fill": "k", "bytes": 100},
+        {"req": "D", "u": [0, 0, 1200, 10]}
+      ],
+      "expected": {"restart": {"kind": "resume_worker", "startup_requests": 2, "startup_cost": 1575, "ended_with_handoff": false}, "rules": {}}
+    },
+    {
+      "name": "restart_resume_worker_wrapped",
+      "note": "hc の実際の経路では最初の人の発言が <pasted_content> と <hc …> で包まれ、【再開】 は 3 行目以降にある。それでも resume_worker",
+      "events": [
+        {"user": "<pasted_content id=\"1\">\n<hc from=\"s supervisor\">依頼</hc>\n\n【再開】/x/codex-handoffs/h.md\n</pasted_content id=\"1\">"},
+        {"req": "A", "u": [0, 1000, 0, 10]}
+      ],
+      "expected": {"restart": {"kind": "resume_worker"}, "rules": {}}
+    },
+    {
+      "name": "restart_supervisor_failed_read",
+      "note": "handoff.md の Read が is_error（ファイルが無い）なら再開とは数えず fresh",
+      "events": [
+        {"user": "起動"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Read", {"file_path": "/h/.local/share/hc-supervisor/handoff.md"}]]},
+        {"res": "t1", "fill": "e", "bytes": 50, "err": true},
+        {"req": "B", "u": [0, 0, 1100, 10]}
+      ],
+      "expected": {"restart": {"kind": "fresh"}, "rules": {}}
+    },
+    {
+      "name": "restart_resume_supervisor",
+      "note": "最初の 5 リクエストの中で hc-supervisor/handoff.md を Read すれば resume_supervisor",
+      "events": [
+        {"user": "起動"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "ls"}]]},
+        {"res": "t1", "fill": "h", "bytes": 100},
+        {"req": "B", "u": [0, 100, 1000, 10], "tools": [["t2", "Read", {"file_path": "/h/.local/share/hc-supervisor/handoff.md"}]]},
+        {"res": "t2", "fill": "g", "bytes": 100},
+        {"req": "C", "u": [0, 0, 1100, 10]}
+      ],
+      "expected": {"restart": {"kind": "resume_supervisor", "startup_requests": 3, "ended_with_handoff": false}, "rules": {}}
+    },
+    {
+      "name": "restart_supervisor_read_outside_window",
+      "note": "handoff.md を読んだのが 6 リクエスト目（resume_window = 5 の外）なら fresh。5 リクエスト目（位置 4）なら resume_supervisor",
+      "events": [
+        {"user": "起動"},
+        {"req": "R0", "u": [0, 100, 1000, 10], "tools": [["x0", "Bash", {"command": "ls"}]]},
+        {"res": "x0", "fill": "a", "bytes": 50},
+        {"req": "R1", "u": [0, 100, 1000, 10], "tools": [["x1", "Bash", {"command": "ls"}]]},
+        {"res": "x1", "fill": "b", "bytes": 50},
+        {"req": "R2", "u": [0, 100, 1000, 10], "tools": [["x2", "Bash", {"command": "ls"}]]},
+        {"res": "x2", "fill": "c", "bytes": 50},
+        {"req": "R3", "u": [0, 100, 1000, 10], "tools": [["x3", "Bash", {"command": "ls"}]]},
+        {"res": "x3", "fill": "d", "bytes": 50},
+        {"req": "R4", "u": [0, 100, 1000, 10], "tools": [["x4", "Bash", {"command": "ls"}]]},
+        {"res": "x4", "fill": "e", "bytes": 50},
+        {"req": "R5", "u": [0, 100, 1000, 10], "tools": [["xr", "Read", {"file_path": "/h/hc-supervisor/handoff.md"}]]},
+        {"res": "xr", "fill": "z", "bytes": 50},
+        {"req": "R6", "u": [0, 0, 1100, 10]}
+      ],
+      "expected": {"restart": {"kind": "fresh", "startup_requests": 7}, "rules": {}}
+    },
+    {
+      "name": "restart_supervisor_read_at_window_edge",
+      "note": "5 リクエスト目で Bash の command に hc-supervisor/handoff.md を含めれば resume_supervisor",
+      "events": [
+        {"user": "起動"},
+        {"req": "R0", "u": [0, 100, 1000, 10], "tools": [["x0", "Bash", {"command": "ls"}]]},
+        {"res": "x0", "fill": "a", "bytes": 50},
+        {"req": "R1", "u": [0, 100, 1000, 10], "tools": [["x1", "Bash", {"command": "ls"}]]},
+        {"res": "x1", "fill": "b", "bytes": 50},
+        {"req": "R2", "u": [0, 100, 1000, 10], "tools": [["x2", "Bash", {"command": "ls"}]]},
+        {"res": "x2", "fill": "c", "bytes": 50},
+        {"req": "R3", "u": [0, 100, 1000, 10], "tools": [["x3", "Bash", {"command": "ls"}]]},
+        {"res": "x3", "fill": "d", "bytes": 50},
+        {"req": "R4", "u": [0, 100, 1000, 10], "tools": [["xr", "Bash", {"command": "cat /h/hc-supervisor/handoff.md"}]]},
+        {"res": "xr", "fill": "z", "bytes": 50},
+        {"req": "R5", "u": [0, 0, 1100, 10]}
+      ],
+      "expected": {"restart": {"kind": "resume_supervisor"}, "rules": {}}
+    },
+    {
+      "name": "restart_fresh_with_commit_and_handoff",
+      "note": "どちらでもなければ fresh。git commit を含む Bash が startup の終わり。最後の 10 リクエストの中で codex-handoffs/ への Write があれば ended_with_handoff",
+      "events": [
+        {"user": "実装して"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t1", "Bash", {"command": "ls"}]]},
+        {"res": "t1", "fill": "h", "bytes": 100},
+        {"req": "B", "u": [0, 100, 1000, 10], "tools": [["t2", "Bash", {"command": "git commit -m x"}]]},
+        {"res": "t2", "fill": "g", "bytes": 100},
+        {"req": "C", "u": [0, 100, 1100, 10], "tools": [["t3", "Write", {"file_path": "/r/.git/codex-handoffs/h.md"}]]},
+        {"res": "t3", "fill": "k", "bytes": 100},
+        {"req": "D", "u": [0, 0, 1200, 10]}
+      ],
+      "expected": {"restart": {"kind": "fresh", "startup_requests": 1, "startup_cost": 1300, "ended_with_handoff": true}, "rules": {}}
+    },
+    {
+      "name": "restart_startup_cap_and_handoff_tail",
+      "note": "編集がなければ startup_cap で打ち切る。handoff への Write が handoff_tail の外なら ended_with_handoff は false",
+      "config": {"handoff_tail": 3},
+      "events": [
+        {"user": "調べて"},
+        {"req": "A", "u": [0, 1000, 0, 10], "tools": [["t0", "Write", {"file_path": "/r/.git/codex-handoffs/h.md"}]]},
+        {"res": "t0", "fill": "h", "bytes": 100},
+        {"req": "R0", "u": [0, 100, 1000, 10], "tools": [["x0", "Bash", {"command": "ls"}]]},
+        {"res": "x0", "fill": "a", "bytes": 50},
+        {"req": "R1", "u": [0, 100, 1000, 10], "tools": [["x1", "Bash", {"command": "ls"}]]},
+        {"res": "x1", "fill": "b", "bytes": 50},
+        {"req": "R2", "u": [0, 100, 1000, 10], "tools": [["x2", "Bash", {"command": "ls"}]]},
+        {"res": "x2", "fill": "c", "bytes": 50}
+      ],
+      "expected": {"restart": {"kind": "fresh", "startup_requests": 0, "ended_with_handoff": false}, "rules": {}}
+    },
+    {
+      "name": "restart_startup_cap",
+      "note": "最初の編集が startup_cap より後なら startup_cap で止める",
+      "config": {"startup_cap": 2},
+      "events": [
+        {"user": "調べて"},
+        {"req": "R0", "u": [0, 100, 1000, 10], "tools": [["x0", "Bash", {"command": "ls"}]]},
+        {"res": "x0", "fill": "a", "bytes": 50},
+        {"req": "R1", "u": [0, 100, 1000, 10], "tools": [["x1", "Bash", {"command": "ls"}]]},
+        {"res": "x1", "fill": "b", "bytes": 50},
+        {"req": "R2", "u": [0, 100, 1000, 10], "tools": [["x2", "Bash", {"command": "ls"}]]},
+        {"res": "x2", "fill": "c", "bytes": 50},
+        {"req": "R3", "u": [0, 100, 1000, 10], "tools": [["x3", "Bash", {"command": "ls"}]]},
+        {"res": "x3", "fill": "d", "bytes": 50},
+        {"req": "R4", "u": [0, 0, 1100, 10], "tools": [["xe", "Edit", {"file_path": "/a"}]]},
+        {"res": "xe", "fill": "z", "bytes": 50}
+      ],
+      "expected": {"restart": {"startup_requests": 2, "startup_cost": 550.0}, "rules": {}}
+    }
+  ]
+}
