@@ -43,6 +43,52 @@ function waiting() {
   return rows;
 }
 
+// board.md を「## 見出し」ごとの行に分ける。最初の「## 」より前（「# 監督役ボード」「更新: …」）は捨てる。
+// 「なし」だけの節は空にする。
+function parseBoard(text) {
+  const sections = [];
+  let cur = null;
+  for (const raw of (text ?? "").split("\n")) {
+    const line = raw.trim();
+    const h = /^##\s+(.+)$/.exec(line);
+    if (h) { cur = { title: h[1].trim(), lines: [] }; sections.push(cur); continue; }
+    if (!cur || !line || line === "なし") continue;
+    cur.lines.push(line);
+  }
+  return sections;
+}
+
+const bullet = (line) => line.replace(/^(?:[-*]|\d+[.)])\s+/, "");
+
+// 進行中: 「- <名前>（tN）<リポジトリ> Issue #<番号> [<モデル> / <経路>]: <段階>（HH:MM 時点）」。
+// 形が崩れた行は null を返し、普通の文として出す。
+function parseActive(line) {
+  const m = /^-\s+(.+?)（(t\w+)）\s*(.*?)\s*\[([^\]]+)\]:\s*(.+?)(?:（(\d{1,2}:\d{2})\s*時点）)?$/.exec(line);
+  if (!m) return null;
+  return { name: m[1], terminal: m[2], sub: m[3], model: m[4], text: m[5], time: m[6] ?? "" };
+}
+
+// 完了: 「- Issue #<番号> <PR URL> [<モデル> / <経路>、差し戻し N]: <結果> HH:MM」。
+function parseDone(line) {
+  const m = /^-\s+(.*?)\s*(https?:\/\/\S+?\/pull\/(\d+))\s*\[([^\]]+)\]:\s*(.+?)(?:\s+(\d{1,2}:\d{2}))?$/.exec(line);
+  if (!m) return null;
+  const meta = m[4].split(/[、,]\s*/);
+  const back = meta.find((x) => /差し戻し/.test(x));
+  return {
+    name: m[1], url: m[2], pr: `#${m[3]}`, model: meta.filter((x) => x !== back).join("、"),
+    back: back ? back.replace(/差し戻し\s*/, "") : "", text: m[5], time: m[6] ?? "",
+  };
+}
+
+// 要確認の判断: 「- D-YYYYMMDD-HHMM(-N): 決定」。
+function parseDecision(line) {
+  const m = /^-\s+(D-\d{8}-\d{4}(?:-\d+)?):\s*(.+)$/.exec(line);
+  return m ? { id: m[1], text: m[2] } : null;
+}
+
+const DECISIONS_SHOWN = 5;
+const LINE = 18; // 長い文を 2 行で切るときの 1 行の高さ。
+
 // ペインがあればそこへ移り、無ければ覗き窓（peek）で開く。
 function open(address) {
   const a = agents().find((x) => x.address === address);
@@ -55,6 +101,9 @@ export default class SupervisorBoard extends View {
     this.text = null;
     this.error = null;
     this.now = Date.now();
+    this.expanded = new Set(); // 全文を開いた長い文の id。
+    this.showAllDecisions = false;
+    this.raw = false; // Markdown のまま見る。
     this.reload(cx);
     if (checking()) return;
     // 経過時間の表示と、フォルダ監視が使えないときの読み直し。
@@ -106,6 +155,137 @@ export default class SupervisorBoard extends View {
       .when(count !== null, (el) => el.child(div().child(String(count))));
   }
 
+  // ボードの節の見出し。件数があれば丸い札で添える。
+  heading(title, count, t, color) {
+    return h_flex().pt(14).pb(6).gap(6).items_center().text_size(12).text_color(color ?? t.muted)
+      .child(div().font_semibold().child(title))
+      .when(count != null, (el) => el.child(div().px(6).rounded_full().text_size(11)
+        .bg(t.surface).border_1().border_color(t.border).child(String(count))));
+  }
+
+  // 長い文。閉じているときは 2 行で切り、押すと全文を出す。全文はホバーでも読める。
+  longText(id, text, t, color) {
+    const open = this.expanded.has(id);
+    return div().id(id).w_full().min_w(0).whitespace_normal().line_height(LINE).cursor_pointer()
+      .text_color(color ?? t.foreground).tooltip(text)
+      .when(!open, (el) => el.max_h(LINE * 2).overflow_hidden())
+      .on_click((_e, cx) => { open ? this.expanded.delete(id) : this.expanded.add(id); cx.notify(); })
+      .child(text);
+  }
+
+  // 形の崩れた行も落とさず、普通の文として出す。
+  plainRow(id, line, t) {
+    return div().py(4).border_t(1).border_color(t.border).text_size(12).child(this.longText(id, bullet(line), t));
+  }
+
+  waitingCard(lines, t) {
+    const card = v_flex().gap(6).p(10).rounded(8).border_1()
+      .border_color(lines.length ? t.blocked : t.border).bg(t.surface)
+      .child(h_flex().gap(6).items_center().text_size(12).font_semibold()
+        .text_color(lines.length ? t.blocked : t.muted)
+        .child(div().size(8).flex_none().rounded(4).bg(lines.length ? t.blocked : t.idle))
+        .child(lines.length ? `あなたの対応待ち ${lines.length} 件` : "あなたの対応待ちはありません"));
+    return card.children(lines.map((line, i) => h_flex().items_start().gap(6).text_size(13)
+      .child(div().flex_none().text_color(t.blocked).child("•"))
+      .child(div().flex_1().min_w(0).whitespace_normal().child(bullet(line)))));
+  }
+
+  nextList(lines, t) {
+    return v_flex().gap(4).children(lines.map((line, i) => h_flex().items_start().gap(8).text_size(13)
+      .child(div().flex_none().w(20).h(18).rounded(4).bg(t.surface).border_1().border_color(t.border)
+        .text_size(11).text_color(t.muted).flex().items_center().justify_center()
+        .child((/^(\d+)[.)]/.exec(line) ?? [])[1] ?? String(i + 1)))
+      .child(div().flex_1().min_w(0).whitespace_normal().child(bullet(line)))));
+  }
+
+  // 表の見出し行。列の幅は行と同じ固定幅にそろえる。
+  tableHead(cols, t) {
+    return h_flex().gap(8).pb(4).text_size(11).text_color(t.dim)
+      .children(cols.map(([label, w]) => (w ? div().flex_none().w(w) : div().flex_1().min_w(0)).truncate().child(label)));
+  }
+
+  // 1 行目に短い列（名前・PR・モデル・時刻）、2 行目に段階・結果の長い文を全幅で出す。
+  // 狭いパネルでも長い文の列がつぶれない。
+  tableRow(id, cells, text, t) {
+    return v_flex().py(6).gap(2).border_t(1).border_color(t.border).text_size(12)
+      .child(h_flex().gap(8).items_center().children(cells))
+      .child(div().text_size(12).text_color(t.muted).child(this.longText(id, text, t, t.foreground)));
+  }
+
+  activeTable(lines, t) {
+    const head = this.tableHead([["名前 / Issue", null], ["モデル / 経路", 92], ["時刻", 38]], t);
+    return v_flex().child(head).children(lines.map((line, i) => {
+      const x = parseActive(line);
+      if (!x) return this.plainRow(`active-${i}`, line, t);
+      return this.tableRow(`active-${i}`, [
+        v_flex().flex_1().min_w(0)
+          .child(h_flex().gap(4).min_w(0).child(div().font_semibold().truncate().child(x.name))
+            .child(div().flex_none().text_size(11).text_color(t.dim).child(x.terminal)))
+          .child(div().truncate().text_size(11).text_color(t.muted).child(x.sub)),
+        div().flex_none().w(92).truncate().text_size(11).text_color(t.muted).tooltip(x.model).id(`active-model-${i}`).child(x.model),
+        div().flex_none().w(38).text_size(11).text_color(t.dim).child(x.time),
+      ], x.text, t);
+    }));
+  }
+
+  doneTable(lines, t) {
+    const head = this.tableHead([["Issue", null], ["PR", 44], ["モデル / 経路", 92], ["時刻", 38]], t);
+    return v_flex().child(head).children(lines.map((line, i) => {
+      const x = parseDone(line);
+      if (!x) return this.plainRow(`done-${i}`, line, t);
+      return this.tableRow(`done-${i}`, [
+        div().flex_1().min_w(0).font_semibold().truncate().tooltip(x.name).id(`done-name-${i}`).child(x.name),
+        div().id(`done-pr-${i}`).flex_none().w(44).truncate().text_color(t.accent).cursor_pointer()
+          .hover((s) => s.underline()).tooltip(x.url).on_click((_e, cx) => cx.open_url(x.url)).child(x.pr),
+        div().id(`done-model-${i}`).flex_none().w(92).truncate().text_size(11).text_color(t.muted)
+          .tooltip(`${x.model}${x.back ? `、差し戻し ${x.back}` : ""}`)
+          .child(x.back && x.back !== "0" ? `${x.model} ↩${x.back}` : x.model),
+        div().flex_none().w(38).text_size(11).text_color(t.dim).child(x.time),
+      ], x.text, t);
+    }));
+  }
+
+  decisionTable(lines, t) {
+    const all = this.showAllDecisions;
+    const shown = all ? lines : lines.slice(0, DECISIONS_SHOWN);
+    const rest = lines.length - shown.length;
+    return v_flex()
+      .children(shown.map((line, i) => {
+        const x = parseDecision(line);
+        if (!x) return this.plainRow(`decision-${i}`, line, t);
+        return h_flex().items_start().gap(8).py(4).border_t(1).border_color(t.border).text_size(12)
+          .child(div().flex_none().w(112).pt(1).text_size(11).text_color(t.muted).child(x.id))
+          .child(div().flex_1().min_w(0).child(this.longText(`decision-${i}`, x.text, t)));
+      }))
+      .when(lines.length > DECISIONS_SHOWN, (el) => el.child(
+        div().id("decisions-more").py(6).border_t(1).border_color(t.border).text_size(12).text_color(t.accent)
+          .cursor_pointer().hover((s) => s.underline())
+          .on_click((_e, cx) => { this.showAllDecisions = !all; cx.notify(); })
+          .child(all ? "折りたたむ" : `残り ${rest} 件を表示`)));
+  }
+
+  boardView(t) {
+    const sections = parseBoard(this.text);
+    const out = [];
+    sections.forEach((s, k) => {
+      const n = s.lines.length;
+      if (/対応待ち/.test(s.title)) {
+        out.push(div().pt(4).child(this.waitingCard(s.lines, t)));
+        return;
+      }
+      out.push(this.heading(s.title, /判断|完了|進行中/.test(s.title) ? n : null, t));
+      if (!n) out.push(div().text_size(12).text_color(t.dim).child("なし"));
+      else if (/次にやること/.test(s.title)) out.push(this.nextList(s.lines, t));
+      else if (/進行中/.test(s.title)) out.push(this.activeTable(s.lines, t));
+      else if (/完了/.test(s.title)) out.push(this.doneTable(s.lines, t));
+      else if (/判断/.test(s.title)) out.push(this.decisionTable(s.lines, t));
+      else out.push(v_flex().children(s.lines.map((line, i) => this.plainRow(`other-${k}-${i}`, line, t))));
+    });
+    return v_flex().w_full().min_w(0).children(out).child(h_flex().pt(14).child(div().id("show-raw").text_size(11).text_color(t.dim).cursor_pointer()
+      .hover((s) => s.underline()).on_click((_e, cx) => { this.raw = true; cx.notify(); })
+      .child("Markdown のまま見る")));
+  }
+
   render(cx) {
     const t = theme();
     const live = terminals().filter((x) => x.state === "live");
@@ -127,7 +307,7 @@ export default class SupervisorBoard extends View {
         .child(supervisor ? "supervisor" : "監督役なし"));
 
     const live_rows = v_flex().flex_none().pb(6).border_b(1).border_color(t.border)
-      .child(this.section("あなたの対応待ち", blocked.length, blocked.length ? t.blocked : null, t))
+      .child(this.section("止まっているセッション", blocked.length, blocked.length ? t.blocked : null, t))
       .child(v_flex().px(6).children(blocked.length
         ? blocked.map((x, i) => this.row(`wait-${i}`, { ...x, status: "blocked", detail: x.where }, t))
         : [div().px(8).py(2).text_size(12).text_color(t.dim).child("止まっているセッションはありません")]))
@@ -143,8 +323,14 @@ export default class SupervisorBoard extends View {
       body = v_flex().p(14).gap(6).text_size(12).text_color(t.muted)
         .child("監督役がまだボードを書いていません。")
         .child(div().text_color(t.dim).child(boardPath()));
+    } else if (this.raw) {
+      body = v_flex().gap(8)
+        .child(div().id("show-table").text_size(11).text_color(t.accent).cursor_pointer()
+          .hover((s) => s.underline()).on_click((_e, cx) => { this.raw = false; cx.notify(); })
+          .child("表で見る"))
+        .child(TextView.markdown("board-md", this.text).selectable(true));
     } else {
-      body = TextView.markdown("board-md", this.text).selectable(true);
+      body = this.boardView(t);
     }
 
     return v_flex().id("supervisor-board").size_full().min_h(0).rounded(10).overflow_hidden()
