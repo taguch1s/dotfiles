@@ -295,6 +295,20 @@ target = ".local/bin/dotfiles-autosync"
 mode = "link"
 executable = true
 
+# 重い処理を Modal などへ回す。上限と無料枠は config.toml。説明は docs/hc-remote.md
+[[config]]
+name = "hc-remote（重い処理を Modal へ回す）"
+source = ".local/bin/hc-remote"
+target = ".local/bin/hc-remote"
+mode = "link"
+executable = true
+
+[[config]]
+name = "hc-remote の上限と無料枠"
+source = ".config/hc-remote/config.toml"
+target = ".config/hc-remote/config.toml"
+mode = "link"
+
 [[config]]
 name = "Claude 文脈予算 hook"
 source = ".local/bin/claude-context-guard"

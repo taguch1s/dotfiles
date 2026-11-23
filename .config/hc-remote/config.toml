@@ -1,0 +1,30 @@
+# hc-remote の上限と無料枠。説明は docs/hc-remote.md
+# 超えるジョブは起動せず「ユーザー確認が必要」で止まる。上げるのはユーザーが決める。
+
+[limits]
+max_cpu = 8               # 1 ジョブの物理コア数
+max_memory_gb = 32        # 1 ジョブのメモリ（GiB）
+max_timeout = "2h"        # 1 ジョブの時間
+max_concurrent_jobs = 2   # 同時に動かすジョブ数（hc-remote が起動したもの）
+max_upload_mb = 200       # 送る tar.gz の大きさ
+
+[defaults]
+backend = "auto"          # auto は課金のある backend を順に試す（今は modal だけ）
+cpu = 2
+memory_gb = 4
+timeout = "30m"
+
+[budget.modal]
+free_credit_usd = 30      # Starter プランの月の無料クレジット
+margin_usd = 3            # billing report の反映の遅れの分
+
+# Modal Function の料金（https://modal.com/pricing を 2026-11-23 に確認）。Sandbox は約 3 倍なので使わない。
+[pricing.modal]
+cpu_core_second_usd = 0.0000131
+memory_gib_second_usd = 0.00000222
+
+[modal]
+app = "hc-remote"
+volume = "hc-remote"
+python = "3.12"
+uv = "0.11.25"

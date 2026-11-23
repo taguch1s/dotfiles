@@ -74,6 +74,7 @@ make dev-mode   # スタートメニューに「Dev Mode」「Normal Mode」を�
 make remote-access # スマホから遠隔操作中のスリープ抑止サービスを有効化する（docs/remote-access.md）
 # Herdr app / スマホの Claude Code を監督役が見張る構成（hc-supervisor）は docs/herdr-core-orchestration.md
 # セッションごとのトークン効率指標（claude-token-metrics と SessionEnd hook）、statusline と使用率からの重み推定は docs/claude-token-metrics.md
+# 重い処理を Modal に回す hc-remote（1 ジョブの上限と月の無料枠の確認）は docs/hc-remote.md
 make sync       # ~/.claude/settings.json の dotfiles 管理の hook・statusLine と Codex の feature だけを同期
 # Claude Code のセッション開始時に dotfiles-main の fast-forward・新しいリンク・make sync を自動で行う（docs/dotfiles-autosync.md）
 make doctor     # コマンド、リンク、ステータススクリプトを検証
