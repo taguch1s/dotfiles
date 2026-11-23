@@ -70,6 +70,7 @@ case "$1 $2" in
   {"metric": "COMMITTED_CPUS", "limit": 0.0, "usage": 0.0},
   {"metric": "E2_CPUS", "limit": $e2.0, "usage": 0.0},
   {"metric": "N2_CPUS", "limit": $n2.0, "usage": 0.0},
+  {"metric": "N2D_CPUS", "limit": $n2.0, "usage": 0.0},
   {"metric": "M2_CPUS", "limit": 0.0, "usage": 0.0},
   {"metric": "INSTANCES", "limit": 24.0, "usage": 1.0},
   {"metric": "NVIDIA_T4_GPUS", "limit": $gpu.0, "usage": 0.0},
@@ -85,6 +86,14 @@ JSON
       exit 0
     fi
     has quota-fail && { echo 'ERROR: quota decrease rejected' >&2; exit 1; }
+    if has quota-recent && [[ "$*" == *--quota-id=N2D-CPUS-per-project-region* && "$*" == *--preferred-value=0\ * ]]; then
+      echo 'ERROR: (gcloud.beta.quotas.preferences.update) FAILED_PRECONDITION: decreases effective quota unsafely. New Effective limit 0 is below recent quota usage 8.' >&2
+      exit 1
+    fi
+    if has quota-missing && [[ "$*" == *--quota-id=E2-CPUS-per-project-region* ]]; then
+      echo "ERROR: (gcloud.beta.quotas.preferences.update) NOT_FOUND: Limit 'E2-CPUS-per-project-region' does not exist" >&2
+      exit 1
+    fi
     exit 0 ;;
   "billing projects")
     has billing && echo 'billingAccounts/000000-111111-222222'; exit 0 ;;
@@ -234,6 +243,12 @@ check '作りかけの鍵を残さない' test ! -e "$home/.config/hc-remote/gcp
 run_setup sa quota-fail -- --apply --no-budget
 check 'quota を下げられなければ失敗で止まる' test "$status" -ne 0
 check 'quota を下げられなければ鍵を作らない' not_called '^iam service-accounts keys create'
+run_setup sa quota-recent quota-missing -- --apply --no-budget
+check '直近の使用量を下回れない・無い quota があっても止まらない' test "$status" -eq 0
+check '直近の使用量（8）まで下げ直す' called '--quota-id=N2D-CPUS-per-project-region --dimensions=region=asia-northeast1 --preferred-value=8 '
+check '直近の使用量を下回るフラグは付けない' not_called 'allow-quota-decrease-below-usage'
+check '無い quota は飛ばすと表示する' out_has 'この project には無い quota なので飛ばす: E2-CPUS-per-project-region'
+check '下げ直せたら鍵を作る' called '^iam service-accounts keys create'
 run_setup sa no-region -- --apply --no-budget
 check 'quota を読めなければ失敗で止まる' test "$status" -ne 0
 check 'quota を読めなければ鍵を作らない' not_called '^iam service-accounts keys create'

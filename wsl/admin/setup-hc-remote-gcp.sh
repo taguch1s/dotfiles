@@ -367,6 +367,29 @@ def fmt(value):
 for row in rows:
     print("\t".join(fmt(x) for x in row))
 QUOTA
+  quota_update() {
+    change beta quotas preferences update "$1" --allow-missing --project="$project" \
+      --service=compute.googleapis.com --quota-id="$2" --dimensions="$3" --preferred-value="$4" \
+      --allow-high-percentage-quota-decrease --justification="hc-remote damage cap (dotfiles #57)" --quiet \
+      </dev/null
+  }
+  # quota を下げる。Google は直近の使用量（いま動いていなくても、最近使った分）を下回る値を拒否するので、
+  # そのときは直近の使用量まで下げる（確認を外すフラグは付けない）。この project に無い quota は飛ばす。
+  lower_quota() {
+    local preference_id=$1 qid=$2 dims=$3 target=$4 err="$tmp_dir/quota-error" recent
+    quota_update "$preference_id" "$qid" "$dims" "$target" 2>"$err" && return 0
+    cat "$err" >&2
+    if grep -q 'NOT_FOUND' "$err"; then
+      info "この project には無い quota なので飛ばす: ${qid}"
+      return 0
+    fi
+    recent=$(grep -oE 'below recent quota usage [0-9]+' "$err" | grep -oE '[0-9]+$' | head -n 1)
+    if [[ -n "$recent" ]] && ((recent > target)); then
+      info "直近の使用量 ${recent} を下回れないので、${recent} に下げる: ${qid}"
+      quota_update "$preference_id" "$qid" "$dims" "$recent" && return 0
+    fi
+    return 1
+  }
   gpu_nonzero=0
   quota_failed=0
   while IFS=$'\t' read -r action qid dims label limit usage target note; do
@@ -377,10 +400,7 @@ QUOTA
       lower)
         info "$(printf '%-34s 上限 %-6s 使用 %-5s → %s に下げる（%s）' "$label" "$limit" "$usage" "$target" "$note")"
         preference_id="hc-remote_$(tr 'A-Z' 'a-z' <<<"${label}" | tr -c 'a-z0-9\n' '-' | sed 's/-*$//')_${region}"
-        change beta quotas preferences update "$preference_id" --allow-missing --project="$project" \
-          --service=compute.googleapis.com --quota-id="$qid" --dimensions="$dims" --preferred-value="$target" \
-          --allow-high-percentage-quota-decrease --justification="hc-remote damage cap (dotfiles #57)" --quiet \
-          </dev/null || quota_failed=1
+        lower_quota "$preference_id" "$qid" "$dims" "$target" || quota_failed=1
         ;;
     esac
   done <"$quota_plan"
