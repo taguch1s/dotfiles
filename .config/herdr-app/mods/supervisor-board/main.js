@@ -4,7 +4,7 @@
 // dotfiles の .config/herdr-core/claude/supervisor-prompt.md の「ボード」、全体像は
 // docs/herdr-core-orchestration.md。dotfiles で管理しているので、直すときは dotfiles 側を編集する。
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex, TextView } from "gpui-base";
+import { v_flex, h_flex, TextView, Scrollbar } from "gpui-base";
 import { agents, terminals, readTextFile, watchFolder, theme, home, run, checking } from "herdr";
 
 const STALE_MINUTES = 30;
@@ -151,7 +151,11 @@ export default class SupervisorBoard extends View {
       .bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .child(header)
       .child(live_rows)
+      // overflow_y_scrollbar() は要素を別の入れ物で包むため、absolute().inset_0() が包みの外へ届かず、
+      // 高さの決まらない領域になってスクロールしない（changes mod と同じ）。overflow_y_scroll() で
+      // 自分でスクロールさせ、同じ id の Scrollbar を重ねる。
       .child(div().flex_1().min_h(0).relative()
-        .child(v_flex().id("board-scroll").absolute().inset_0().overflow_y_scrollbar().px(14).py(10).child(body)));
+        .child(v_flex().id("board-scroll").absolute().inset_0().overflow_y_scroll().px(14).py(10).child(body))
+        .child(Scrollbar.vertical("board-scroll").absolute().inset_0()));
   }
 }
