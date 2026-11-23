@@ -714,6 +714,12 @@ class GcpTest(Base):
         spec = HC.Spec("x", [], 2, 4, 1800)
         self.assertEqual(backend.max_run_s(spec), 1800 + HC.GRACE_S + 600)
         self.assertAlmostEqual(backend.estimate_max_usd(spec), m.hour_usd * (1800 + HC.GRACE_S + 600 + HC.GCP_CREATE_S) / 3600)
+        # 終わったジョブの課金は VM の生存時間で、--max-run-duration より長くは数えない
+        record = {"created_at": HC.iso(NOW), "handle": {"created_epoch": NOW.timestamp() - 86400 * 3, "max_run_s": 2700}}
+        self.assertEqual(backend.billed_seconds(record, {}, NOW, final=True), 2700 + HC.GCP_CREATE_S)
+        self.assertEqual(backend.billed_seconds(record, {}, NOW, final=False), 2700 + HC.GCP_CREATE_S)
+        record["handle"]["created_epoch"] = NOW.timestamp() - 600
+        self.assertEqual(backend.billed_seconds(record, {}, NOW, final=True), 600 + HC.GCP_CREATE_S / 2)
         limit, info, _ = backend.budget_limit()
         self.assertAlmostEqual(limit, 1000 / 170)
         self.assertEqual(info["monthly_budget_jpy"], 1000)
@@ -921,13 +927,15 @@ class GcpTest(Base):
             "hc-remote-b": inst("hc-remote-b", {"hc-remote": "1", "hc-remote-job": "jb", "hc-remote-deadline": future}),
             "hc-remote-c": inst("hc-remote-c", {"hc-remote": "1", "hc-remote-job": "jc", "hc-remote-deadline": past}),
             "hc-remote-e": inst("hc-remote-e", {"hc-remote": "1", "hc-remote-job": "je", "hc-remote-deadline": past}),
+            "hc-remote-f": inst("hc-remote-f", {"hc-remote": "1", "hc-remote-job": "jf", "hc-remote-deadline": future}),
             "hc-remote-d": inst("hc-remote-d", {"hc-remote-job": "jd", "hc-remote-deadline": past}),
             "ts-crawler-x": inst("ts-crawler-x", {}),
             "ts-crawler-y": inst("ts-crawler-y", {"hc-remote": "1"}),
         }))
-        self.add_record("ja", status="done")
+        self.add_record("ja", status="done", fetched=True)
         self.add_record("jb", status="running", max_usd=0.1)
         self.add_record("je", status="running", max_usd=0.2)
+        self.add_record("jf", status="done")  # 別の ls が終わりに気づいただけで、まだ持ち帰っていない
 
     def test_gc_deletes_only_labelled_finished_or_expired_vms(self):
         self.gc_fixture()
@@ -943,8 +951,9 @@ class GcpTest(Base):
         self.assertIn("--filter=labels.hc-remote=1", listed)
         deleted = sorted(c["args"][3] for c in self.calls("compute", "instances", "delete"))
         self.assertEqual(deleted, ["hc-remote-a", "hc-remote-c", "hc-remote-e"])
-        self.assertEqual(sorted(self.instances()), ["hc-remote-b", "hc-remote-d", "ts-crawler-x", "ts-crawler-y"])
+        self.assertEqual(sorted(self.instances()), ["hc-remote-b", "hc-remote-d", "hc-remote-f", "ts-crawler-x", "ts-crawler-y"])
         self.assertIn("残す: hc-remote-b", out)
+        self.assertIn("hc-remote wait jf", out)
         self.assertNotIn("ts-crawler", out)
         # 実行中の記録の VM を期限切れで消したら、最大見積額で記録を閉じる
         self.assertEqual(self.records()["je"]["status"], "error")

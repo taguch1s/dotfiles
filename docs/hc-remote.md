@@ -78,7 +78,7 @@ VM を消す場面（受け入れ条件。`tests/test_hc_remote.py` の `GcpTest
 | 成功・コマンドの失敗（終了コード ≠ 0）・`--timeout` | 持ち帰りの後に `instances delete` |
 | VM の準備の失敗・ジョブが結果を残さずに終わった | 同上（状態は `error`） |
 | 起動の途中の失敗（SSH で入れない・送れない）・その途中の Ctrl-C | その場で `instances delete` してから失敗を返す |
-| `run` を Ctrl-C・SIGTERM で止めた、見ている途中の例外 | `instances delete` して記録を `cancelled`／`error` で閉じる |
+| `run`・`wait` を Ctrl-C・SIGTERM で止めた（VM の作成・起動の途中を含む）、見ている途中の例外 | `instances delete` して記録を `cancelled`／`error` で閉じる |
 | `hc-remote cancel <id>` | `instances delete`（次の `wait` で `cancelled` を記録する） |
 | 手元が落ちた（SIGKILL・電源断） | `--max-run-duration` で VM が自分で消える。`hc-remote gc` でも消せる |
 
@@ -137,7 +137,7 @@ https://modal.com/pricing を 2026-11-23 に確かめた値（Function、物理�
 
 - 東京は E2 の通常の料金で us-central1 の約 1.3 倍（目安、未確認）で、Spot の料金は日々変わる（最大で 1 日 1 回）。その分を見込んで us-central1 の約 1.5 倍に切り上げた。custom の 5% の割増しは別に掛ける。
 - 1 ジョブの最大見積額 = `(timeout + 300 秒 + setup_timeout + 120 秒) × マシンの時間単価`。VM は `--max-run-duration` で消えるので、これが 1 ジョブの上限になる。例: 既定（2 コア・4 GB・30 分 → `e2-highcpu-4`、$0.1008/時）は約 $0.08（約 13 円）、上限いっぱい（8 コア・32 GB・2 時間 → `e2-custom-16-32768`）は約 $1.0（約 170 円）。
-- 終わったジョブの見積額 = `(VM を作り始めてから消すまでの時間 + 60 秒) × 時間単価`（最低 1 分）。持ち帰りの前に `ls`・`budget` が終わりに気づいたときは、VM が残っているので最大で数えておく。
+- 終わったジョブの見積額 = `(VM を作り始めてから消すまでの時間 + 60 秒) × 時間単価`（最低 1 分、`--max-run-duration` + 120 秒が上限）。持ち帰りの前に `ls`・`budget` が終わりに気づいたときは、VM が残っているので最大で数えておく。
 - 料金が分かったら（dev の実機確認の後、課金アカウントの請求で hc-remote のラベルの額を見る）、`pricing.gcp` を直す。
 
 ## 枠の確認
@@ -176,7 +176,7 @@ CLOUDSDK_CONFIG=~/.config/hc-remote/gcloud gcloud compute instances list --filte
 ```
 
 - `gc` は `gcloud compute instances list --filter=labels.hc-remote=1` で一覧を取り、さらにラベル `hc-remote=1` と名前 `hc-remote-` の両方を満たすものだけを扱う。ラベルの無い VM（`ts-crawler-*` など）は一覧にも出さない。
-- 消すのは、記録で終わっている（`running` でない）もの、または期限（ラベル `hc-remote-deadline`）を過ぎたもの。記録で実行中の VM を期限切れで消したときは、記録を `error`（最大見積額）で閉じる。記録に無く期限前の VM（別の端末・起動の途中）は残す。
+- 消すのは、記録で終わって持ち帰り済み（`running` でなく `fetched`）のもの、または期限（ラベル `hc-remote-deadline`）を過ぎたもの。記録で実行中の VM を期限切れで消したときは、記録を `error`（最大見積額）で閉じる。記録に無く期限前の VM（別の端末・起動の途中）と、終わったが持ち帰り前の VM（`hc-remote wait <id>` で持ち帰ると消える）は残す。
 - 予算を変えるのはユーザーが決める。`~/.config/hc-remote/config.toml`（dotfiles の `.config/hc-remote/config.toml`）の `[budget.gcp] monthly_budget_jpy` を変え、スクリプトの `DEFAULTS` も同じ値にする（テストが一致を確かめる）。GCP 側の budget のアラートの金額も合わせる。`wsl/admin/setup-hc-remote-gcp.sh` は既にある budget を作り直さないので、Cloud Console の「お支払い」→「予算とアラート」で `hc-remote` の金額を直す。
 
 ## backend を足す

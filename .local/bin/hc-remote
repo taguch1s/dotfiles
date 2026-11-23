@@ -874,7 +874,10 @@ class GcpBackend(Backend):
             # VM は持ち帰り（wait）か --max-run-duration まで残るので、最大で数えておく
             return float(handle["max_run_s"]) + GCP_CREATE_S
         start = float(handle.get("created_epoch") or datetime.fromisoformat(record["created_at"]).timestamp())
-        return max(GCP_MIN_BILL_S, now.timestamp() - start + GCP_CREATE_S / 2)
+        seconds = max(GCP_MIN_BILL_S, now.timestamp() - start + GCP_CREATE_S / 2)
+        if handle.get("max_run_s"):  # VM は --max-run-duration で消えているので、それより長くは課金されない
+            seconds = min(seconds, float(handle["max_run_s"]) + GCP_CREATE_S)
+        return seconds
 
     def budget_limit(self) -> tuple[float, dict[str, Any], str]:
         budget = self.cfg["budget"]["gcp"]
@@ -1036,12 +1039,15 @@ class GcpBackend(Backend):
             # 失敗・中断でも VM を消す（消せなくても --max-run-duration で消える）
             try:
                 self.delete_instance(name, zone)
-            except Unavailable as del_exc:
+            except Exception as del_exc:
                 self.say(f"{del_exc}（hc-remote gc で消す）")
-            shutil.rmtree(key.parent, ignore_errors=True)
-            spent = self.estimate_usd(spec.cpu, spec.memory_gb, time.time() - created + GCP_CREATE_S / 2)
+            finally:
+                shutil.rmtree(key.parent, ignore_errors=True)
             if isinstance(exc, Unavailable):
-                exc.spent_usd = spent if create is not None and create.returncode == 0 else 0.0
+                # 作成がはっきり失敗したときだけ 0。時間切れ・中断は VM があったかもしれないので数える
+                created_vm = create is None or create.returncode == 0 or create.returncode == 124
+                elapsed = time.time() - created + GCP_CREATE_S / 2
+                exc.spent_usd = self.estimate_usd(spec.cpu, spec.memory_gb, elapsed) if created_vm else 0.0
             raise
         with contextlib.suppress(FileNotFoundError):
             bundle.unlink()
@@ -1410,10 +1416,6 @@ def _sigterm_as_interrupt(signum: int, frame: Any) -> None:
 def follow(ctx: Ctx, record: dict[str, Any]) -> int:
     backend = ctx.backend(record["backend"])
     offset = 0
-    previous = None
-    if not backend.detached and threading.current_thread() is threading.main_thread():
-        # Bash の時間制限などで SIGTERM を受けても、Ctrl-C と同じく VM を消してから終わる
-        previous = signal.signal(signal.SIGTERM, _sigterm_as_interrupt)
     try:
         while True:
             chunk = backend.read_log(record, offset)
@@ -1441,9 +1443,6 @@ def follow(ctx: Ctx, record: dict[str, Any]) -> int:
         ctx.say(f"{record['id']} を見ている途中で失敗したので {backend.name} の後始末をする: {type(exc).__name__}: {exc}")
         abort(ctx, record, f"{type(exc).__name__}: {exc}", cancelled=False)
         return EXIT_INFRA
-    finally:
-        if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
     chunk = backend.read_log(record, offset)
     if chunk:
         ctx.out.write(chunk.decode(errors="replace"))
@@ -1626,12 +1625,17 @@ def cmd_gc(ctx: Ctx, args: argparse.Namespace) -> int:
             deadline = int(labels.get("hc-remote-deadline", ""))
         except ValueError:
             deadline = None
-        if record is not None and record.get("status") != "running":
+        if record is not None and record.get("status") != "running" and record.get("fetched"):
             why = f"記録で終わっている（{record.get('status')}）"
         elif deadline is not None and now > deadline:
             why = "期限（--max-run-duration + 余裕）を過ぎた"
         else:
-            state = "記録で実行中" if record is not None else "記録に無い（期限前）"
+            if record is None:
+                state = "記録に無い（期限前）"
+            elif record.get("status") == "running":
+                state = "記録で実行中"
+            else:
+                state = f"終わったが持ち帰り前。hc-remote wait {job_id} で持ち帰って消す"
             ctx.out.write(f"残す: {name}（{state}、{inst.get('status')}）\n")
             continue
         if args.dry_run:
@@ -1690,6 +1694,10 @@ def main(
     out = out or sys.stdout
     err = err or sys.stderr
     args = build_parser().parse_args(argv)
+    previous = None
+    if args.command in ("run", "wait") and threading.current_thread() is threading.main_thread():
+        # Bash の時間制限などで SIGTERM を受けても Ctrl-C と同じに扱う（GCP は起動中・実行中の VM を消してから終わる）
+        previous = signal.signal(signal.SIGTERM, _sigterm_as_interrupt)
     try:
         ctx = Ctx(load_config(), Store(state_dir()), sdk, out, err, now)
         if args.command == "run":
@@ -1706,6 +1714,9 @@ def main(
     except (UsageError, Unavailable) as exc:
         print(f"hc-remote: {exc}", file=err)
         return EXIT_USAGE
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":
