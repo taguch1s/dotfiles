@@ -256,6 +256,13 @@ mode = "manual"
 reason = "dev の中で root が実行する。手順は docs/wsl-dev-distro.md"
 
 [[config]]
+name = "hc-remote の GCP service account の鍵"
+source = "wsl/admin/setup-hc-remote-gcp.sh"
+target = ".config/hc-remote/gcp-key.json"
+mode = "manual"
+reason = "admin で SA と鍵を作り、dev へ渡す。手順は docs/hc-remote-gcp.md"
+
+[[config]]
 name = "WSL (Windows)"
 source = "windows/.wslconfig"
 target = "%UserProfile%\\.wslconfig"

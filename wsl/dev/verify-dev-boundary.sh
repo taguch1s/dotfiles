@@ -93,6 +93,48 @@ else
   ng "$HOME/.claude/settings.json に skipDangerousModePermissionPrompt: true がない（hc の起動が確認ダイアログで止まる）"
 fi
 
+# GCP: dev にはユーザー本人の gcloud の資格情報を置かない。hc-remote は service account の鍵と
+# 専用の設定（CLOUDSDK_CONFIG=~/.config/hc-remote/gcloud）だけを使う（docs/hc-remote-gcp.md）。
+for gcloud_dir in "$HOME/.config/gcloud" "$HOME/.config/hc-remote/gcloud"; do
+  [[ -d "$gcloud_dir" ]] || continue
+  user_accounts="$(python3 - "$gcloud_dir" <<'PY' 2>&1
+import json, os, sqlite3, sys
+
+root = sys.argv[1]
+found = set()
+for name in ("credentials.db", "access_tokens.db"):
+    path = os.path.join(root, name)
+    if not os.path.exists(path):
+        continue
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        table = "credentials" if name == "credentials.db" else "access_tokens"
+        # access_tokens.db にはアカウント以外（ADC のキャッシュのハッシュ）も入るので、メールアドレスの形だけを見る
+        found.update(row[0] for row in db.execute(f"SELECT account_id FROM {table}") if "@" in row[0])
+    except sqlite3.Error as error:
+        found.add(f"{name} を読めない（{error}）")
+legacy = os.path.join(root, "legacy_credentials")
+if os.path.isdir(legacy):
+    found.update(os.listdir(legacy))
+adc = os.path.join(root, "application_default_credentials.json")
+if os.path.exists(adc):
+    try:
+        kind = json.load(open(adc)).get("type")
+    except (OSError, ValueError):
+        kind = "unreadable"
+    if kind != "service_account":
+        found.add(f"application_default_credentials.json（type={kind}）")
+print(" ".join(sorted(a for a in found if not a.endswith(".gserviceaccount.com"))))
+PY
+)"
+  if [[ -n "$user_accounts" ]]; then
+    ng "gcloud の資格情報にユーザー本人のもの（service account 以外）がある: ${gcloud_dir}: ${user_accounts}"
+  else
+    ok "gcloud の資格情報は service account だけ: ${gcloud_dir}"
+  fi
+done
+[[ -d "$HOME/.config/gcloud" || -d "$HOME/.config/hc-remote/gcloud" ]] || ok 'gcloud の資格情報がない（~/.config/gcloud・~/.config/hc-remote/gcloud）'
+
 if ((failures)); then
   printf '\n%d 件の NG があります。docs/wsl-dev-distro.md を確認してください。\n' "$failures"
   exit 1

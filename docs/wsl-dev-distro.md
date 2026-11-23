@@ -56,7 +56,7 @@ wsl --terminate dev
 wsl -d dev -- bash /home/issei/dotfiles/wsl/dev/verify-dev-boundary.sh
 ```
 
-作業ユーザーの立場で、役割の印、root 相当のグループ、パスワードなしの sudo、PATH、`.exe` の起動、`/mnt` に見えるもの、VS Code 用 mount が読み取り専用か、を確かめます。すべて `OK` になれば完了です。
+作業ユーザーの立場で、役割の印、root 相当のグループ、パスワードなしの sudo、PATH、`.exe` の起動、`/mnt` に見えるもの、VS Code 用 mount が読み取り専用か、gcloud にユーザー本人の資格情報がないか、を確かめます。すべて `OK` になれば完了です。admin から複製された `~/.config/gcloud` で NG になったときは、[hc-remote-gcp.md](hc-remote-gcp.md) の「dev の `~/.config/gcloud` からユーザー本人の資格情報を消す」に従います（`gcloud auth revoke` は admin の資格情報も無効にするので使わない）。
 
 ### 4. スマホからの経路を dev に移す
 
@@ -71,6 +71,7 @@ wsl -d dev -u root -- tailscale up --ssh --hostname dev
 - VS Code: `code --remote wsl+dev /home/issei/<リポジトリ>`、または VS Code の「WSL に接続」で `dev` を選ぶ。
 - Claude Code・gh・Codex の認証は admin から複製されています。Claude Code のログインが切れた場合は dev で `/login` し直してください（同じ認証を 2 つのディストリで更新し合うと、片方が切れることがあります）。
 - Herdr app は dev の WSLg から起動します。hc の監督役は dev で起動します（`hc-supervisor`）。
+- GCP（hc-remote の gcp backend）は、admin で作った専用の service account の鍵だけを dev に置いて使います。ユーザー本人の gcloud の資格情報は dev に置きません。手順は [hc-remote-gcp.md](hc-remote-gcp.md)。実行時に admin は要らないので、admin はセットアップと鍵の作り直しのときだけ起動し、終わったら `wsl --terminate Ubuntu-24.04` で止めます。
 
 ## 運用
 
