@@ -13,6 +13,7 @@ usage() {
 Usage: hc-supervisor [start] [--cwd DIR]
        hc-supervisor restart [--cwd DIR]
        hc-supervisor status | stop | board
+       hc-supervisor capacity [--json]
        hc-supervisor resume-worker --from WORKER --cwd WORKTREE --handoff PATH [--name NAME] [--model opus|sonnet] REQUEST
 
 start    監督役（名前 supervisor、ラベル role=supervisor）を起動する。既に監督役がいれば起動しない。
@@ -29,6 +30,12 @@ restart  監督役を作り直す（プロンプトや設定の変更を反映�
 status   監督役の状態を表示する。
 stop     監督役を止める。監督役が起動したワーカーは止まらない（--outlive-parent）。
 board    監督役の進捗ボード（~/.local/share/hc-supervisor/board.md）を表示する。どのセッションからでも使える。
+capacity 今あと何個ワーカーを起動してよいか（slots）と、効いている制約（limit_by）、根拠の値を出す。
+         読み取りだけ。メモリ（/proc/meminfo の MemAvailable）、メモリの PSI（/proc/pressure/memory の
+         some avg10）、CPU（/proc/loadavg の load1 と nproc）、動いている role=worker の数（hc ls --json）
+         から決める。値が読めない制約は安全側の slots（HC_SUPERVISOR_FALLBACK_SLOTS、既定 1）にして理由を出し、
+         止まらない（終了コードは常に 0）。--json で JSON を出す。式・既定値・環境変数は
+         docs/herdr-core-orchestration.md の「ワーカーの同時数」。
 resume-worker
          「【引き継ぎ】<handoff>」を送ったワーカー（--from、名前か tN）を片付け、同じ worktree（--cwd）で
          新しいワーカーを起動する。依頼文は「【再開】<handoff>」の行の後に REQUEST（前のワーカーへの依頼と同じ）を
@@ -318,6 +325,168 @@ resume_worker() {
   printf '新しいワーカーを起動しました: %s（引き継ぎ %s 回目、モデル %s、handoff: %s）\n' "$new_name" "$count" "$model" "$real_handoff"
 }
 
+# 今あと何個ワーカーを起動してよいかを、ホストの資源から決めて出す（読み取りだけ。終了コードは常に 0）。
+# dev と admin は同じ WSL2 VM を共有し、/proc/meminfo は VM 全体の値なので、admin の Docker なども差し引かれる。
+# 値が読めない制約は安全側の slots（HC_SUPERVISOR_FALLBACK_SLOTS）にして理由を出す。
+# HC_SUPERVISOR_PROC_DIR・HC_SUPERVISOR_NPROC は検証用（偽の /proc と CPU 数に差し替える）。
+capacity() {
+  local as_json=0 workers_json="" workers_error=""
+  while (($#)); do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; exit 2 ;;
+    esac
+  done
+  if ! command -v hc >/dev/null 2>&1; then
+    workers_error='hc が PATH にありません'
+  else
+    local err_file
+    err_file="$(mktemp)"
+    if ! workers_json="$(hc ls --json 2>"$err_file")"; then
+      workers_error="hc ls --json が失敗しました: $(head -c 300 "$err_file" | tr '\n' ' ')${workers_json:0:300}"
+      workers_json=""
+    fi
+    rm -f "$err_file"
+  fi
+  python3 - "$as_json" "$workers_json" "$workers_error" <<'PY'
+import json, math, os, sys
+
+as_json, workers_json, workers_error = sys.argv[1] == "1", sys.argv[2], sys.argv[3]
+proc = os.environ.get("HC_SUPERVISOR_PROC_DIR") or "/proc"
+notes = []
+
+def setting(name, default, kind, minimum):
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return default
+    try:
+        value = kind(raw)
+        if not math.isfinite(value) or value < minimum:
+            raise ValueError
+        return value
+    except ValueError:
+        notes.append(f"{name}={raw!r} は使えないので既定値 {default} にしました")
+        return default
+
+worker_mem_mb = setting("HC_SUPERVISOR_WORKER_MEM_MB", 1536, int, 1)
+reserve_mb_min = setting("HC_SUPERVISOR_MEM_RESERVE_MB", 1536, int, 0)
+reserve_pct = setting("HC_SUPERVISOR_MEM_RESERVE_PCT", 15.0, float, 0)
+worker_cpu = setting("HC_SUPERVISOR_WORKER_CPU", 1.0, float, 0.01)
+cpu_target = setting("HC_SUPERVISOR_CPU_TARGET", 0.8, float, 0.01)
+psi_limit = setting("HC_SUPERVISOR_PSI_MEM_LIMIT", 10.0, float, 0)
+max_workers = setting("HC_SUPERVISOR_MAX_WORKERS", 8, int, 0)
+fallback = setting("HC_SUPERVISOR_FALLBACK_SLOTS", 1, int, 0)
+
+def read(name):
+    with open(os.path.join(proc, name), encoding="utf-8") as f:
+        return f.read()
+
+constraints = {}
+
+# メモリ: MemAvailable から予約（max(下限, MemTotal の割合)）を引き、1 ワーカーの見積もりで割る。
+try:
+    info = {}
+    for line in read("meminfo").splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts:
+            info[key] = int(parts[0])  # kB
+    total_mb, avail_mb = info["MemTotal"] // 1024, info["MemAvailable"] // 1024
+    reserve_mb = max(reserve_mb_min, math.ceil(total_mb * reserve_pct / 100))
+    constraints["memory"] = {
+        "slots": max(0, (avail_mb - reserve_mb) // worker_mem_mb),
+        "mem_total_mb": total_mb, "mem_available_mb": avail_mb,
+        "reserve_mb": reserve_mb, "worker_mem_mb": worker_mem_mb,
+    }
+except (OSError, KeyError, ValueError, IndexError) as e:
+    constraints["memory"] = {"slots": fallback, "error": f"/proc/meminfo を読めません: {e}"}
+
+# メモリの PSI: some avg10 が閾値を超えていたら 0。ファイルが無い（PSI の無いカーネル）なら制約にしない。
+psi_path = os.path.join(proc, "pressure/memory")
+if os.path.exists(psi_path):
+    try:
+        some = next(l for l in read("pressure/memory").splitlines() if l.startswith("some "))
+        avg10 = float(dict(kv.split("=", 1) for kv in some.split()[1:])["avg10"])
+        constraints["memory_pressure"] = {
+            "slots": 0 if avg10 > psi_limit else None, "some_avg10": avg10, "threshold": psi_limit,
+        }
+    except (OSError, StopIteration, KeyError, ValueError) as e:
+        constraints["memory_pressure"] = {"slots": None, "ignored": f"/proc/pressure/memory を読めないので無視しました: {e}"}
+else:
+    constraints["memory_pressure"] = {"slots": None, "ignored": "/proc/pressure/memory が無いので無視しました"}
+
+# CPU: nproc × 目標使用率 − load1 を、1 ワーカーの見積もりで割る。
+try:
+    raw_nproc = os.environ.get("HC_SUPERVISOR_NPROC", "")
+    nproc = int(raw_nproc) if raw_nproc else len(os.sched_getaffinity(0))
+    if nproc < 1:
+        raise ValueError(f"nproc が {nproc} です")
+    load1 = float(read("loadavg").split()[0])
+    constraints["cpu"] = {
+        "slots": max(0, math.floor((nproc * cpu_target - load1) / worker_cpu)),
+        "nproc": nproc, "load1": load1, "cpu_target": cpu_target, "worker_cpu": worker_cpu,
+    }
+except (OSError, ValueError, IndexError) as e:
+    constraints["cpu"] = {"slots": fallback, "error": f"CPU の値を読めません: {e}"}
+
+# 上限: max_workers から動いている role=worker の数を引く。
+def terminals(data):
+    if isinstance(data, dict):
+        data = data.get("terminals", data.get("items"))
+    if not isinstance(data, list):
+        raise ValueError("hc ls --json の形が想定と違います")
+    return [t for t in data if isinstance(t, dict)]
+
+try:
+    if workers_error:
+        raise ValueError(workers_error)
+    running = sum(
+        1 for t in terminals(json.loads(workers_json))
+        if isinstance(t.get("labels"), dict) and t["labels"].get("role") == "worker"
+        and t.get("state", "live") != "finished"
+    )
+    constraints["max_workers"] = {"slots": max(0, max_workers - running), "max_workers": max_workers, "running_workers": running}
+except ValueError as e:  # json.JSONDecodeError も ValueError
+    constraints["max_workers"] = {"slots": fallback, "max_workers": max_workers, "error": f"動いているワーカーの数を読めません: {e}"}
+
+effective = {k: v["slots"] for k, v in constraints.items() if v["slots"] is not None}
+slots = max(0, min(effective.values()))
+limit_by = ",".join(k for k, v in effective.items() if v == slots)
+unknown = [k for k, v in constraints.items() if "error" in v]
+
+if as_json:
+    print(json.dumps({"slots": slots, "limit_by": limit_by, "unknown": unknown, "notes": notes,
+                      "constraints": constraints}, ensure_ascii=False))
+    sys.exit(0)
+
+def gib(mb):
+    return f"{mb / 1024:.1f}GiB"
+
+print(f"slots: {slots}（limit_by: {limit_by}）")
+for name in ("memory", "memory_pressure", "cpu", "max_workers"):
+    c = constraints[name]
+    if "error" in c:
+        detail = f"{c['slots']}（安全側の値。{c['error']}）"
+    elif "ignored" in c:
+        detail = f"制約なし（{c['ignored']}）"
+    elif name == "memory":
+        detail = (f"{c['slots']}（MemAvailable {gib(c['mem_available_mb'])} − 予約 {gib(c['reserve_mb'])}、"
+                  f"1 ワーカー {gib(c['worker_mem_mb'])}。MemTotal {gib(c['mem_total_mb'])}）")
+    elif name == "memory_pressure":
+        state = "0（閾値を超えています）" if c["slots"] == 0 else "制約なし"
+        detail = f"{state}（some avg10 {c['some_avg10']} / 閾値 {c['threshold']}）"
+    elif name == "cpu":
+        detail = (f"{c['slots']}（nproc {c['nproc']} × {c['cpu_target']} − load1 {c['load1']}、"
+                  f"1 ワーカー {c['worker_cpu']}）")
+    else:
+        detail = f"{c['slots']}（上限 {c['max_workers']} − 動いているワーカー {c['running_workers']}）"
+    print(f"{name}: {detail}")
+for note in notes:
+    print(f"注意: {note}")
+PY
+}
+
 command="start"
 if (($#)) && [[ "$1" != -* ]]; then
   command="$1"
@@ -338,9 +507,9 @@ done
 self_path="$(readlink -f "${BASH_SOURCE[0]}")"
 cwd="$default_cwd"
 handoff_ready=0
-# resume-worker は自分の引数を持つので、ここでは読まずに後で渡す。
+# resume-worker・capacity は自分の引数を持つので、ここでは読まずに後で渡す。
 resume_args=()
-if [[ "$command" == resume-worker ]]; then
+if [[ "$command" == resume-worker || "$command" == capacity ]]; then
   resume_args=("$@")
   set --
 fi
@@ -366,6 +535,12 @@ while (($#)); do
       ;;
   esac
 done
+
+# capacity は読み取りだけで、hc が使えなくても安全側の値を出す（admin でも使える）。
+if [[ "$command" == capacity ]]; then
+  capacity "${resume_args[@]}"
+  exit 0
+fi
 
 command -v hc >/dev/null 2>&1 || die 'hc が PATH にありません（herdr-core を導入してください）'
 

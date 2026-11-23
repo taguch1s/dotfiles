@@ -57,6 +57,11 @@ case "$1" in
       echo handoff >"$HOME/.local/share/hc-supervisor/handoff.md"
     fi
     ;;
+  ls)
+    # $MOCK_HC_DIR/ls.json があれば、それを hc ls --json の結果として返す。無ければ core が使えない失敗。
+    [[ -f "$MOCK_HC_DIR/ls.json" ]] || { echo '{"error":{"kind":"unavailable"}}' >&2; exit 3; }
+    cat "$MOCK_HC_DIR/ls.json"
+    ;;
   label|wait|rm) ;;
   *) echo "unexpected hc command: $*" >&2; exit 1 ;;
 esac
@@ -351,6 +356,115 @@ if resume --from w1 --cwd "$repo" --handoff "$worker_handoff" '依頼'; then ng 
 [[ -z "$(cmds)" ]] && ok 'resume-worker: dev ディストリ以外では起動しない' || ng "admin での resume-worker が違う: $(cmds)"
 echo dev >"$HC_CLAUDE_ROLE_FILE"
 rm -f "$fixture/live/"* "$fixture/labels/"*
+
+# capacity: 偽の /proc（HC_SUPERVISOR_PROC_DIR）と CPU 数（HC_SUPERVISOR_NPROC）と hc ls --json で、各制約が効く場合を確かめる。
+proc="$fixture/proc"
+# set_proc <MemTotal kB> <MemAvailable kB> <load1> [<PSI some avg10>]（PSI を省くとファイルを置かない）
+set_proc() {
+  rm -rf "$proc"
+  mkdir -p "$proc/pressure"
+  printf 'MemTotal:       %s kB\nMemFree:          100000 kB\nMemAvailable:   %s kB\n' "$1" "$2" >"$proc/meminfo"
+  printf '%s 1.00 1.00 2/300 12345\n' "$3" >"$proc/loadavg"
+  [[ -z "${4:-}" ]] || printf 'some avg10=%s avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=1\n' "$4" >"$proc/pressure/memory"
+}
+# set_workers <role=worker の数>（ほかに監督役と、終了済みのワーカーを 1 つずつ置く。どちらも数えない）
+set_workers() {
+  python3 -c '
+import json, sys
+n = int(sys.argv[1])
+items = [{"address": f"t{i + 10}", "state": "live", "labels": {"role": "worker"}} for i in range(n)]
+items += [{"address": "t1", "state": "live", "labels": {"role": "supervisor"}},
+          {"address": "t2", "state": "finished", "labels": {"role": "worker"}},
+          {"address": "t3", "state": "live"}]
+print(json.dumps(items))' "$1" >"$fixture/ls.json"
+}
+cap() { HC_SUPERVISOR_PROC_DIR="$proc" HC_SUPERVISOR_NPROC="${NPROC:-20}" "$launcher" capacity --json "$@" 2>"$fixture/err"; }
+# cap_value <JSON> <python の式（d が JSON）>
+# （式がタプルなら値を空白区切りで出す）
+cap_value() { python3 -c 'import json, sys; d = json.loads(sys.argv[1]); v = eval(sys.argv[2]); print(*(v if isinstance(v, tuple) else (v,)))' "$1" "$2"; }
+check_cap() {
+  local label="$1" json="$2" slots="$3" limit="$4"
+  if [[ "$(cap_value "$json" 'd["slots"]')" == "$slots" && "$(cap_value "$json" 'd["limit_by"]')" == "$limit" ]]; then
+    ok "capacity: $label（slots=$slots、limit_by=$limit）"
+  else
+    ng "capacity: $label が違う（期待 slots=$slots limit_by=$limit）: $json / $(<"$fixture/err")"
+  fi
+}
+
+# 10GiB の VM: 予約は max(1536MiB, 15% = 1536MiB)。MemAvailable 4GiB → (4096 − 1536) / 1536 = 1。
+set_proc 10485760 4194304 2.00 0.50
+set_workers 2
+reset
+json="$(cap)"
+check_cap 'メモリが効く' "$json" 1 memory
+[[ "$(cap_value "$json" 'd["constraints"]["cpu"]["slots"], d["constraints"]["max_workers"]["slots"], d["constraints"]["memory_pressure"]["slots"]')" == '14 6 None' ]] \
+  && ok 'capacity: cpu = floor((20 × 0.8 − 2.0) / 1.0)、上限 = 8 − 動いている role=worker（監督役・終了済みは数えない）、PSI は閾値以下なら制約なし' \
+  || ng "capacity の各制約の値が違う: $json"
+[[ "$(cmds)" == 'ls ' ]] && ok 'capacity: hc は ls だけを呼ぶ（読み取りだけ）' || ng "capacity が hc を操作した: $(cmds)"
+json="$(HC_SUPERVISOR_WORKER_MEM_MB=1024 cap)"
+check_cap '1 ワーカーのメモリを HC_SUPERVISOR_WORKER_MEM_MB で変えられる' "$json" 2 memory
+json="$(HC_SUPERVISOR_MEM_RESERVE_MB=512 HC_SUPERVISOR_MEM_RESERVE_PCT=5 cap)"
+check_cap '予約を HC_SUPERVISOR_MEM_RESERVE_MB・_PCT で変えられる（(4096 − 512) / 1536）' "$json" 2 memory
+json="$(HC_SUPERVISOR_WORKER_MEM_MB=abc cap)"
+[[ "$(cap_value "$json" 'd["slots"], len(d["notes"])')" == '1 1' ]] \
+  && ok 'capacity: 使えない環境変数の値は既定値にして注意を出す' || ng "不正な環境変数の扱いが違う: $json"
+
+set_proc 10485760 1048576 2.00
+json="$(cap)"
+check_cap 'MemAvailable が予約より少なければ負ではなく 0' "$json" 0 memory
+
+# 9GiB 空き → メモリ 5。nproc 4 × 0.8 − load1 1.2 = 2。
+set_proc 10485760 9437184 1.20 0.00
+json="$(NPROC=4 cap)"
+check_cap 'CPU が効く' "$json" 2 cpu
+json="$(NPROC=4 HC_SUPERVISOR_WORKER_CPU=0.5 HC_SUPERVISOR_CPU_TARGET=1.0 cap)"
+check_cap 'CPU の見積もりを HC_SUPERVISOR_WORKER_CPU・_CPU_TARGET で変えられる（(4 − 1.2) / 0.5。同じ値の制約は limit_by に並べる）' "$json" 5 memory,cpu
+set_proc 10485760 9437184 30.00 0.00
+json="$(NPROC=4 cap)"
+check_cap 'load1 が目標を超えていれば 0' "$json" 0 cpu
+
+set_proc 10485760 9437184 1.00 25.00
+json="$(cap)"
+check_cap 'メモリの PSI（some avg10）が閾値を超えると 0' "$json" 0 memory_pressure
+json="$(HC_SUPERVISOR_PSI_MEM_LIMIT=30 cap)"
+check_cap 'PSI の閾値を HC_SUPERVISOR_PSI_MEM_LIMIT で変えられる' "$json" 5 memory
+set_proc 10485760 9437184 1.00
+json="$(cap)"
+[[ "$(cap_value "$json" 'd["slots"], d["constraints"]["memory_pressure"]["slots"], "ignored" in d["constraints"]["memory_pressure"]')" == '5 None True' ]] \
+  && ok 'capacity: /proc/pressure/memory が無ければ PSI は無視する' || ng "PSI なしの扱いが違う: $json"
+
+set_proc 104857600 104857600 1.00 0.00
+set_workers 7
+json="$(cap)"
+check_cap '上限（既定 8）から動いているワーカー数を引いた値が効く' "$json" 1 max_workers
+json="$(HC_SUPERVISOR_MAX_WORKERS=4 cap)"
+check_cap '上限を超えて動いていても負ではなく 0、上限は HC_SUPERVISOR_MAX_WORKERS で変えられる' "$json" 0 max_workers
+
+# 値が取れない: /proc が無い・hc ls が失敗する → 安全側の 1、理由を出して終了コード 0。
+rm -rf "$proc" "$fixture/ls.json"
+if json="$(cap)"; then
+  check_cap '値が読めなければ安全側の値で止まらない' "$json" 1 'memory,cpu,max_workers'
+  [[ "$(cap_value "$json" '",".join(d["unknown"]), all("error" in d["constraints"][k] for k in d["unknown"])')" == 'memory,cpu,max_workers True' ]] \
+    && ok 'capacity: 読めなかった制約と理由を出す' || ng "読めない制約の表示が違う: $json"
+else
+  ng "capacity が値を読めずに失敗した: $(<"$fixture/err")"
+fi
+json="$(HC_SUPERVISOR_FALLBACK_SLOTS=0 cap)"
+check_cap '安全側の値は HC_SUPERVISOR_FALLBACK_SLOTS で変えられる' "$json" 0 'memory,cpu,max_workers'
+echo '{"error":{"kind":"unavailable"}}' >"$fixture/ls.json"
+set_proc 104857600 104857600 1.00
+json="$(cap)"
+check_cap 'hc ls --json の形が想定と違えば上限を安全側の値にする' "$json" 1 max_workers
+
+set_proc 10485760 4194304 2.00 0.50
+set_workers 2
+echo admin >"$HC_CLAUDE_ROLE_FILE"
+out="$(HC_SUPERVISOR_PROC_DIR="$proc" HC_SUPERVISOR_NPROC=20 "$launcher" capacity 2>&1)" \
+  && [[ "$out" == 'slots: 1（limit_by: memory）'* && "$out" == *'memory: 1（MemAvailable 4.0GiB − 予約 1.5GiB'* && "$out" == *'max_workers: 6（上限 8 − 動いているワーカー 2）'* ]] \
+  && ok 'capacity: --json なしでは slots・limit_by と根拠を 1 行ずつ出す（admin でも使える）' || ng "capacity の表示が違う: $out"
+echo dev >"$HC_CLAUDE_ROLE_FILE"
+if "$launcher" capacity --bogus >/dev/null 2>&1; then ng 'capacity の不明な引数を受け付けた'; else ok 'capacity: 不明な引数は拒否'; fi
+rm -f "$fixture/ls.json"
 
 if "$launcher" --cwd "$fixture/missing" >/dev/null 2>&1; then ng '存在しない --cwd を受け付けた'; else ok '存在しない --cwd は拒否'; fi
 if "$launcher" bogus >/dev/null 2>&1; then ng '不明なサブコマンドを受け付けた'; else ok '不明なサブコマンドは拒否'; fi
