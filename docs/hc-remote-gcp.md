@@ -55,9 +55,9 @@ bash ~/dotfiles/wsl/admin/setup-hc-remote-gcp.sh --apply    # 実際に作る（
 | 付与 | `roles/iap.tunnelResourceAccessor` | IAP の TCP 転送。条件 `destination.port == 22` |
 | firewall | `hc-remote-allow-iap-ssh` | network `default`、tag `hc-remote` の VM に `35.235.240.0/20`（IAP）からの tcp:22 だけを許す |
 | 鍵 | admin の `~/.config/hc-remote/gcp-key.json` | 0600。組織のポリシーで作れなければ理由を出して止まる |
-| budget | `hc-remote` | project のうちラベル `hc-remote=1` の使用額。しきい値 50%・90%・100% でメール。課金アカウントが JPY なので既定 1500 円（#56 の $10 のおよその換算）。作れなければ手順を表示して先へ進む |
+| budget | `hc-remote` | project のうちラベル `hc-remote=1` の使用額。しきい値 50%・90%・100% でメール。課金アカウントが JPY なので既定 1000 円（2026-11-23 のユーザーの決定。USD の課金アカウントなら $6）。作れなければ手順を表示して先へ進む |
 
-budget はアラートだけで、課金を止めません。使い過ぎは hc-remote の記録上の予算（#56）と VM の `--max-run-duration` で抑えます。
+budget はアラートだけで、課金を止めません。使い過ぎは hc-remote の記録上の予算（#56、月 1000 円。[hc-remote.md](hc-remote.md) の「枠の確認」）と VM の `--max-run-duration` で抑えます。
 
 ## 権限と理由
 
@@ -259,7 +259,7 @@ for vm in ts-crawler-detail-loop-4zzn hc-remote-probe; do
 done
 ```
 
-`ts-crawler-*` は許可されず、`hc-remote-probe` は許可されれば期待どおりです（`ts-crawler-*` の実際の VM 名は `gcloud compute instances list` で確かめる）。作成の条件（上の「確かめられなかった点」）は、#56 の実機確認（最小の VM で `echo` 1 件）で確かめます。
+`ts-crawler-*` は許可されず、`hc-remote-probe` は許可されれば期待どおりです（`ts-crawler-*` の実際の VM 名は `gcloud compute instances list` で確かめる）。作成の条件（上の「確かめられなかった点」）は、#56 の実機確認（最小の VM で `echo` 1 件、手順は [hc-remote.md](hc-remote.md) の「実機で確かめる」の「GCP」）で確かめます。
 
 ## 鍵の作り直し・無効化
 

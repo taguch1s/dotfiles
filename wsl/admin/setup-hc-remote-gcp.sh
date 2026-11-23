@@ -15,7 +15,7 @@ Usage: setup-hc-remote-gcp.sh [--apply] [--project ID] [--zone ZONE] [--network 
 --zone           VM を作るゾーン（既定 asia-northeast1-a）。条件の式の名前に入る
 --network        firewall を置く VPC（既定 default）
 --key-dir        鍵を置くディレクトリ（既定 ~/.config/hc-remote）。鍵は <dir>/gcp-key.json（0600）
---budget-amount  hc-remote の月の budget の金額（課金アカウントの通貨。既定は USD なら 10、JPY なら 1500）
+--budget-amount  hc-remote の月の budget の金額（課金アカウントの通貨。既定は USD なら 6、JPY なら 1000）
 --max-vcpus      hc-remote が同時に使える vCPU の上限（既定 16）。region の CPU の quota を
                  「今の使用分 + この値」まで下げる（下げるだけで、上げない）
 --no-budget      budget のアラートを作らない
@@ -455,8 +455,8 @@ else
   [[ -n "$billing_account" ]] && currency="$(read_gcloud billing accounts describe "$billing_account" --format='value(currencyCode)' || true)"
   if [[ -z "$budget_amount" ]]; then
     case "$currency" in
-      USD) budget_amount=10 ;;
-      JPY) budget_amount=1500 ;;  # #56 の GCP の月の予算 $10 のおよその円換算
+      USD) budget_amount=6 ;;
+      JPY) budget_amount=1000 ;;  # 2026-11-23 のユーザーの決定（#56 の GCP の月の予算 1000 円）
     esac
   fi
   if [[ -z "$billing_account" || -z "$currency" || -z "$budget_amount" ]]; then

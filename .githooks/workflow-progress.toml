@@ -61,3 +61,7 @@ handoff = "issue-55-hc-remote-modal.md"
 [[issue_branch]]
 branch = "feature/issue-57-hc-remote-gcp-access"
 handoff = "issue-57-hc-remote-gcp-access.md"
+
+[[issue_branch]]
+branch = "feature/issue-56-hc-remote-gcp"
+handoff = "issue-56-hc-remote-gcp.md"

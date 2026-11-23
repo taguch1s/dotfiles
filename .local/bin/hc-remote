@@ -3,26 +3,28 @@
 # requires-python = ">=3.12,<3.13"
 # dependencies = ["modal==1.6.4"]
 # ///
-"""重い処理を手元の git worktree から遠隔（Modal など）へ回す。説明は docs/hc-remote.md。
+"""重い処理を手元の git worktree から遠隔（Modal・GCP の Spot VM）へ回す。説明は docs/hc-remote.md。
 
-  hc-remote run [--backend auto|modal|local] [--cpu N] [--memory GB] [--timeout DUR] [--out PATH]... -- CMD...
+  hc-remote run [--backend auto|modal|gcp|local] [--cpu N] [--memory GB] [--timeout DUR] [--out PATH]... -- CMD...
   hc-remote budget [--json]
   hc-remote ls [--json]
   hc-remote logs <id>
   hc-remote wait <id>
   hc-remote cancel <id>
+  hc-remote gc [--dry-run]
 
 - 送るもの: カレントの git worktree の `git ls-files -co --exclude-standard`（追跡ファイルと、
   無視されていない未追跡ファイル）。秘密情報らしいファイルが 1 つでもあれば送らずに止める。
 - 遠隔では、展開した `/work` で `bash -lc CMD` を実行し、ログを流し、終了コードを返し、
   `--out` の path を worktree の同じ場所へ持ち帰る。
 - 上限（~/.config/hc-remote/config.toml）: 1 ジョブの CPU・メモリ・時間、送る量、同時に動かす数。
-  課金のある backend は、起動前に今月の使用額 + このジョブの最大見積額が無料枠 − 余裕に収まるかを確かめる。
+  課金のある backend は、起動前に今月の使用額 + このジョブの最大見積額が枠（Modal は無料枠 − 余裕、
+  GCP は月の予算）に収まるかを確かめる。auto は modal → gcp の順に試し、どれにも収まらなければ手元で実行する。
 - 記録: ~/.local/share/hc-remote/jobs.jsonl（追記だけ）。ls・logs・wait・cancel はここにあるジョブだけを扱う。
 - 環境変数: HC_REMOTE_CONFIG（設定の path）、HC_REMOTE_STATE_DIR（記録の置き場所）。
 
 backend は Backend の小さなインターフェース（見積もり・使用額・launch・poll・read_log・fetch_outputs・
-cleanup・cancel）にまとめ、BACKENDS と AUTO_ORDER に足せば増やせる（GCP の VM は #56）。
+cleanup・cancel）にまとめ、BACKENDS と AUTO_ORDER に足せば増やせる。
 """
 
 from __future__ import annotations
@@ -31,7 +33,9 @@ import argparse
 import contextlib
 import fcntl
 import fnmatch
+import inspect
 import json
+import math
 import os
 import re
 import secrets
@@ -62,14 +66,35 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "max_upload_mb": 200,
     },
     "defaults": {"backend": "auto", "cpu": 2, "memory_gb": 4, "timeout": "30m"},
-    "budget": {"modal": {"free_credit_usd": 30, "margin_usd": 3}},
-    # Modal Function の料金（https://modal.com/pricing を 2026-11-23 に確認）。Sandbox は約 3 倍なので使わない。
-    "pricing": {"modal": {"cpu_core_second_usd": 0.0000131, "memory_gib_second_usd": 0.00000222}},
+    "budget": {
+        "modal": {"free_credit_usd": 30, "margin_usd": 3},
+        # 2026-11-23 のユーザーの決定: GCP は月 1000 円まで（課金アカウントは JPY）。記録は USD なので円安側の換算で割る
+        "gcp": {"monthly_budget_jpy": 1000, "usd_jpy": 170},
+    },
+    "pricing": {
+        # Modal Function の料金（https://modal.com/pricing を 2026-11-23 に確認）。Sandbox は約 3 倍なので使わない。
+        "modal": {"cpu_core_second_usd": 0.0000131, "memory_gib_second_usd": 0.00000222},
+        # E2 の Spot の料金。公式の価格ページで確かめられたのは us-central1（vCPU $0.01309/時、メモリ $0.001754/GiB/時、
+        # 2026-11-23）だけで、東京の値はページに出なかったため、約 1.5 倍に切り上げた。fixed は boot disk と外部 IP の分。
+        "gcp": {"vcpu_hour_usd": 0.02, "memory_gib_hour_usd": 0.0027, "fixed_hour_usd": 0.01},
+    },
     "modal": {"app": "hc-remote", "volume": "hc-remote", "python": "3.12", "uv": "0.11.25"},
+    # docs/hc-remote-gcp.md の「gcp backend（#56）との約束」と同じ値
+    "gcp": {
+        "project": "first-impression-490413",
+        "zone": "asia-northeast1-a",
+        "cloudsdk_config": "~/.config/hc-remote/gcloud",
+        "gcloud": "gcloud",
+        "image_family": "debian-12",
+        "image_project": "debian-cloud",
+        "boot_disk_gb": 20,
+        "uv": "0.11.25",
+        "setup_timeout": "10m",
+    },
 }
 
 EXIT_USAGE = 2
-EXIT_REFUSED = 3  # 上限・無料枠・秘密情報で起動しなかった（ユーザー確認が必要）
+EXIT_REFUSED = 3  # 上限・枠・秘密情報で起動しなかった（ユーザー確認が必要）
 EXIT_INFRA = 125  # backend の失敗でコマンドの終了コードが無い
 GRACE_S = 300  # 展開・持ち帰りの分。backend の時間制限と最大見積もりに足す
 STARTUP_S = 30  # 起動の分。実績の見積もりに足す
@@ -110,11 +135,22 @@ class Refused(Exception):
 
 
 class Unavailable(Exception):
-    """backend が使えない、または使用額を取れない理由。"""
+    """backend が使えない、使用額を取れない、または起動できなかった理由。
+
+    spent_usd: 起動に失敗するまでに課金された見積額（GCP で VM を作ってから失敗したときなど）。記録に残して枠に数える。
+    """
+
+    def __init__(self, message: str, spent_usd: float = 0.0) -> None:
+        super().__init__(message)
+        self.spent_usd = spent_usd
 
 
 class UsageError(Exception):
     pass
+
+
+class LaunchFailed(Exception):
+    """指定した backend で起動できなかった（backend の失敗）。"""
 
 
 # ---------------------------------------------------------------- 設定と値
@@ -333,7 +369,10 @@ def execute_job(
     work = _Path(work)
     work.mkdir(parents=True, exist_ok=True)
     with _tarfile.open(bundle) as tar:
-        tar.extractall(work, filter="tar")
+        try:
+            tar.extractall(work, filter="tar")
+        except TypeError:  # filter の無い Python（3.11.4 より前。GCP の Debian 12 の python3 など）。中身は自分の worktree
+            tar.extractall(work)
     timed_out = cancelled = False
     term_at = None
     with open(log_path, "ab") as log:
@@ -436,22 +475,30 @@ class Poll:
 
 
 class Backend:
-    """backend の共通インターフェース。#56 の GCP の VM はこれを継いで BACKENDS と AUTO_ORDER に足す。
+    """backend の共通インターフェース。継いで BACKENDS と（課金のあるものは）AUTO_ORDER に足す。
 
     - billable: 課金があるか。True なら [pricing.<name>]・[budget.<name>] を使い、起動前に枠を確かめる。
+    - detached: run を止めても（Ctrl-C・SIGTERM）遠隔のジョブが動き続けるか。False なら止めたときに cancel する。
     - estimate_max_usd / estimate_usd: [pricing.<name>] の 1 秒あたりの料金から見積もる。
+    - budget_limit(): 枠（USD）と、その内訳（記録・表示用）。
     - month_usage(start, end): その期間の実際の使用額（USD）。取れなければ Unavailable。
     - launch(job_id, spec, bundle): bundle（tar.gz）を送って起動し、記録に残す handle（JSON にできる dict）を返す。
+      起動できなければ Unavailable（auto なら次の backend を試す）。
     - poll(record) / read_log(record, offset) / fetch_outputs(record, dest) / cleanup(record) / cancel(record)
     """
 
     name = ""
     billable = False
+    detached = True
     poll_interval = 1.0
+    budget_word = "無料枠"
 
     def __init__(self, cfg: dict[str, Any], state: Path, sdk: Any = None) -> None:
         self.cfg = cfg
         self.state = state
+
+    def say(self, msg: str) -> None:  # Ctx.backend が ctx.say に差し替える
+        print(f"hc-remote: {msg}", file=sys.stderr, flush=True)
 
     def rates(self) -> tuple[float, float]:
         p = self.cfg["pricing"][self.name]
@@ -465,6 +512,18 @@ class Backend:
 
     def estimate_max_usd(self, spec: Spec) -> float:
         return self.estimate_usd(spec.cpu, spec.memory_gb, spec.timeout_s + GRACE_S)
+
+    def billed_seconds(self, record: dict[str, Any], result: dict[str, Any], now: datetime, final: bool) -> float:
+        """終わったジョブの課金の秒数の見積もり。final は後始末（cleanup）まで済ませるとき。"""
+        if "seconds" in result:
+            return float(result["seconds"]) + (STARTUP_S if self.billable else 0)
+        return (now - datetime.fromisoformat(record["created_at"])).total_seconds()
+
+    def budget_limit(self) -> tuple[float, dict[str, Any], str]:
+        budget = self.cfg["budget"][self.name]
+        limit = float(budget["free_credit_usd"]) - float(budget["margin_usd"])
+        info = {"free_credit_usd": float(budget["free_credit_usd"]), "margin_usd": float(budget["margin_usd"])}
+        return limit, info, f"無料枠 ${info['free_credit_usd']:.2f} − 余裕 ${info['margin_usd']:.2f}"
 
     def check_available(self) -> None:
         pass
@@ -691,9 +750,387 @@ class ModalBackend(Backend):
         self.sdk.FunctionCall.from_id(record["handle"]["call_id"]).cancel(terminate_containers=True)
 
 
-BACKENDS: dict[str, type[Backend]] = {"local": LocalBackend, "modal": ModalBackend}
-# auto で試す順。#56 で GCP の VM を後ろに足す。local は試行用なので auto に入れない。
-AUTO_ORDER = ["modal"]
+GCP_USER = "hcremote"
+GCP_LABEL = "hc-remote"  # ラベル hc-remote=1 と network tag hc-remote
+GCP_PREFIX = "hc-remote-"  # IAM 条件が許す VM・disk の名前の接頭辞
+GCP_SSH_WAIT_S = 300  # VM を作ってから SSH が通るまで待つ上限
+GCP_CREATE_S = 120  # VM の作成と削除の分。最大見積もりと期限に足す
+GCP_MIN_BILL_S = 60  # Compute Engine は 1 分未満でも 1 分を課金する
+E2_PREDEFINED = (("highcpu", 1, (2, 4, 8, 16, 32)), ("standard", 4, (2, 4, 8, 16, 32)), ("highmem", 8, (2, 4, 8, 16)))
+E2_CUSTOM_PREMIUM = 1.05  # custom は predefined より 5% 高い（公式の価格ページ）
+
+GCP_STARTUP = """#!/bin/bash
+# hc-remote: VM の準備（root で 1 回）。終わったら ready、失敗したら failed にログの末尾を書く
+mkdir -p /var/lib/hc-remote
+if {{
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -q &&
+    apt-get install -y -q --no-install-recommends python3 git build-essential curl ca-certificates &&
+    curl -LsSf https://astral.sh/uv/{uv}/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+}} >/var/lib/hc-remote/setup.log 2>&1; then
+  touch /var/lib/hc-remote/ready
+else
+  tail -n 30 /var/lib/hc-remote/setup.log >/var/lib/hc-remote/failed
+fi
+"""
+
+GCP_RUN = """#!/bin/bash
+# hc-remote: VM の準備を待ってから runner.py（execute_job）を動かす。ssh から setsid で切り離して起動する
+ready=${{HC_REMOTE_READY:-/var/lib/hc-remote/ready}}
+failed=${{ready%/*}}/failed
+echo $$ >pid
+for ((i = 0; i < {setup_s}; i++)); do
+  [[ -e $ready ]] && exec python3 runner.py
+  if [[ -e $failed ]]; then
+    {{ echo "hc-remote: VM の準備（apt・uv）に失敗した"; cat "$failed"; }} >>log
+    echo failed >setup-error
+    exit 1
+  fi
+  sleep 1
+done
+echo "hc-remote: VM の準備が {setup_s} 秒で終わらなかった" >>log
+echo timeout >setup-error
+"""
+
+
+def gcp_runner_source() -> str:
+    """VM で動かす runner.py。execute_job（標準ライブラリだけ）の source をそのまま入れる。"""
+    return (
+        "from __future__ import annotations\n\nimport json\nimport threading\nfrom pathlib import Path\n"
+        "from typing import Any, Callable\n\n\n"
+        + inspect.getsource(execute_job)
+        + '\n\nif __name__ == "__main__":\n'
+        + '    execute_job("bundle.tar", "work", "log", "out.tar", "result.json", json.load(open("spec.json")))\n'
+    )
+
+
+@dataclass
+class Machine:
+    type: str
+    vcpu: int
+    memory_gb: float
+    hour_usd: float
+
+
+class GcpBackend(Backend):
+    """ジョブごとに GCP の Spot VM（E2）を 1 台作り、IAP 経由の SSH で動かして、終わったら消す。
+
+    約束（docs/hc-remote-gcp.md）: CLOUDSDK_CONFIG=[gcp] cloudsdk_config の service account、名前 hc-remote-<id>、
+    ラベル hc-remote=1、network tag hc-remote、--no-service-account --no-scopes、block-project-ssh-keys と作成時の
+    ssh-keys（ジョブごとの一時鍵）、Spot・--instance-termination-action=DELETE・--max-run-duration。
+    使用額は請求額を取らず（Non-goal）、手元の記録の見積もりで数える。
+    """
+
+    name = "gcp"
+    billable = True
+    detached = False  # run を止めたら VM を消す（手元が落ちても --max-run-duration で消える）
+    poll_interval = 10.0
+    budget_word = "予算"
+
+    def __init__(self, cfg: dict[str, Any], state: Path, sdk: Any = None) -> None:
+        super().__init__(cfg, state)
+        self.opts = cfg["gcp"]
+        self.prices = cfg["pricing"]["gcp"]
+
+    # ---- 見積もり
+
+    def machine(self, cpu: float, memory_gb: float) -> Machine:
+        """--cpu（物理コア、1 コア = 2 vCPU）と --memory から、最も安い E2 のマシンタイプを選ぶ。"""
+        vcpu = max(2, math.ceil(cpu * 2))
+        vcpu += vcpu % 2
+        while memory_gb > 8 * vcpu:  # E2 は 1 vCPU あたり 8 GB まで
+            vcpu += 2
+        if vcpu > 32 or memory_gb > 128:
+            raise Unavailable(f"E2 で作れない大きさ（{vcpu} vCPU・{memory_gb:g} GB。E2 は 32 vCPU・128 GB まで）")
+
+        def hour(v: float, m: float) -> float:
+            return v * float(self.prices["vcpu_hour_usd"]) + m * float(self.prices["memory_gib_hour_usd"])
+
+        fixed = float(self.prices["fixed_hour_usd"])
+        options = []
+        for family, ratio, sizes in E2_PREDEFINED:
+            if vcpu in sizes and memory_gb <= ratio * vcpu:
+                options.append(Machine(f"e2-{family}-{vcpu}", vcpu, ratio * vcpu, hour(vcpu, ratio * vcpu) + fixed))
+                break
+        mem = math.ceil(max(memory_gb, 0.5 * vcpu) * 4) / 4  # 1 vCPU あたり 0.5 GB 以上、256 MB 単位
+        options.append(
+            Machine(f"e2-custom-{vcpu}-{int(mem * 1024)}", vcpu, mem, hour(vcpu, mem) * E2_CUSTOM_PREMIUM + fixed)
+        )
+        return min(options, key=lambda m: m.hour_usd)
+
+    def estimate_usd(self, cpu: float, memory_gb: float, seconds: float) -> float:
+        return self.machine(cpu, memory_gb).hour_usd * max(seconds, GCP_MIN_BILL_S) / 3600
+
+    def max_run_s(self, spec: Spec) -> int:
+        return spec.timeout_s + GRACE_S + parse_duration(self.opts["setup_timeout"])
+
+    def estimate_max_usd(self, spec: Spec) -> float:
+        # VM は --max-run-duration で消えるので、作成・削除の分を足した長さが上限になる
+        return self.estimate_usd(spec.cpu, spec.memory_gb, self.max_run_s(spec) + GCP_CREATE_S)
+
+    def billed_seconds(self, record: dict[str, Any], result: dict[str, Any], now: datetime, final: bool) -> float:
+        handle = record.get("handle") or {}
+        if not final and handle.get("max_run_s"):
+            # VM は持ち帰り（wait）か --max-run-duration まで残るので、最大で数えておく
+            return float(handle["max_run_s"]) + GCP_CREATE_S
+        start = float(handle.get("created_epoch") or datetime.fromisoformat(record["created_at"]).timestamp())
+        seconds = max(GCP_MIN_BILL_S, now.timestamp() - start + GCP_CREATE_S / 2)
+        if handle.get("max_run_s"):  # VM は --max-run-duration で消えているので、それより長くは課金されない
+            seconds = min(seconds, float(handle["max_run_s"]) + GCP_CREATE_S)
+        return seconds
+
+    def budget_limit(self) -> tuple[float, dict[str, Any], str]:
+        budget = self.cfg["budget"]["gcp"]
+        jpy, rate = float(budget["monthly_budget_jpy"]), float(budget["usd_jpy"])
+        info = {"monthly_budget_jpy": jpy, "usd_jpy": rate}
+        return jpy / rate, info, f"月の予算 {jpy:.0f} 円 ÷ {rate:g} 円/$"
+
+    def month_usage(self, start: datetime, end: datetime) -> float:
+        raise Unavailable("GCP は請求額を取らず、hc-remote の記録上の見積もりで数える")
+
+    # ---- gcloud
+
+    def config_dir(self) -> Path:
+        return Path(os.path.expanduser(str(self.opts["cloudsdk_config"])))
+
+    def check_available(self) -> None:
+        if shutil.which(str(self.opts["gcloud"])) is None:
+            raise Unavailable(f"gcloud が無い（{self.opts['gcloud']}）")
+        if shutil.which("ssh-keygen") is None:
+            raise Unavailable("ssh-keygen が無い")
+        if not self.config_dir().is_dir():
+            raise Unavailable(
+                f"gcloud の設定 {self.config_dir()} が無い（docs/hc-remote-gcp.md の「dev で使う」で作る）"
+            )
+
+    def gcloud(self, *args: str, timeout: float | None = 600, input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+        env = dict(os.environ)
+        env["CLOUDSDK_CONFIG"] = str(self.config_dir())
+        env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
+        cmd = [str(self.opts["gcloud"]), *args, f"--project={self.opts['project']}"]
+        try:
+            return subprocess.run(
+                cmd, env=env, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL if input_bytes is None else None,
+                input=input_bytes,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return subprocess.CompletedProcess(cmd, 124, exc.stdout or b"", (exc.stderr or b"") + b"\ngcloud timed out")
+        except OSError as exc:
+            return subprocess.CompletedProcess(cmd, 127, b"", str(exc).encode())
+
+    @staticmethod
+    def _err(proc: subprocess.CompletedProcess) -> str:
+        text = (proc.stderr or b"").decode(errors="replace").strip().splitlines()
+        return " / ".join(text[-3:]) or f"終了コード {proc.returncode}"
+
+    def _ssh_flags(self, handle: dict[str, Any]) -> list[str]:
+        return [
+            f"--zone={handle['zone']}",
+            "--tunnel-through-iap",
+            f"--ssh-key-file={handle['key']}",
+            "--strict-host-key-checking=no",
+            "--quiet",
+        ]
+
+    def ssh(self, handle: dict[str, Any], command: str, timeout: float = 120) -> subprocess.CompletedProcess:
+        return self.gcloud(
+            "compute", "ssh", f"{GCP_USER}@{handle['instance']}", *self._ssh_flags(handle), f"--command={command}",
+            timeout=timeout,
+        )
+
+    def scp(self, handle: dict[str, Any], *paths: str, timeout: float = 600) -> subprocess.CompletedProcess:
+        return self.gcloud("compute", "scp", *self._ssh_flags(handle), *paths, timeout=timeout)
+
+    def remote_dir(self, job_id: str) -> str:
+        return f"hc-remote/{job_id}"
+
+    def instance_state(self, handle: dict[str, Any]) -> str | None:
+        """VM の status（RUNNING など）。無ければ None。確かめられなければ "UNKNOWN"。"""
+        proc = self.gcloud(
+            "compute", "instances", "describe", handle["instance"], f"--zone={handle['zone']}", "--format=value(status)",
+            timeout=120,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.decode().strip() or "UNKNOWN"
+        if b"not found" in proc.stderr.lower() or b"was not found" in proc.stderr.lower():
+            return None
+        return "UNKNOWN"
+
+    def delete_instance(self, name: str, zone: str) -> None:
+        proc = self.gcloud("compute", "instances", "delete", name, f"--zone={zone}", "--quiet", timeout=600)
+        if proc.returncode != 0 and b"not found" not in proc.stderr.lower():
+            raise Unavailable(f"VM {name} を消せない: {self._err(proc)}")
+
+    # ---- ジョブ
+
+    def launch(self, job_id: str, spec: Spec, bundle: Path) -> dict[str, Any]:
+        d = bundle.parent
+        machine = self.machine(spec.cpu, spec.memory_gb)
+        name = f"{GCP_PREFIX}{job_id}"
+        zone = str(self.opts["zone"])
+        setup_s = parse_duration(self.opts["setup_timeout"])
+        max_run = self.max_run_s(spec)
+        key = d / "ssh" / "id"
+        key.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", GCP_USER, "-f", str(key)],
+            check=True, capture_output=True,
+        )
+        pub = key.with_suffix(".pub").read_text().strip()
+        (d / "startup.sh").write_text(GCP_STARTUP.format(uv=self.opts["uv"]))
+        (d / "run.sh").write_text(GCP_RUN.format(setup_s=setup_s))
+        (d / "runner.py").write_text(gcp_runner_source())
+        (d / "spec.json").write_text(json.dumps(spec.payload()))
+        created = time.time()
+        deadline = int(created) + max_run + GCP_CREATE_S
+        create: subprocess.CompletedProcess | None = None
+        handle = {
+            "instance": name,
+            "zone": zone,
+            "project": self.opts["project"],
+            "machine_type": machine.type,
+            "vcpu": machine.vcpu,
+            "memory_gb": machine.memory_gb,
+            "key": str(key),
+            "created_epoch": round(created, 1),
+            "deadline_epoch": deadline,
+            "max_run_s": max_run,
+        }
+        self.say(f"VM {name} を作る（{machine.type}、Spot、{format_duration(max_run)} で自動削除）")
+        try:
+            create = self.gcloud(
+                "compute", "instances", "create", name,
+                f"--zone={zone}",
+                f"--machine-type={machine.type}",
+                f"--image-family={self.opts['image_family']}",
+                f"--image-project={self.opts['image_project']}",
+                f"--boot-disk-size={int(self.opts['boot_disk_gb'])}GB",
+                "--boot-disk-type=pd-balanced",
+                "--provisioning-model=SPOT",
+                "--instance-termination-action=DELETE",
+                f"--max-run-duration={max_run}s",
+                "--no-service-account",
+                "--no-scopes",
+                f"--tags={GCP_LABEL}",
+                f"--labels={GCP_LABEL}=1,{GCP_LABEL}-job={job_id},{GCP_LABEL}-deadline={deadline}",
+                f"--metadata=block-project-ssh-keys=TRUE,ssh-keys={GCP_USER}:{pub}",
+                f"--metadata-from-file=startup-script={d / 'startup.sh'}",
+                timeout=600,
+            )
+            if create.returncode != 0:
+                raise Unavailable(f"VM を作れない: {self._err(create)}")
+            remote = self.remote_dir(job_id)
+            ssh_deadline = time.time() + GCP_SSH_WAIT_S
+            while True:
+                probe = self.ssh(handle, f"mkdir -p {remote}", timeout=120)
+                if probe.returncode == 0:
+                    break
+                if time.time() > ssh_deadline:
+                    raise Unavailable(f"VM に SSH で入れない（{GCP_SSH_WAIT_S} 秒）: {self._err(probe)}")
+                time.sleep(5)
+            files = [str(d / n) for n in ("bundle.tar", "spec.json", "runner.py", "run.sh")]
+            sent = self.scp(handle, *files, f"{GCP_USER}@{name}:{remote}/")
+            if sent.returncode != 0:
+                raise Unavailable(f"VM へ送れない: {self._err(sent)}")
+            started = self.ssh(handle, f"cd {remote} && (setsid nohup bash run.sh >/dev/null 2>&1 </dev/null &)")
+            if started.returncode != 0:
+                raise Unavailable(f"VM でジョブを起動できない: {self._err(started)}")
+        except BaseException as exc:
+            # 失敗・中断でも VM を消す（消せなくても --max-run-duration で消える）
+            try:
+                self.delete_instance(name, zone)
+            except Exception as del_exc:
+                self.say(f"{del_exc}（hc-remote gc で消す）")
+            finally:
+                shutil.rmtree(key.parent, ignore_errors=True)
+            if isinstance(exc, Unavailable):
+                # 作成がはっきり失敗したときだけ 0。時間切れ・中断は VM があったかもしれないので数える
+                created_vm = create is None or create.returncode == 0 or create.returncode == 124
+                elapsed = time.time() - created + GCP_CREATE_S / 2
+                exc.spent_usd = self.estimate_usd(spec.cpu, spec.memory_gb, elapsed) if created_vm else 0.0
+            raise
+        with contextlib.suppress(FileNotFoundError):
+            bundle.unlink()
+        return handle
+
+    def poll(self, record: dict[str, Any]) -> Poll:
+        handle = record["handle"]
+        remote = self.remote_dir(record["id"])
+        proc = self.ssh(
+            handle,
+            f"cd {remote} && if [ -e result.json ]; then cat result.json; elif [ -e setup-error ]; then echo SETUP-ERROR; "
+            "elif [ -e pid ] && ! kill -0 \"$(cat pid)\" 2>/dev/null; then echo DEAD; fi",
+        )
+        if proc.returncode != 0:
+            state = self.instance_state(handle)
+            if state is None or state in ("STOPPING", "TERMINATED", "SUSPENDED"):
+                return Poll(True, error=f"VM {handle['instance']} が無い（Spot の回収・--max-run-duration・cancel）")
+            if time.time() > float(handle.get("deadline_epoch") or 0):
+                return Poll(True, error=f"VM {handle['instance']} に期限を過ぎても入れない: {self._err(proc)}")
+            return Poll(False)  # 一時的な SSH の失敗
+        text = proc.stdout.decode(errors="replace").strip()
+        if not text:
+            return Poll(False)
+        if text == "SETUP-ERROR":
+            return Poll(True, error="VM の準備（apt・uv）に失敗した（hc-remote logs で理由を見る）")
+        if text == "DEAD":
+            return Poll(True, error="VM のジョブが結果を残さずに終わった")
+        try:
+            return Poll(True, json.loads(text))
+        except json.JSONDecodeError:
+            return Poll(False)
+
+    def local_log(self, record: dict[str, Any]) -> Path:
+        return self.state / "jobs" / record["id"] / "log"
+
+    def read_log(self, record: dict[str, Any], offset: int) -> bytes:
+        local = self.local_log(record)
+        if local.exists():
+            with local.open("rb") as f:
+                f.seek(offset)
+                return f.read()
+        proc = self.ssh(record["handle"], f"tail -c +{offset + 1} {self.remote_dir(record['id'])}/log 2>/dev/null || true")
+        return proc.stdout if proc.returncode == 0 else b""
+
+    def fetch_outputs(self, record: dict[str, Any], dest: Path) -> bool:
+        handle = record["handle"]
+        proc = self.scp(handle, f"{GCP_USER}@{handle['instance']}:{self.remote_dir(record['id'])}/out.tar", str(dest))
+        return proc.returncode == 0 and dest.exists()
+
+    def cleanup(self, record: dict[str, Any]) -> None:
+        """ログを手元に残してから VM を消し、一時鍵を消す。"""
+        handle = record["handle"]
+        local = self.local_log(record)
+        if not local.exists() and Path(handle["key"]).exists():
+            local.parent.mkdir(parents=True, exist_ok=True)
+            self.scp(handle, f"{GCP_USER}@{handle['instance']}:{self.remote_dir(record['id'])}/log", str(local))
+        try:
+            self.delete_instance(handle["instance"], handle["zone"])
+        finally:
+            shutil.rmtree(Path(handle["key"]).parent, ignore_errors=True)
+
+    def cancel(self, record: dict[str, Any]) -> None:
+        handle = record["handle"]
+        self.delete_instance(handle["instance"], handle["zone"])
+        shutil.rmtree(Path(handle["key"]).parent, ignore_errors=True)
+
+    def list_instances(self) -> list[dict[str, Any]]:
+        """ラベル hc-remote=1 の VM だけ。ラベルの無い VM（ts-crawler-* など）は一覧にも出さない。"""
+        proc = self.gcloud(
+            "compute", "instances", "list", f"--filter=labels.{GCP_LABEL}=1", "--format=json", timeout=120
+        )
+        if proc.returncode != 0:
+            raise Unavailable(f"VM の一覧を取れない: {self._err(proc)}")
+        items = json.loads(proc.stdout or b"[]")
+        return [
+            i for i in items
+            if (i.get("labels") or {}).get(GCP_LABEL) == "1" and str(i.get("name", "")).startswith(GCP_PREFIX)
+        ]
+
+
+BACKENDS: dict[str, type[Backend]] = {"local": LocalBackend, "modal": ModalBackend, "gcp": GcpBackend}
+# auto で試す順。どれにも収まらなければ local（手元）で実行する（2026-11-23 のユーザーの決定）。
+AUTO_ORDER = ["modal", "gcp"]
 
 
 # ---------------------------------------------------------------- 記録
@@ -753,6 +1190,7 @@ class Ctx:
             raise UsageError(f"知らない backend: {name}")
         if name not in self._backends:
             self._backends[name] = BACKENDS[name](self.cfg, self.store.root, sdk=self.sdk)
+            self._backends[name].say = self.say
         return self._backends[name]
 
     def say(self, msg: str) -> None:
@@ -760,11 +1198,10 @@ class Ctx:
 
 
 def budget_status(ctx: Ctx, name: str) -> dict[str, Any]:
-    """今月（UTC の月初から）の使用額、実行中のジョブの予約、無料枠の残り。"""
+    """今月（UTC の月初から）の使用額、実行中のジョブの予約、枠の残り。"""
     backend = ctx.backend(name)
     now = ctx.now()
     start = month_start(now)
-    budget = ctx.cfg["budget"][name]
     records = [r for r in ctx.store.records().values() if r.get("backend") == name]
     this_month = [r for r in records if r.get("created_at", "") >= iso(start)]
     note = None
@@ -776,7 +1213,7 @@ def budget_status(ctx: Ctx, name: str) -> dict[str, Any]:
         source = "local"
         note = str(exc)
     reserved = sum(float(r.get("max_usd") or 0) for r in records if r.get("status") == "running")
-    limit = float(budget["free_credit_usd"]) - float(budget["margin_usd"])
+    limit, info, limit_text = backend.budget_limit()
     return {
         "backend": name,
         "month": start.strftime("%Y-%m"),
@@ -784,9 +1221,9 @@ def budget_status(ctx: Ctx, name: str) -> dict[str, Any]:
         "source": source,
         "source_note": note,
         "running_reserved_usd": round(reserved, 4),
-        "free_credit_usd": float(budget["free_credit_usd"]),
-        "margin_usd": float(budget["margin_usd"]),
+        **info,
         "limit_usd": round(limit, 4),
+        "limit_text": limit_text,
         "remaining_usd": round(limit - used - reserved, 4),
         "jobs": [
             {k: r.get(k) for k in ("id", "status", "exit_code", "cpu", "memory_gb", "seconds", "est_usd", "max_usd")}
@@ -799,6 +1236,12 @@ SOURCE_LABEL = {
     "report": "Modal の billing report",
     "local": "手元の記録からの見積もり（hc-remote 以外の使用分は入らない）",
 }
+
+
+def yen(status: dict[str, Any], usd: float) -> str:
+    """GCP の枠は円で決めているので、円も添える。"""
+    rate = status.get("usd_jpy")
+    return f"（約 {usd * rate:.0f} 円）" if rate else ""
 
 
 def refresh_running(ctx: Ctx) -> None:
@@ -814,34 +1257,77 @@ def refresh_running(ctx: Ctx) -> None:
             finish(ctx, record, poll, fetch=False)
 
 
-def choose_backend(ctx: Ctx, requested: str, spec: Spec) -> tuple[Backend, float]:
-    names = AUTO_ORDER if requested == "auto" else [requested]
-    reasons = []
+def eligible(ctx: Ctx, names: list[str], spec: Spec, reasons: list[str]):
+    """使えて枠に収まる backend を順に返す（backend, このジョブの最大見積額）。外れた理由は reasons に足す。"""
     for name in names:
         backend = ctx.backend(name)
         try:
             backend.check_available()
+            max_usd = backend.estimate_max_usd(spec)
         except Unavailable as exc:
             reasons.append(f"{name}: {exc}")
             continue
-        max_usd = backend.estimate_max_usd(spec)
         if backend.billable:
             status = budget_status(ctx, name)
             need = status["used_usd"] + status["running_reserved_usd"] + max_usd
             ctx.say(
                 f"{name} の今月の使用額 ${status['used_usd']:.2f}（{SOURCE_LABEL[status['source']]}）"
                 f" + 実行中 ${status['running_reserved_usd']:.2f} + このジョブの最大 ${max_usd:.2f}"
-                f" / 枠 ${status['limit_usd']:.2f}（無料枠 ${status['free_credit_usd']:.2f} − 余裕 ${status['margin_usd']:.2f}）"
+                f" = ${need:.2f}{yen(status, need)} / 枠 ${status['limit_usd']:.2f}（{status['limit_text']}）"
             )
             if status["source_note"]:
-                ctx.say(f"billing report を使わなかった理由: {status['source_note']}")
+                ctx.say(f"実際の使用額を使わなかった理由: {status['source_note']}")
             if need > status["limit_usd"]:
-                reasons.append(f"{name}: 無料枠を超える（${need:.2f} > ${status['limit_usd']:.2f}）")
+                reasons.append(f"{name}: {backend.budget_word}を超える（${need:.2f} > ${status['limit_usd']:.2f}）")
                 continue
-        return backend, max_usd
-    if requested == "auto":
-        reasons.append("auto で試せる次の backend は無い")
-    raise Refused("; ".join(reasons))
+        yield backend, max_usd
+
+
+def launch_first(
+    ctx: Ctx, requested: str, spec: Spec, job_id: str, bundle: Path, nfiles: int, size: int
+) -> tuple[Backend, float, dict[str, Any], str | None]:
+    """枠に収まる backend で起動する。auto でどの remote でも起動できなければ、手元（local）で実行する。"""
+    names = AUTO_ORDER if requested == "auto" else [requested]
+    reasons: list[str] = []
+    for backend, max_usd in eligible(ctx, names, spec, reasons):
+        ctx.say(f"{job_id} を {backend.name} で起動する（{nfiles} ファイル、{size / 1024:.0f} KB）")
+        try:
+            return backend, max_usd, backend.launch(job_id, spec, bundle), None
+        except Unavailable as exc:
+            record_failed_launch(ctx, backend, job_id, spec, exc)
+            if requested != "auto":
+                raise LaunchFailed(f"{backend.name} で起動できない: {exc}") from exc
+            reasons.append(f"{backend.name}: {exc}")
+            ctx.say(f"{backend.name} で起動できない。次を試す: {exc}")
+    if requested != "auto":
+        raise Refused("; ".join(reasons))
+    fallback = "; ".join(reasons)
+    ctx.say(f"どの remote にも収まらないため、手元（local）で実行する: {fallback}")
+    local = ctx.backend("local")
+    return local, 0.0, local.launch(job_id, spec, bundle), fallback
+
+
+def record_failed_launch(ctx: Ctx, backend: Backend, job_id: str, spec: Spec, exc: Unavailable) -> None:
+    """起動に失敗するまでに課金があれば（VM を作った後の失敗）、枠に数えるため記録に残す。"""
+    if not exc.spent_usd:
+        return
+    ctx.store.append(
+        {
+            "event": "launch_failed",
+            "id": f"{job_id}-{backend.name}",
+            "backend": backend.name,
+            "status": "error",
+            "created_at": iso(ctx.now()),
+            "ended_at": iso(ctx.now()),
+            "cmd": spec.cmd,
+            "cpu": spec.cpu,
+            "memory_gb": spec.memory_gb,
+            "timeout_s": spec.timeout_s,
+            "est_usd": round(exc.spent_usd, 4),
+            "error": str(exc),
+            "fetched": True,
+        }
+    )
 
 
 def new_job_id(now: datetime) -> str:
@@ -896,9 +1382,7 @@ def cmd_run(ctx: Ctx, args: argparse.Namespace, cwd: Path) -> int:
                     f"実行中のジョブが {len(running)} 件あり、上限 max_concurrent_jobs={limits['max_concurrent_jobs']} に達している"
                     f"（{', '.join(r['id'] for r in running)}）"
                 )
-            backend, max_usd = choose_backend(ctx, requested, spec)
-            ctx.say(f"{job_id} を {backend.name} で起動する（{len(files)} ファイル、{size / 1024:.0f} KB）")
-            handle = backend.launch(job_id, spec, bundle)
+            backend, max_usd, handle, fallback = launch_first(ctx, requested, spec, job_id, bundle, len(files), size)
             record = {
                 "event": "launch",
                 "id": job_id,
@@ -914,6 +1398,8 @@ def cmd_run(ctx: Ctx, args: argparse.Namespace, cwd: Path) -> int:
                 "max_usd": round(max_usd, 4),
                 "handle": handle,
             }
+            if fallback:
+                record["fallback_reason"] = fallback
             ctx.store.append(record)
     except BaseException:
         if not any(r["id"] == job_id for r in ctx.store.records().values()):
@@ -921,6 +1407,10 @@ def cmd_run(ctx: Ctx, args: argparse.Namespace, cwd: Path) -> int:
         raise
     record.pop("event")
     return follow(ctx, record)
+
+
+def _sigterm_as_interrupt(signum: int, frame: Any) -> None:
+    raise KeyboardInterrupt
 
 
 def follow(ctx: Ctx, record: dict[str, Any]) -> int:
@@ -938,16 +1428,38 @@ def follow(ctx: Ctx, record: dict[str, Any]) -> int:
                 break
             time.sleep(backend.poll_interval)
     except KeyboardInterrupt:
-        ctx.say(
-            f"待つのをやめた。{record['id']} は動き続けている。"
-            f"hc-remote wait {record['id']} で続きを待つ、hc-remote cancel {record['id']} で止める"
-        )
+        if backend.detached:
+            ctx.say(
+                f"待つのをやめた。{record['id']} は動き続けている。"
+                f"hc-remote wait {record['id']} で続きを待つ、hc-remote cancel {record['id']} で止める"
+            )
+            return 130
+        ctx.say(f"中断したので {record['id']} を止めて {backend.name} の後始末をする")
+        abort(ctx, record, "run を中断した", cancelled=True)
         return 130
+    except Exception as exc:
+        if backend.detached:
+            raise
+        ctx.say(f"{record['id']} を見ている途中で失敗したので {backend.name} の後始末をする: {type(exc).__name__}: {exc}")
+        abort(ctx, record, f"{type(exc).__name__}: {exc}", cancelled=False)
+        return EXIT_INFRA
     chunk = backend.read_log(record, offset)
     if chunk:
         ctx.out.write(chunk.decode(errors="replace"))
         ctx.out.flush()
     return finish(ctx, record, poll, fetch=True)
+
+
+def abort(ctx: Ctx, record: dict[str, Any], why: str, *, cancelled: bool) -> None:
+    """detached でない backend（GCP）で run が止まったとき: ジョブを止め（VM を消し）、記録を閉じる。"""
+    backend = ctx.backend(record["backend"])
+    try:
+        backend.cancel(record)
+    except Exception as exc:
+        ctx.say(f"{record['id']} を止められない（hc-remote gc で消す）: {exc}")
+    if cancelled:
+        ctx.store.append({"event": "cancel", "id": record["id"], "cancel_requested": iso(ctx.now())})
+    finish(ctx, record, Poll(True, error=why), fetch=True)
 
 
 def finish(ctx: Ctx, record: dict[str, Any], poll: Poll, *, fetch: bool) -> int:
@@ -962,11 +1474,7 @@ def finish(ctx: Ctx, record: dict[str, Any], poll: Poll, *, fetch: bool) -> int:
         status = "timeout"
     else:
         status = "done"
-    if "seconds" in result:
-        seconds = float(result["seconds"]) + (STARTUP_S if backend.billable else 0)
-    else:
-        created = datetime.fromisoformat(record["created_at"])
-        seconds = (ctx.now() - created).total_seconds()
+    seconds = backend.billed_seconds(record, result, ctx.now(), final=fetch)
     est = backend.estimate_usd(float(record["cpu"]), float(record["memory_gb"]), seconds)
     event: dict[str, Any] = {
         "event": "finish",
@@ -1002,8 +1510,10 @@ def finish(ctx: Ctx, record: dict[str, Any], poll: Poll, *, fetch: bool) -> int:
     if current.get("status") == "running" or fetch:
         ctx.store.append(event)
     if fetch:
-        with contextlib.suppress(Exception):
+        try:
             backend.cleanup(record)
+        except Exception as exc:
+            ctx.say(f"{record['id']} の後始末に失敗した（hc-remote gc で消す）: {exc}")
         ctx.say(
             f"{record['id']} {status} 終了コード {result.get('exit_code')}"
             f"（{format_duration(seconds)}、見積もり ${est:.4f}）"
@@ -1078,14 +1588,14 @@ def cmd_budget(ctx: Ctx, args: argparse.Namespace) -> int:
     for s in statuses:
         ctx.out.write(
             f"{s['backend']} {s['month']}（UTC）\n"
-            f"  使用額: ${s['used_usd']:.2f}（{SOURCE_LABEL[s['source']]}）\n"
+            f"  使用額: ${s['used_usd']:.2f}{yen(s, s['used_usd'])}（{SOURCE_LABEL[s['source']]}）\n"
         )
         if s["source_note"]:
-            ctx.out.write(f"  billing report を使わなかった理由: {s['source_note']}\n")
+            ctx.out.write(f"  実際の使用額を使わなかった理由: {s['source_note']}\n")
         ctx.out.write(
-            f"  実行中のジョブの最大見積額: ${s['running_reserved_usd']:.2f}\n"
-            f"  枠: ${s['limit_usd']:.2f}（無料枠 ${s['free_credit_usd']:.2f} − 余裕 ${s['margin_usd']:.2f}）\n"
-            f"  残り: ${s['remaining_usd']:.2f}\n"
+            f"  実行中のジョブの最大見積額: ${s['running_reserved_usd']:.2f}{yen(s, s['running_reserved_usd'])}\n"
+            f"  枠: ${s['limit_usd']:.2f}（{s['limit_text']}）\n"
+            f"  残り: ${s['remaining_usd']:.2f}{yen(s, s['remaining_usd'])}\n"
             f"  今月の記録にあるジョブ: {len(s['jobs'])} 件\n"
         )
         for j in s["jobs"]:
@@ -1094,8 +1604,61 @@ def cmd_budget(ctx: Ctx, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gc(ctx: Ctx, args: argparse.Namespace) -> int:
+    """ラベル hc-remote=1 の GCP の VM のうち、記録で終わっているもの・期限を過ぎたものを消す。"""
+    backend = ctx.backend("gcp")
+    backend.check_available()
+    records = ctx.store.records()
+    now = ctx.now().timestamp()
+    instances = backend.list_instances()
+    if not instances:
+        ctx.out.write("hc-remote の VM（ラベル hc-remote=1）はありません\n")
+        return 0
+    failed = 0
+    for inst in instances:
+        name = inst["name"]
+        labels = inst.get("labels") or {}
+        job_id = labels.get("hc-remote-job", "")
+        zone = str(inst.get("zone", backend.opts["zone"])).rsplit("/", 1)[-1]
+        record = records.get(job_id)
+        try:
+            deadline = int(labels.get("hc-remote-deadline", ""))
+        except ValueError:
+            deadline = None
+        if record is not None and record.get("status") != "running" and record.get("fetched"):
+            why = f"記録で終わっている（{record.get('status')}）"
+        elif deadline is not None and now > deadline:
+            why = "期限（--max-run-duration + 余裕）を過ぎた"
+        else:
+            if record is None:
+                state = "記録に無い（期限前）"
+            elif record.get("status") == "running":
+                state = "記録で実行中"
+            else:
+                state = f"終わったが持ち帰り前。hc-remote wait {job_id} で持ち帰って消す"
+            ctx.out.write(f"残す: {name}（{state}、{inst.get('status')}）\n")
+            continue
+        if args.dry_run:
+            ctx.out.write(f"消す予定: {name}（{why}）\n")
+            continue
+        try:
+            backend.delete_instance(name, zone)
+        except Unavailable as exc:
+            failed += 1
+            ctx.out.write(f"消せない: {name}: {exc}\n")
+            continue
+        ctx.out.write(f"消した: {name}（{why}）\n")
+        if record is not None and record.get("status") == "running":
+            ctx.store.append(
+                {"event": "finish", "id": job_id, "status": "error", "ended_at": iso(ctx.now()),
+                 "error": "期限を過ぎたので hc-remote gc が VM を消した",
+                 "est_usd": record.get("max_usd"), "fetched": True}
+            )
+    return 1 if failed else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="hc-remote", description="重い処理を Modal などへ回す（docs/hc-remote.md）")
+    parser = argparse.ArgumentParser(prog="hc-remote", description="重い処理を Modal・GCP へ回す（docs/hc-remote.md）")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="worktree を送ってコマンドを実行する")
     run.add_argument("--backend", choices=["auto", *BACKENDS])
@@ -1104,13 +1667,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", help="例: 30m、2h")
     run.add_argument("--out", action="append", help="持ち帰る path（worktree からの相対）。何度でも書ける")
     run.add_argument("cmd", nargs=argparse.REMAINDER)
-    budget = sub.add_parser("budget", help="今月の使用額と無料枠の残り")
+    budget = sub.add_parser("budget", help="今月の使用額と枠（Modal の無料枠・GCP の予算）の残り")
     budget.add_argument("--json", action="store_true")
     ls = sub.add_parser("ls", help="hc-remote が起動したジョブ")
     ls.add_argument("--json", action="store_true")
     for name, text in (("logs", "ジョブのログ"), ("wait", "ジョブを待ってログと --out を持ち帰る"), ("cancel", "ジョブを止める")):
         p = sub.add_parser(name, help=text)
         p.add_argument("id")
+    gc = sub.add_parser("gc", help="残った GCP の VM（ラベル hc-remote=1）のうち、終わったもの・期限切れを消す")
+    gc.add_argument("--dry-run", action="store_true", help="消さずに表示だけする")
     return parser
 
 
@@ -1129,19 +1694,29 @@ def main(
     out = out or sys.stdout
     err = err or sys.stderr
     args = build_parser().parse_args(argv)
+    previous = None
+    if args.command in ("run", "wait") and threading.current_thread() is threading.main_thread():
+        # Bash の時間制限などで SIGTERM を受けても Ctrl-C と同じに扱う（GCP は起動中・実行中の VM を消してから終わる）
+        previous = signal.signal(signal.SIGTERM, _sigterm_as_interrupt)
     try:
         ctx = Ctx(load_config(), Store(state_dir()), sdk, out, err, now)
         if args.command == "run":
             return cmd_run(ctx, args, cwd or Path.cwd())
-        return {"budget": cmd_budget, "ls": cmd_ls, "logs": cmd_logs, "wait": cmd_wait, "cancel": cmd_cancel}[
+        return {"budget": cmd_budget, "ls": cmd_ls, "logs": cmd_logs, "wait": cmd_wait, "cancel": cmd_cancel, "gc": cmd_gc}[
             args.command
         ](ctx, args)
     except Refused as exc:
         print(f"hc-remote: 起動しません（ユーザー確認が必要）: {exc}", file=err)
         return EXIT_REFUSED
+    except LaunchFailed as exc:
+        print(f"hc-remote: {exc}", file=err)
+        return EXIT_INFRA
     except (UsageError, Unavailable) as exc:
         print(f"hc-remote: {exc}", file=err)
         return EXIT_USAGE
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":
