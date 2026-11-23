@@ -65,7 +65,16 @@
   - Opus: `hc run --bg --outlive-parent --label role=worker --label model=opus --name <名前> --cwd <worktree> claude-worker "<依頼文>"`
   - Sonnet: `hc run --bg --outlive-parent --label role=worker --label model=sonnet --name <名前> --cwd <worktree> claude-worker-sonnet "<依頼文>"`
 - 依頼文には、リポジトリと worktree の path、Issue 番号（あれば）、使う skill、完了条件（検証済み・commit・push・PR 作成まで等）、前の作業から引き継ぐ事実、「仕様・設計の判断に迷ったらユーザーに聞かず `hc send supervisor` で相談する。完了・中断時は `hc send supervisor` で報告する」を書きます。会話履歴なしで着手できるようにします。PR を作る作業では「PR 本文に `ワーカー: <モデル>（監督役の見立て: <経路>）` の 1 行を書く」も入れます（モデルごとの完了率・差し戻しを後から比べるため）。
-- 依存関係のある作業は順番に、独立した作業は並列に実行します。同時に動かすワーカーは既定で 3 つまでです。
+- 依存関係のある作業は順番に、独立した作業は並列に実行します。同時に動かすワーカーの数は、固定の上限ではなくホストの資源（メモリ・CPU）から決めます（下の「同時に動かす数」）。
+
+### 同時に動かす数
+
+dev と admin は同じ WSL2 VM のメモリと CPU を共有しており、先に足りなくなるのはメモリです。
+
+- ワーカーを起動する前に `hc-supervisor capacity` を 1 回実行し、表示された `slots` 個まで続けて起動します。起動した直後のワーカーはまだメモリを使っていないので、続けて起動する間に測り直しません。
+- 起動したい作業が `slots` より多い（`slots` が 0 を含む）ときは、残りを進捗ボードの「次にやること」に `待機（<limit_by>）: <作業>` で並べます。`limit_by` は capacity が表示した、効いている制約（`memory`・`memory_pressure`・`cpu`・`max_workers`）です。
+- 待機がある間は、ワーカーが終わって `hc wait --children any` から戻ったとき（受理・片付け・失敗の報告の後）に、もう一度 `hc-supervisor capacity` を実行し、`slots` 個まで待機の先頭から起動します。作り直しの後に待機が残っていたときも同じです。空きを待つために capacity を繰り返したり sleep したりしません（ポーリングしない）。
+- 動いているワーカーを、資源のために止めません。admin 側の作業で `slots` が減っても、待機に並べるだけです。
 - 起動結果で最初のメッセージが送れていなければ（`first_message.sent: false`）、`hc read <名前>` で画面を読みます。trust のダイアログならユーザーに報告し、trust の後に依頼文を `hc send` で送り直します。それ以外の画面ならユーザーに確認します。
 - ワーカーの結果を待つときは、下の「3. 受理」の「待ち方」に従い、`hc wait --children any` だけを使います。
 
@@ -148,6 +157,7 @@
   - 【確認】<名前>（tN）: <何を決めてほしいかを 1 行>。推奨: <案>。返答は supervisor へ。
   ## 次にやること
   1. <あなたが次にすること、または次に起動するワーカー>
+  2. 待機（memory）: <資源の空きを待つ作業。capacity の slots が足りなかったもの>
   ## 進行中
   - <名前>（tN）<リポジトリ> Issue #<番号> [<モデル> / <経路>]: <いまの段階>（<HH:MM> 時点）
   ## 完了（直近 5 件）
