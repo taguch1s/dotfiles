@@ -188,7 +188,119 @@ class FakeModal(types.SimpleNamespace):
         self.enable_output = contextlib.nullcontext
 
 
+# ---------------------------------------------------------------- 偽の gcloud
+
+# 呼び出しを calls.jsonl に記録し、VM を FAKE_GCLOUD_DIR/vm/<名前>/ のディレクトリで真似る。
+# ssh は --command をそのディレクトリで bash -c し、scp は user@<名前>:path をそのディレクトリの path に読み替える。
+# 振る舞いはファイルで変える: fail_create（中身がエラー）、scp_fail、setup_fails、ignore_filter。
+FAKE_GCLOUD = r'''
+import json, os, shutil, signal, subprocess, sys
+from pathlib import Path
+
+root = Path(os.environ["FAKE_GCLOUD_DIR"])
+args = sys.argv[1:]
+with (root / "calls.jsonl").open("a") as f:
+    f.write(json.dumps({"args": args, "cloudsdk_config": os.environ.get("CLOUDSDK_CONFIG")}) + "\n")
+inst_file = root / "instances.json"
+insts = json.loads(inst_file.read_text()) if inst_file.exists() else {}
+
+
+def save():
+    inst_file.write_text(json.dumps(insts))
+
+
+def opt(name):
+    for a in args:
+        if a.startswith(f"--{name}="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def fail(msg, code=1):
+    sys.stderr.write(f"ERROR: {msg}\n")
+    sys.exit(code)
+
+
+def vm(name):
+    return root / "vm" / name
+
+
+def local_path(spec):
+    if "@" in spec and ":" in spec:
+        target, path = spec.split(":", 1)
+        name = target.split("@", 1)[1]
+        if name not in insts:
+            fail(f"The resource '{name}' was not found", 255)
+        return vm(name) / path
+    return Path(spec)
+
+
+pos = [a for a in args if not a.startswith("--")]
+if pos[:3] == ["compute", "instances", "create"]:
+    name = pos[3]
+    if (root / "fail_create").exists():
+        fail((root / "fail_create").read_text())
+    labels = dict(kv.split("=", 1) for kv in opt("labels").split(","))
+    insts[name] = {"name": name, "zone": "projects/p/zones/" + opt("zone"), "labels": labels, "status": "RUNNING"}
+    save()
+    vm(name).mkdir(parents=True)
+    if (root / "setup_fails").exists():
+        (vm(name) / "failed").write_text("E: apt failed\n")
+    else:
+        (vm(name) / ".ready").touch()
+elif pos[:3] == ["compute", "instances", "delete"]:
+    name = pos[3]
+    if name not in insts:
+        fail(f"The resource 'projects/p/zones/z/instances/{name}' was not found")
+    del insts[name]
+    save()
+    for pid in vm(name).glob("hc-remote/*/pid"):
+        try:
+            os.killpg(int(pid.read_text()), signal.SIGKILL)
+        except (ProcessLookupError, ValueError, PermissionError):
+            pass
+    if vm(name).exists():
+        vm(name).rename(root / "vm" / f"{name}.deleted")
+elif pos[:3] == ["compute", "instances", "describe"]:
+    if pos[3] not in insts:
+        fail(f"The resource '{pos[3]}' was not found")
+    print(insts[pos[3]]["status"])
+elif pos[:3] == ["compute", "instances", "list"]:
+    items = list(insts.values())
+    if opt("filter") == "labels.hc-remote=1" and not (root / "ignore_filter").exists():
+        items = [i for i in items if (i.get("labels") or {}).get("hc-remote") == "1"]
+    print(json.dumps(items))
+elif pos[:2] == ["compute", "ssh"]:
+    name = pos[2].split("@", 1)[1]
+    if name not in insts:
+        fail(f"The resource '{name}' was not found", 255)
+    if not Path(opt("ssh-key-file")).exists():
+        fail("no key", 255)
+    env = dict(os.environ, HC_REMOTE_READY=str(vm(name) / ".ready"))
+    proc = subprocess.run(["bash", "-c", opt("command")], cwd=vm(name), env=env)
+    sys.exit(proc.returncode)
+elif pos[:2] == ["compute", "scp"]:
+    if (root / "scp_fail").exists():
+        fail("scp failed", 1)
+    *srcs, dest = pos[2:]
+    dest_path = local_path(dest)
+    for src in srcs:
+        src_path = local_path(src)
+        if not src_path.exists():
+            fail(f"scp: {src}: No such file or directory")
+        target = dest_path / src_path.name if dest.endswith("/") else dest_path
+        shutil.copyfile(src_path, target)
+else:
+    fail(f"fake gcloud does not know: {args}", 2)
+'''
+
+
 # ---------------------------------------------------------------- 準備
+
+
+def budget_of(statuses, name):
+    (status,) = [s for s in statuses if s["backend"] == name]
+    return status
 
 
 def git(repo, *args):
@@ -205,9 +317,12 @@ class Base(unittest.TestCase):
         self.config = self.tmp / "config.toml"
         # ユーザーの全体の gitignore（.env などを無視する）に左右されないようにする
         (self.tmp / "gitconfig").write_text("")
+        # 本物の ~/.config/hc-remote/gcloud（GCP の資格情報）を使わない
+        (self.tmp / "home").mkdir()
         env = mock.patch.dict(
             os.environ,
             {
+                "HOME": str(self.tmp / "home"),
                 "HC_REMOTE_STATE_DIR": str(self.state),
                 "HC_REMOTE_CONFIG": str(self.config),
                 "GIT_CONFIG_GLOBAL": str(self.tmp / "gitconfig"),
@@ -474,12 +589,24 @@ class ModalTest(Base):
     def test_report_over_the_free_credit_refuses_modal(self):
         # 枠は 30 − 3 = 27。使用 26.95 + 既定のジョブ（2 コア・4 GiB・30 分 + 猶予、約 $0.07）の最大で超える
         sdk = self.sdk(report=[26.95])
-        code, _, err = self.run_cli("run", "--", "true", sdk=sdk)
+        code, _, err = self.run_cli("run", "--backend", "modal", "--", "true", sdk=sdk)
         self.assertEqual(code, HC.EXIT_REFUSED)
         self.assertIn("無料枠を超える", err)
-        self.assertIn("次の backend は無い", err)
         self.assertEqual(sdk.spawned, [])
         self.assertEqual(self.records(), {})
+
+    def test_auto_runs_locally_when_no_remote_fits(self):
+        # modal は無料枠を超え、gcp は gcloud の設定が無い（HOME は空）→ 止めずに手元で実行し、記録に残す
+        sdk = self.sdk(report=[26.95])
+        code, out, err = self.run_cli("run", "--", "echo local-ran; exit 4", sdk=sdk)
+        self.assertEqual(code, 4, err)
+        self.assertIn("local-ran", out)
+        self.assertIn("手元（local）で実行する", err)
+        self.assertEqual(sdk.spawned, [])
+        (record,) = self.records().values()
+        self.assertEqual(record["backend"], "local")
+        self.assertIn("modal: 無料枠を超える", record["fallback_reason"])
+        self.assertIn("gcp: gcloud", record["fallback_reason"])
 
     def test_report_within_the_free_credit_allows_modal(self):
         sdk = self.sdk(report=[26.5])
@@ -494,14 +621,14 @@ class ModalTest(Base):
                       "created_at": "2026-11-02T00:00:00+00:00", "est_usd": 26.95, "cpu": 1, "memory_gb": 1})
         store.append({"event": "launch", "id": "lastmonth", "backend": "modal", "status": "done",
                       "created_at": "2026-10-30T00:00:00+00:00", "est_usd": 100, "cpu": 1, "memory_gb": 1})
-        code, _, err = self.run_cli("run", "--", "true", sdk=sdk)
+        code, _, err = self.run_cli("run", "--backend", "modal", "--", "true", sdk=sdk)
         self.assertEqual(code, HC.EXIT_REFUSED)
         self.assertIn("手元の記録からの見積もり", err)
         self.assertIn("not on this plan", err)
 
         code, out, _ = self.run_cli("budget", "--json", sdk=sdk)
         self.assertEqual(code, 0)
-        status = json.loads(out)
+        status = budget_of(json.loads(out), "modal")
         self.assertEqual(status["source"], "local")
         self.assertEqual(status["used_usd"], 26.95)
         self.assertEqual(status["limit_usd"], 27.0)
@@ -516,7 +643,7 @@ class ModalTest(Base):
                       "handle": {"call_id": "fc-run", "volume": "hc-remote", "app": "hc-remote"}})
         code, out, _ = self.run_cli("budget", "--json", sdk=sdk)
         self.assertEqual(code, 0)
-        status = json.loads(out)
+        status = budget_of(json.loads(out), "modal")
         self.assertEqual(status["source"], "report")
         self.assertEqual(status["used_usd"], 5.5)
         self.assertEqual(status["running_reserved_usd"], 1.0)
@@ -534,6 +661,295 @@ class ModalTest(Base):
         code, _, _ = self.run_cli("cancel", "m", sdk=sdk)
         self.assertEqual(code, 0)
         self.assertTrue(call.cancelled)
+
+
+# ---------------------------------------------------------------- GCP（偽の gcloud）と予算、auto の順
+
+
+class GcpTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.fake = self.tmp / "fake-gcloud"
+        self.fake.mkdir()
+        self.gcloud = self.tmp / "gcloud"
+        self.gcloud.write_text(f"#!{sys.executable}\n" + FAKE_GCLOUD)
+        self.gcloud.chmod(0o755)
+        self.sdk_config = self.tmp / "hc-remote-gcloud"
+        self.sdk_config.mkdir()
+        self.write_config(f'[gcp]\ngcloud = "{self.gcloud}"\ncloudsdk_config = "{self.sdk_config}"\n')
+        env = mock.patch.dict(os.environ, {"FAKE_GCLOUD_DIR": str(self.fake)})
+        env.start()
+        self.addCleanup(env.stop)
+        fast = mock.patch.object(HC.GcpBackend, "poll_interval", 0.05)
+        fast.start()
+        self.addCleanup(fast.stop)
+
+    def calls(self, *prefix):
+        path = self.fake / "calls.jsonl"
+        if not path.exists():
+            return []
+        calls = [json.loads(line) for line in path.read_text().splitlines()]
+        return [c for c in calls if [a for a in c["args"] if not a.startswith("--")][: len(prefix)] == list(prefix)]
+
+    def instances(self):
+        path = self.fake / "instances.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def add_record(self, job_id, backend="gcp", status="done", est=0.0, **extra):
+        HC.Store(self.state).append(
+            {"event": "launch", "id": job_id, "backend": backend, "status": status, "created_at": HC.iso(NOW),
+             "cpu": 1, "memory_gb": 1, "est_usd": est, **extra}
+        )
+
+    # ---- 見積もりと予算
+
+    def test_machine_type_and_estimate(self):
+        backend = HC.GcpBackend(HC.load_config(), self.state)
+        self.assertEqual(backend.machine(2, 4).type, "e2-highcpu-4")  # 2 コア = 4 vCPU
+        self.assertEqual(backend.machine(0.25, 0.5).type, "e2-custom-2-1024")  # 最小 2 vCPU、1 vCPU あたり 0.5 GB 以上
+        self.assertEqual(backend.machine(1, 32).type, "e2-highmem-4")  # 1 vCPU あたり 8 GB まで
+        self.assertEqual(backend.machine(8, 32).type, "e2-custom-16-32768")  # 上限いっぱいでも quota の 16 vCPU に収まる
+        m = backend.machine(2, 4)
+        self.assertAlmostEqual(m.hour_usd, 4 * 0.02 + 4 * 0.0027 + 0.01)
+        spec = HC.Spec("x", [], 2, 4, 1800)
+        self.assertEqual(backend.max_run_s(spec), 1800 + HC.GRACE_S + 600)
+        self.assertAlmostEqual(backend.estimate_max_usd(spec), m.hour_usd * (1800 + HC.GRACE_S + 600 + HC.GCP_CREATE_S) / 3600)
+        limit, info, _ = backend.budget_limit()
+        self.assertAlmostEqual(limit, 1000 / 170)
+        self.assertEqual(info["monthly_budget_jpy"], 1000)
+
+    def test_over_the_budget_refuses_gcp_without_creating_a_vm(self):
+        # 枠 1000 円 ÷ 170 = $5.88。今月の記録 $5.85 + 既定のジョブの最大（約 $0.08）で超える。先月の分は数えない
+        self.add_record("g1", est=5.85)
+        HC.Store(self.state).append({"event": "launch", "id": "old", "backend": "gcp", "status": "done",
+                                     "created_at": "2026-10-31T00:00:00+00:00", "est_usd": 100})
+        code, _, err = self.run_cli("run", "--backend", "gcp", "--", "true")
+        self.assertEqual(code, HC.EXIT_REFUSED)
+        self.assertIn("gcp: 予算を超える", err)
+        self.assertIn("円", err)
+        self.assertEqual(self.calls("compute", "instances", "create"), [])
+
+        sdk = FakeModal(self.tmp, report=[])
+        code, out, _ = self.run_cli("budget", "--json", sdk=sdk)
+        status = budget_of(json.loads(out), "gcp")
+        self.assertEqual(status["source"], "local")
+        self.assertEqual(status["used_usd"], 5.85)
+        self.assertEqual(status["monthly_budget_jpy"], 1000)
+        code, out, _ = self.run_cli("budget", sdk=sdk)
+        self.assertIn("月の予算 1000 円", out)
+        self.assertIn("使用額: $5.85（約 994 円）", out)
+
+    # ---- 起動・実行・後始末
+
+    def test_run_creates_a_spot_vm_runs_brings_back_and_deletes_it(self):
+        code, out, err = self.run_cli(
+            "run", "--backend", "gcp", "--cpu", "2", "--memory", "4", "--timeout", "10m", "--out", "out", "--",
+            "cat tracked.txt; test ! -e ignored.txt && echo no-ignored; mkdir -p out && echo hi > out/x; exit 3",
+        )
+        self.assertEqual(code, 3, err)
+        self.assertIn("tracked", out)
+        self.assertIn("no-ignored", out)
+        self.assertEqual((self.repo / "out" / "x").read_text(), "hi\n")
+        (record,) = self.records().values()
+        job = record["id"]
+        name = f"hc-remote-{job}"
+        ((create),) = self.calls("compute", "instances", "create")
+        args = create["args"]
+        self.assertEqual(create["cloudsdk_config"], str(self.sdk_config))
+        for flag in (
+            "--provisioning-model=SPOT",
+            "--instance-termination-action=DELETE",
+            f"--max-run-duration={600 + HC.GRACE_S + 600}s",
+            "--no-service-account",
+            "--no-scopes",
+            "--tags=hc-remote",
+            "--zone=asia-northeast1-a",
+            "--project=first-impression-490413",
+            "--machine-type=e2-highcpu-4",
+            "--image-family=debian-12",
+            "--image-project=debian-cloud",
+        ):
+            self.assertIn(flag, args)
+        self.assertEqual(args[3], name)
+        labels = dict(kv.split("=", 1) for kv in next(a for a in args if a.startswith("--labels=")).split("=", 1)[1].split(","))
+        self.assertEqual(labels["hc-remote"], "1")
+        self.assertEqual(labels["hc-remote-job"], job)
+        self.assertEqual(int(labels["hc-remote-deadline"]), record["handle"]["deadline_epoch"])
+        metadata = next(a for a in args if a.startswith("--metadata="))
+        self.assertIn("block-project-ssh-keys=TRUE", metadata)
+        self.assertIn("ssh-keys=hcremote:ssh-ed25519 ", metadata)
+        for call in self.calls("compute", "ssh") + self.calls("compute", "scp"):
+            self.assertIn("--tunnel-through-iap", call["args"])
+        # 成功しても VM を消し、一時鍵も消す。ログは手元に残す
+        self.assertEqual(self.instances(), {})
+        self.assertEqual(len(self.calls("compute", "instances", "delete")), 1)
+        self.assertFalse(Path(record["handle"]["key"]).exists())
+        self.assertEqual(record["status"], "done")
+        self.assertEqual(record["backend"], "gcp")
+        self.assertGreater(record["est_usd"], 0)
+        self.assertLess(record["est_usd"], record["max_usd"])
+        code, out, _ = self.run_cli("logs", job)
+        self.assertIn("no-ignored", out)
+
+    def test_vm_is_deleted_when_the_setup_fails(self):
+        (self.fake / "setup_fails").write_text("")
+        code, out, err = self.run_cli("run", "--backend", "gcp", "--", "echo never")
+        self.assertEqual(code, HC.EXIT_INFRA, err)
+        self.assertIn("VM の準備", err)
+        self.assertNotIn("never", out)
+        (record,) = self.records().values()
+        self.assertEqual(record["status"], "error")
+        self.assertEqual(self.instances(), {})
+        self.assertEqual(len(self.calls("compute", "instances", "delete")), 1)
+
+    def test_vm_is_deleted_when_sending_fails_during_launch(self):
+        (self.fake / "scp_fail").write_text("")
+        code, _, err = self.run_cli("run", "--backend", "gcp", "--", "true")
+        self.assertEqual(code, HC.EXIT_INFRA, err)
+        self.assertIn("VM へ送れない", err)
+        self.assertIn("VM hc-remote-", err)
+        self.assertEqual(self.instances(), {})
+        self.assertEqual(len(self.calls("compute", "instances", "delete")), 1)
+        # VM を作った後の失敗は、枠に数えるため記録に残す
+        (record,) = self.records().values()
+        self.assertEqual(record["status"], "error")
+        self.assertGreater(record["est_usd"], 0)
+
+    def test_vm_is_deleted_when_the_run_is_interrupted(self):
+        with mock.patch.object(HC.time, "sleep", side_effect=KeyboardInterrupt):
+            code, _, err = self.run_cli("run", "--backend", "gcp", "--", "sleep 3")
+        self.assertEqual(code, 130, err)
+        self.assertIn("後始末", err)
+        self.assertEqual(self.instances(), {})
+        (record,) = self.records().values()
+        self.assertEqual(record["status"], "cancelled")
+        self.assertTrue(record["fetched"])
+
+    def test_vm_is_deleted_when_interrupted_while_creating(self):
+        real = HC.GcpBackend.ssh
+
+        def interrupt(backend, handle, command, timeout=120):
+            raise KeyboardInterrupt
+
+        with mock.patch.object(HC.GcpBackend, "ssh", interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_cli("run", "--backend", "gcp", "--", "true")
+        self.assertIsNotNone(real)
+        self.assertEqual(len(self.calls("compute", "instances", "create")), 1)
+        self.assertEqual(self.instances(), {})
+        self.assertEqual(self.records(), {})
+
+    def test_cancel_deletes_the_vm(self):
+        self.instances_file = self.fake / "instances.json"
+        self.instances_file.write_text(json.dumps({"hc-remote-j": {"name": "hc-remote-j", "labels": {"hc-remote": "1"}, "status": "RUNNING"}}))
+        key = self.tmp / "k" / "id"
+        key.parent.mkdir()
+        key.write_text("")
+        self.add_record("j", status="running", handle={"instance": "hc-remote-j", "zone": "asia-northeast1-a", "key": str(key),
+                                                     "deadline_epoch": time.time() + 3600, "max_run_s": 600})
+        code, _, _ = self.run_cli("cancel", "j")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.instances(), {})
+        code, _, _ = self.run_cli("wait", "j")
+        self.assertEqual(self.records()["j"]["status"], "cancelled")
+
+    # ---- auto の順
+
+    def test_auto_uses_modal_first_within_the_free_credit(self):
+        sdk = FakeModal(self.tmp, report=[1.0])
+        code, _, err = self.run_cli("run", "--", "true", sdk=sdk)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(sdk.spawned), 1)
+        self.assertEqual(self.calls("compute", "instances", "create"), [])
+
+    def test_auto_uses_gcp_when_modal_is_over_the_free_credit(self):
+        sdk = FakeModal(self.tmp, report=[26.95])
+        code, out, err = self.run_cli("run", "--", "echo on-gcp", sdk=sdk)
+        self.assertEqual(code, 0, err)
+        self.assertIn("on-gcp", out)
+        self.assertEqual(sdk.spawned, [])
+        (record,) = self.records().values()
+        self.assertEqual(record["backend"], "gcp")
+        self.assertNotIn("fallback_reason", record)
+        self.assertEqual(self.instances(), {})
+
+    def test_auto_runs_locally_when_both_are_over(self):
+        sdk = FakeModal(self.tmp, report=[26.95])
+        self.add_record("g1", est=5.85)
+        code, out, err = self.run_cli("run", "--", "echo here; exit 5", sdk=sdk)
+        self.assertEqual(code, 5, err)
+        self.assertIn("here", out)
+        self.assertIn("手元（local）で実行する", err)
+        self.assertEqual(self.calls("compute", "instances", "create"), [])
+        record = [r for r in self.records().values() if r["id"] != "g1"][0]
+        self.assertEqual(record["backend"], "local")
+        self.assertIn("modal: 無料枠を超える", record["fallback_reason"])
+        self.assertIn("gcp: 予算を超える", record["fallback_reason"])
+
+    def test_auto_runs_locally_when_the_vm_cannot_be_created(self):
+        sdk = FakeModal(self.tmp, report=[26.95])
+        (self.fake / "fail_create").write_text("Quota 'CPUS' exceeded")
+        code, _, err = self.run_cli("run", "--", "true", sdk=sdk)
+        self.assertEqual(code, 0, err)
+        (record,) = self.records().values()
+        self.assertEqual(record["backend"], "local")
+        self.assertIn("VM を作れない", record["fallback_reason"])
+        self.assertIn("Quota", record["fallback_reason"])
+
+    def test_auto_still_refuses_over_the_limits_and_secrets(self):
+        sdk = FakeModal(self.tmp, report=[26.95])
+        code, _, err = self.run_cli("run", "--cpu", "9", "--", "true", sdk=sdk)
+        self.assertEqual(code, HC.EXIT_REFUSED)
+        self.assertIn("max_cpu", err)
+        (self.repo / ".env").write_text("TOKEN=x\n")
+        code, _, err = self.run_cli("run", "--", "true", sdk=sdk)
+        self.assertEqual(code, HC.EXIT_REFUSED)
+        self.assertIn("秘密情報", err)
+        self.assertEqual(self.records(), {})
+        self.assertEqual(self.calls("compute", "instances", "create"), [])
+
+    # ---- gc
+
+    def gc_fixture(self):
+        future, past = str(int(NOW.timestamp()) + 3600), str(int(NOW.timestamp()) - 60)
+
+        def inst(name, labels):
+            return {"name": name, "zone": "projects/p/zones/asia-northeast1-a", "labels": labels, "status": "RUNNING"}
+
+        (self.fake / "instances.json").write_text(json.dumps({
+            "hc-remote-a": inst("hc-remote-a", {"hc-remote": "1", "hc-remote-job": "ja", "hc-remote-deadline": future}),
+            "hc-remote-b": inst("hc-remote-b", {"hc-remote": "1", "hc-remote-job": "jb", "hc-remote-deadline": future}),
+            "hc-remote-c": inst("hc-remote-c", {"hc-remote": "1", "hc-remote-job": "jc", "hc-remote-deadline": past}),
+            "hc-remote-e": inst("hc-remote-e", {"hc-remote": "1", "hc-remote-job": "je", "hc-remote-deadline": past}),
+            "hc-remote-d": inst("hc-remote-d", {"hc-remote-job": "jd", "hc-remote-deadline": past}),
+            "ts-crawler-x": inst("ts-crawler-x", {}),
+            "ts-crawler-y": inst("ts-crawler-y", {"hc-remote": "1"}),
+        }))
+        self.add_record("ja", status="done")
+        self.add_record("jb", status="running", max_usd=0.1)
+        self.add_record("je", status="running", max_usd=0.2)
+
+    def test_gc_deletes_only_labelled_finished_or_expired_vms(self):
+        self.gc_fixture()
+        (self.fake / "ignore_filter").write_text("")  # 偽の gcloud が filter を無視しても、ラベルと名前で絞る
+        code, out, _ = self.run_cli("gc", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls("compute", "instances", "delete"), [])
+        self.assertIn("消す予定: hc-remote-a", out)
+
+        code, out, _ = self.run_cli("gc")
+        self.assertEqual(code, 0, out)
+        (listed,) = {tuple(c["args"]) for c in self.calls("compute", "instances", "list")}
+        self.assertIn("--filter=labels.hc-remote=1", listed)
+        deleted = sorted(c["args"][3] for c in self.calls("compute", "instances", "delete"))
+        self.assertEqual(deleted, ["hc-remote-a", "hc-remote-c", "hc-remote-e"])
+        self.assertEqual(sorted(self.instances()), ["hc-remote-b", "hc-remote-d", "ts-crawler-x", "ts-crawler-y"])
+        self.assertIn("残す: hc-remote-b", out)
+        self.assertNotIn("ts-crawler", out)
+        # 実行中の記録の VM を期限切れで消したら、最大見積額で記録を閉じる
+        self.assertEqual(self.records()["je"]["status"], "error")
+        self.assertEqual(self.records()["je"]["est_usd"], 0.2)
+        self.assertEqual(self.records()["jb"]["status"], "running")
 
 
 if __name__ == "__main__":

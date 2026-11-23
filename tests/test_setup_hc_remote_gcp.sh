@@ -165,7 +165,7 @@ check 'dry-run は firewall と IAP の範囲を表示する' out_has 'hc-remote
 check 'dry-run は鍵の置き場所を表示する' out_has "$home/.config/hc-remote/gcp-key.json（0600"
 check 'dry-run は ts-crawler を条件に当たらない VM として数える' out_has '条件に当たらない既存の VM: 1 台'
 check 'dry-run は条件に当たらない VM の機種と状態を表示する' out_has '条件に当たらない: ts-crawler-detail-loop-4zzn（asia-northeast1-a e2-small RUNNING）'
-check 'dry-run は JPY の既定の budget を表示する' out_has '金額 1500 JPY/月'
+check 'dry-run は JPY の既定の budget を表示する' out_has '金額 1000 JPY/月'
 check 'dry-run は CPUS を使用分 + 16 に下げると表示する' grep -qE 'CPUS +上限 100 +使用 1 +→ 17 に下げる' <<<"$out"
 check 'dry-run は PREEMPTIBLE_CPUS が 0 なら触らないと表示する' grep -qE 'PREEMPTIBLE_CPUS +上限 0 .*0 のまま' <<<"$out"
 check 'dry-run は GPU の quota が 0 でないことを表示する' out_has 'GPU の quota に 0 でないものがある'
@@ -210,7 +210,7 @@ check '鍵を作る' called "^iam service-accounts keys create $home/.config/hc-
 check '鍵は 0600' test "$(stat -c %a "$home/.config/hc-remote/gcp-key.json")" = 600
 check '鍵のディレクトリは 0700' test "$(stat -c %a "$home/.config/hc-remote")" = 700
 check 'budget の API を有効にする' called "^services enable billingbudgets.googleapis.com --project $project\$"
-check 'budget をラベル hc-remote=1・1500JPY で作る' called "^billing budgets create --billing-account=000000-111111-222222 --billing-project=$project --display-name=hc-remote --budget-amount=1500JPY --filter-projects=projects/$project --filter-labels=hc-remote=1 --calendar-period=month "
+check 'budget をラベル hc-remote=1・1000JPY で作る' called "^billing budgets create --billing-account=000000-111111-222222 --billing-project=$project --display-name=hc-remote --budget-amount=1000JPY --filter-projects=projects/$project --filter-labels=hc-remote=1 --calendar-period=month "
 check 'VM・project の metadata を変えない' not_called '^compute (instances (create|delete|add-metadata)|project-info)'
 check 'dev へ鍵を渡す PowerShell の 1 行を表示する' out_has "wsl -d dev -- sh -c 'umask 077; mkdir -p ~/.config/hc-remote; cat > ~/.config/hc-remote/gcp-key.json'"
 

@@ -1,5 +1,5 @@
-# hc-remote の上限と無料枠。説明は docs/hc-remote.md
-# 超えるジョブは起動せず「ユーザー確認が必要」で止まる。上げるのはユーザーが決める。
+# hc-remote の上限と枠（Modal の無料枠・GCP の月の予算）。説明は docs/hc-remote.md
+# 上限を超えるジョブは起動せず「ユーザー確認が必要」で止まる。上げるのはユーザーが決める。
 
 [limits]
 max_cpu = 8               # 1 ジョブの物理コア数
@@ -9,7 +9,7 @@ max_concurrent_jobs = 2   # 同時に動かすジョブ数（hc-remote が起動
 max_upload_mb = 200       # 送る tar.gz の大きさ
 
 [defaults]
-backend = "auto"          # auto は課金のある backend を順に試す（今は modal だけ）
+backend = "auto"          # auto は modal（無料枠内）→ gcp（予算内）→ local（手元）の順
 cpu = 2
 memory_gb = 4
 timeout = "30m"
@@ -18,13 +18,39 @@ timeout = "30m"
 free_credit_usd = 30      # Starter プランの月の無料クレジット
 margin_usd = 3            # billing report の反映の遅れの分
 
+# 2026-11-23 のユーザーの決定: GCP は月 1000 円まで（課金アカウントは JPY）。
+# 記録は USD の見積もりなので、枠 = monthly_budget_jpy ÷ usd_jpy（円安側に置くほど枠は小さく、安全側）
+[budget.gcp]
+monthly_budget_jpy = 1000
+usd_jpy = 170
+
 # Modal Function の料金（https://modal.com/pricing を 2026-11-23 に確認）。Sandbox は約 3 倍なので使わない。
 [pricing.modal]
 cpu_core_second_usd = 0.0000131
 memory_gib_second_usd = 0.00000222
+
+# GCP の E2 の Spot の 1 時間あたりの料金（USD）。公式の価格ページ（https://cloud.google.com/spot-vms/pricing、
+# 2026-11-23）で確かめられたのは us-central1 の vCPU $0.01309・メモリ $0.001754/GiB だけで、東京（asia-northeast1）の
+# 値はページに出なかった。東京の割高と日々の変動の分として約 1.5 倍に切り上げている。fixed は boot disk と外部 IP の分。
+[pricing.gcp]
+vcpu_hour_usd = 0.02
+memory_gib_hour_usd = 0.0027
+fixed_hour_usd = 0.01
 
 [modal]
 app = "hc-remote"
 volume = "hc-remote"
 python = "3.12"
 uv = "0.11.25"
+
+# docs/hc-remote-gcp.md の「gcp backend（#56）との約束」。project・zone は service account の IAM 条件と合わせる
+[gcp]
+project = "first-impression-490413"
+zone = "asia-northeast1-a"
+cloudsdk_config = "~/.config/hc-remote/gcloud"
+gcloud = "gcloud"
+image_family = "debian-12"
+image_project = "debian-cloud"
+boot_disk_gb = 20
+uv = "0.11.25"
+setup_timeout = "10m"      # VM の準備（apt・uv）を待つ上限。--max-run-duration と最大見積もりに足す
