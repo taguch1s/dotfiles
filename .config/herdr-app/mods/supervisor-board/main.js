@@ -86,7 +86,6 @@ function parseDecision(line) {
   return m ? { id: m[1], text: m[2] } : null;
 }
 
-const DECISIONS_SHOWN = 5;
 const LINE = 18; // 長い文を 2 行で切るときの 1 行の高さ。
 
 // ペインがあればそこへ移り、無ければ覗き窓（peek）で開く。
@@ -102,7 +101,6 @@ export default class SupervisorBoard extends View {
     this.error = null;
     this.now = Date.now();
     this.expanded = new Set(); // 全文を開いた長い文の id。
-    this.showAllDecisions = false;
     this.raw = false; // Markdown のまま見る。
     this.reload(cx);
     if (checking()) return;
@@ -245,23 +243,16 @@ export default class SupervisorBoard extends View {
     }));
   }
 
+  // 全件を ID・決定の 2 列で出す。決定の文は切らず、全文を折り返す。
   decisionTable(lines, t) {
-    const all = this.showAllDecisions;
-    const shown = all ? lines : lines.slice(0, DECISIONS_SHOWN);
-    const rest = lines.length - shown.length;
-    return v_flex()
-      .children(shown.map((line, i) => {
-        const x = parseDecision(line);
-        if (!x) return this.plainRow(`decision-${i}`, line, t);
-        return h_flex().items_start().gap(8).py(4).border_t(1).border_color(t.border).text_size(12)
-          .child(div().flex_none().w(112).pt(1).text_size(11).text_color(t.muted).child(x.id))
-          .child(div().flex_1().min_w(0).child(this.longText(`decision-${i}`, x.text, t)));
-      }))
-      .when(lines.length > DECISIONS_SHOWN, (el) => el.child(
-        div().id("decisions-more").py(6).border_t(1).border_color(t.border).text_size(12).text_color(t.accent)
-          .cursor_pointer().hover((s) => s.underline())
-          .on_click((_e, cx) => { this.showAllDecisions = !all; cx.notify(); })
-          .child(all ? "折りたたむ" : `残り ${rest} 件を表示`)));
+    const head = this.tableHead([["ID", 112], ["決定", null]], t);
+    return v_flex().child(head).children(lines.map((line, i) => {
+      const x = parseDecision(line);
+      if (!x) return this.plainRow(`decision-${i}`, line, t);
+      return h_flex().items_start().gap(8).py(4).border_t(1).border_color(t.border).text_size(12)
+        .child(div().flex_none().w(112).pt(1).text_size(11).text_color(t.muted).child(x.id))
+        .child(div().flex_1().min_w(0).whitespace_normal().text_color(t.foreground).child(x.text));
+    }));
   }
 
   boardView(t) {
