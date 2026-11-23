@@ -51,5 +51,9 @@ branch = "feature/issue-44-hc-read-outside"
 handoff = "issue-44-hc-read-outside.md"
 
 [[issue_branch]]
+branch = "feature/issue-54-resource-based-workers"
+handoff = "issue-54-resource-based-workers.md"
+
+[[issue_branch]]
 branch = "feature/issue-55-hc-remote-modal"
 handoff = "issue-55-hc-remote-modal.md"
