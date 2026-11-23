@@ -213,6 +213,38 @@ hc run --bg --outlive-parent --label role=worker --name small-issue --cwd <workt
 - 引き継ぎ（`resume-worker`）は、前のワーカーのラベル `model` と同じモデルで起動します（ラベルが無い・不正なら opus）。`--model <opus|sonnet>` で明示もできますが、監督役のプロンプトでは、ラベルの無いワーカーのモデルを補うときだけ使い、引き継ぎでモデルを変えません（途中でのモデル切り替えは #33 の対象外）。許可しない `--model` は、前のワーカーを止めずに拒否します。
 - 比べ方: 監督役は進捗ボードの「進行中」「完了」に `[<モデル> / <経路>]` と差し戻しの回数を書き、ワーカーは PR 本文に `ワーカー: <モデル>（監督役の見立て: <経路>）` を書きます。Issue 1 件あたりのコストは `claude-token-metrics report` の `by_model` で、完了率と差し戻しの回数は PR とボードで、Opus の作業と比べます。単価・使用率の換算は推測で決めず、#20 の calibrate（`by_model`）の実データで確かめます。
 
+### ワーカーの同時数
+
+監督役が同時に動かすワーカーの数は、固定の上限ではなく、起動の直前のホストの資源から決めます（Issue #54）。以前は監督役のプロンプトに「既定で 3 つまで」とあるだけでしたが、3 つ動かしても CPU は 25% 程度で、メモリが 90% 程度まで使われていました。dev と admin は同じ WSL2 VM（[`windows/.wslconfig`](../windows/.wslconfig): memory 10GB、swap 4GB、論理 CPU 20）を共有し、`/proc/meminfo` は VM 全体の値なので、admin の Docker なども差し引かれた空きで決まります。
+
+`hc-supervisor capacity [--json]`（読み取りだけ。admin でも使える）が、今あと何個ワーカーを起動してよいか（`slots`）と、効いている制約（`limit_by`）、根拠の値を出します。
+
+| 制約（`limit_by` の名前） | 式 | 入力 |
+| --- | --- | --- |
+| `memory` | `floor((MemAvailable − reserve) / worker_mem)`、`reserve = max(reserve_min, MemTotal × reserve_pct)` | `/proc/meminfo` |
+| `memory_pressure` | `some avg10 > psi_limit` なら 0、それ以外は制約なし | `/proc/pressure/memory`（無ければ無視） |
+| `cpu` | `floor((nproc × cpu_target − load1) / worker_cpu)` | `/proc/loadavg`、`nproc`（CPU affinity の数） |
+| `max_workers` | `max_workers − 動いている role=worker の数` | `hc ls --json`（`state` が `finished` のものは数えない） |
+
+`slots = max(0, min(各制約))`。`limit_by` は最小の値を出した制約で、同じ値の制約が複数あればカンマで並べます。
+
+| 値 | 既定 | 環境変数（監督役の環境） |
+| --- | --- | --- |
+| `worker_mem`（1 ワーカーのメモリの見積もり） | 1536 MiB | `HC_SUPERVISOR_WORKER_MEM_MB` |
+| `reserve_min`（予約の下限） | 1536 MiB | `HC_SUPERVISOR_MEM_RESERVE_MB` |
+| `reserve_pct`（予約の MemTotal に対する割合） | 15 | `HC_SUPERVISOR_MEM_RESERVE_PCT` |
+| `worker_cpu`（1 ワーカーの CPU の見積もり） | 1.0 | `HC_SUPERVISOR_WORKER_CPU` |
+| `cpu_target`（使ってよい CPU の割合） | 0.8 | `HC_SUPERVISOR_CPU_TARGET` |
+| `psi_limit`（メモリの PSI の閾値） | 10 | `HC_SUPERVISOR_PSI_MEM_LIMIT` |
+| `max_workers`（資源に関係ない上限） | 8 | `HC_SUPERVISOR_MAX_WORKERS` |
+| 値が読めない制約の slots | 1 | `HC_SUPERVISOR_FALLBACK_SLOTS` |
+
+- 値が読めないとき（`/proc` が読めない、`hc ls --json` が失敗する・形が違う）は、その制約を安全側の値（既定 1）にし、`unknown` と理由を出して終了コード 0 で終わります。使えない環境変数の値（数でない、負）は既定値にして `notes` に出します。
+- 既定値の根拠: Claude Code 1 セッションは常駐で 0.5〜1GB、テストや `uv sync` の間はさらに増えるので、1 ワーカー 1.5GiB と見積もります。10GB の VM では MemTotal が約 9.7GiB で、予約は 1.5GiB（15% の 1.46GiB より下限が大きい）です。空きが 5.2GiB なら `memory` は 2、3 ワーカーでメモリ 90% 程度（空き約 1GiB）なら 0 になります。CPU は 20 × 0.8 = 16 から load1 を引くので、普段は効きません。
+- 変え方: capacity は監督役が Bash ツールで実行するので、上の環境変数は Bash ツールが読み込むシェルの設定（dev の `~/.zshrc` など）に `export` で書き、`hc-supervisor restart` で監督役を作り直して反映します（`hc run` は呼び出し元の環境変数を terminal に渡しません）。試すだけなら `HC_SUPERVISOR_WORKER_MEM_MB=1024 hc-supervisor capacity` のように前に付けます。重い処理を遠隔に回して 1 ワーカーあたりの使用量が下がったら、`HC_SUPERVISOR_WORKER_MEM_MB` を下げます。
+- 監督役の使い方（[supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) の「同時に動かす数」）: 起動の前に capacity を 1 回測り、`slots` 個まで続けて起動します。起動直後のワーカーはまだメモリを使っていないので、続けて起動する間は測り直しません。足りない分は進捗ボードの「次にやること」に `待機（<limit_by>）` で並べ、ワーカーが終わって `hc wait --children any` から戻ったときに測り直します。空きを待つポーリングはしません。ワーカーの自動停止・自動起動はしません（判断は監督役）。
+- 検証用: `HC_SUPERVISOR_PROC_DIR`（`/proc` の代わり）と `HC_SUPERVISOR_NPROC`（CPU の数）で入力を差し替えられます。`tests/test_hc_supervisor.sh` が、偽の `/proc` と偽の `hc ls --json` で各制約が効く場合と値が読めない場合を確かめます。
+
 ### 報告・相談の形と受理の確認
 
 監督役は、メッセージが届くたびに自分の文脈（実測で平均 80k〜109k）を読み直します。監督役のコストは、ほぼ「リクエスト数 × 平均文脈」なので、ワーカーからのメッセージの数と長さ、受理での確認の回数を減らします（Issue #34）。相談の禁止や回数の上限は設けません（判断の質を下げないため）。
@@ -346,7 +378,7 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
 
 ## 確認状況
 
-- テスト（`make check` で実行）: 事故よけのルールと hook の入出力は `tests/test_hc_permission.py`、起動ラッパーの role 判定・引数・ワーカーのモデル（`--model` の検査とテンプレート）・役割ごとの閾値と、`session-settings.json` の hook・読める範囲（`additionalDirectories`）は `tests/test_hc_claude.sh`、`hc-supervisor`（`resume-worker` の引数検査・止める順序・引き継ぎ回数・モデルの引き継ぎを含む）は `tests/test_hc_supervisor.sh`（偽の `hc` を使用）。
+- テスト（`make check` で実行）: 事故よけのルールと hook の入出力は `tests/test_hc_permission.py`、起動ラッパーの role 判定・引数・ワーカーのモデル（`--model` の検査とテンプレート）・役割ごとの閾値と、`session-settings.json` の hook・読める範囲（`additionalDirectories`）は `tests/test_hc_claude.sh`、`hc-supervisor`（`resume-worker` の引数検査・止める順序・引き継ぎ回数・モデルの引き継ぎ、`capacity` の各制約と値が読めない場合を含む）は `tests/test_hc_supervisor.sh`（偽の `hc` を使用）。
 - 実機で確認済み（hc 0.1.21、2026-11-14、旧構成で確認したもの）: `hc get --json` の形、Herdr app のラベル `herdr.space` / `herdr.tab` による配置、trust ダイアログ中は `hc run` の最初の依頼文が届かない（`first_message.sent: false`）こと。
 - dev の境界（sbx-test、2026-11-14）: [wsl-dev-distro.md](wsl-dev-distro.md) の「確認済みのこと」。
 - dev での実機確認が必要なもの（#26 の最後の受け入れ条件）:
@@ -361,4 +393,5 @@ Windows 版 Herdr app から見る場合は、dev をマシンとして追加し
 - dev での実機確認と導入後の計測が必要なもの（#33）: 監督役が `claude-worker-sonnet` で起動したワーカーの transcript の model が Sonnet になること、`claude-worker` では Opus のままであること（hc のテンプレートの `command` に `--model sonnet` を足しても引数として渡ることは、偽の `hc` でしか確かめていません）。導入後、Sonnet で実行した Issue の PR までの完了率・差し戻しの回数と Issue 1 件あたりのコスト（`by_model`）を、Opus の場合と比べます。
 - dev での実機確認が必要なもの（#48）: 上の「実機で確かめる」のタスク単位の記録。ワーカーの SessionEnd の行に `git.*`・`hc.role` = worker・`hc.terminal` が入り、`report --by task` にその Issue の行が出ること。過去の transcript での確認（2026-11-22、一時の `XDG_DATA_HOME` で `rescan --since 2026-11-21` → `report --by task`）: 28 セッションを 19 タスクにまとめ、`mlbot-dev#238`・`dotfiles#48` などが Issue ごとの行になり、`restart.kind` は fresh 15・resume_worker 8・resume_supervisor 5、`cache_rewrite_by_cause` は idle 4・tool_wait 5 でした。#48 より前の記録には `hc` が無いので、監督役のセッションは `supervisor` ではなく `cwd:~/.local/share/hc-supervisor` の行になり、merge 後に worktree を消した #46・#47 は `git.repo` が取れず `?#46`・`?#47` になります。
 - dev での実機確認が必要なもの（#44）: cwd が dotfiles の worktree のワーカーで、`~/.claude/projects` の transcript と `~/.local/share/claude-token-metrics/sessions.jsonl` を読む集計（Read ツールと、scratchpad のスクリプトを `python3 <絶対 path>` で実行する Bash の両方）が許可の確認なしで通ること。`--settings` の `additionalDirectories` が block の対象外になることは公式ドキュメントの記述（リストの足し合わせと、除かれるのはリポジトリの設定だけ）とインストール済みの 2.1.330 のコードの読解からの判断で、hc のワーカーではまだ確かめていません。`~/` で書いた entry が展開されることも同時に確かめます（ユーザー設定の `additionalDirectories` は `~/` の entry で効いている）。通らなければ `hc-claude` で `--add-dir` を渡す案（信頼の確認が出ないか確かめる）に切り替えます。
+- dev での実機確認が必要なもの（#54）: `hc-supervisor capacity` が使う `hc ls --json` の形（配列か `{"terminals": [...]}` か、各 terminal に `labels.role`・`state` があるか）は、この sandbox で core を起動できず偽の `hc` でしか確かめていません。形が違うと `max_workers` が安全側の 1 になり（`unknown` に出る）、`slots` が 1 に抑えられます。dev で `hc-supervisor capacity --json` の `unknown` が空で `running_workers` が `hc ls` のワーカー数と合うことを確かめます。既定の見積もり（1 ワーカー 1.5GiB）は、導入後に複数ワーカーを動かしたときの MemAvailable の減り方で見直します。
 - 導入後の計測が必要なもの（#34）: 上の「報告・相談の形と受理の確認」。導入後の監督役で、`claude-token-metrics report` の受理 1 件あたりのリクエスト数と平均文脈を、導入前（#34 の本文の値: 103 リクエスト・平均文脈 109k、31 リクエスト・平均 80k）と比べます。受理の確認の `gh pr view --jq` は、CI の無い PR（このリポジトリ）と CI のある公開リポジトリの PR（成功・失敗・実行中・StatusContext の `PENDING`）で出力を確かめました。
