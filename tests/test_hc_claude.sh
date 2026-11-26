@@ -33,7 +33,7 @@ expected="--model opus --effort medium --permission-mode bypassPermissions --set
 [[ "$(args)" == "$expected" ]] && ok 'dev: ワーカーを effort medium・bypassPermissions・hc 用 settings・役割のプロンプトで起動する' \
   || ng "ワーカーの引数が違う: $(args)"
 "$launcher" supervisor
-[[ "$(args)" == "--model opus --effort high "*"--append-system-prompt-file $config/supervisor-prompt.md" ]] && ok 'dev: 監督役は effort high・監督役のプロンプトで起動する' \
+[[ "$(args)" == "--model fable --effort high "*"--append-system-prompt-file $config/supervisor-prompt.md" ]] && ok 'dev: 監督役は fable・effort high・監督役のプロンプトで起動する' \
   || ng "監督役の引数が違う: $(args)"
 
 # モデル: 既定は opus。ワーカーだけ役割の直後の --model で opus / sonnet を選べる（#33）。
@@ -52,9 +52,30 @@ for bad in haiku Sonnet fable 'opus sonnet' claude-sonnet-4-5 ''; do
   grep -q '許可していないモデル' "$fixture/err" || { ng "許可しないモデル '$bad' を黙って捨てた"; bad_ok=0; }
 done
 [[ "$bad_ok" == 1 ]] && ok 'モデル: 許可しない名前（opus・sonnet 以外）は警告して opus で起動する（起動は止めない）'
+"$launcher" supervisor --model opus 2>"$fixture/err"
+[[ "$(args)" == "--model opus --effort high "*"--append-system-prompt-file $config/supervisor-prompt.md" && ! -s "$fixture/err" ]] \
+  && ok 'モデル: 監督役は --model opus で opus を使う（既定は fable）' || ng "監督役の --model opus の扱いが違う: $(args) / $(cat "$fixture/err")"
+"$launcher" supervisor --model=fable 2>"$fixture/err"
+[[ "$(args)" == "--model fable --effort high "* && ! -s "$fixture/err" ]] \
+  && ok 'モデル: 監督役は --model=fable を明示できる' || ng "監督役の --model=fable の扱いが違う: $(args) / $(cat "$fixture/err")"
 "$launcher" supervisor --model sonnet 2>"$fixture/err"
-[[ "$(args)" == "--model opus --effort high "* && "$(args)" != *sonnet* ]] && grep -q 'opus 固定' "$fixture/err" \
-  && ok 'モデル: 監督役は --model を渡されても警告して opus のまま' || ng "監督役の --model の扱いが違う: $(args) / $(cat "$fixture/err")"
+[[ "$(args)" == "--model fable --effort high "* && "$(args)" != *sonnet* ]] && grep -q '許可していないモデルなので、fable を使います' "$fixture/err" \
+  && ok 'モデル: 監督役に許可しないモデルは、警告して既定の fable で起動する' || ng "監督役の --model の扱いが違う: $(args) / $(cat "$fixture/err")"
+python3 - "$repository_root/.config/herdr-core/templates/claude-supervisor.md" "$repository_root/.config/herdr-core/templates/claude-supervisor-opus.md" \
+  "$repository_root/dotfiles.toml" <<'PY' && ok 'テンプレート: claude-supervisor は fable（--model なし）、claude-supervisor-opus は --model opus、どちらも link する' \
+  || ng '監督役のテンプレートが違う'
+import re, sys, tomllib
+def command(path):
+    return re.search(r"^command: (.*)$", open(path).read(), re.M).group(1)
+assert command(sys.argv[1]) == "hc-claude supervisor", command(sys.argv[1])
+assert command(sys.argv[2]) == "hc-claude supervisor --model opus", command(sys.argv[2])
+# 依頼文の前置き（本文）は同じにする（モデル以外の振る舞いを変えない）。
+body = lambda p: open(p).read().split("---\n", 2)[2]
+assert body(sys.argv[1]) == body(sys.argv[2])
+sources = {c.get("source") for c in tomllib.load(open(sys.argv[3], "rb"))["config"]}
+for name in ("claude-supervisor.md", "claude-supervisor-opus.md"):
+    assert ".config/herdr-core/templates/" + name in sources, name
+PY
 if "$launcher" worker --model 2>/dev/null; then ng '値のない --model を受け付けた'; else ok 'モデル: 値のない --model は使い方の誤りとして拒否'; fi
 python3 - "$repository_root/.config/herdr-core/templates/claude-worker.md" "$repository_root/.config/herdr-core/templates/claude-worker-sonnet.md" \
   "$repository_root/dotfiles.toml" <<'EOF' && ok 'テンプレート: claude-worker は opus（--model なし）、claude-worker-sonnet は --model sonnet、どちらも link する' \

@@ -10,16 +10,22 @@ role_file="${HC_CLAUDE_ROLE_FILE:-/etc/dotfiles-role}"
 
 usage() {
   cat <<'EOF'
-Usage: hc-supervisor [start] [--cwd DIR]
-       hc-supervisor restart [--cwd DIR]
+Usage: hc-supervisor [start] [--cwd DIR] [--model fable|opus]
+       hc-supervisor restart [--cwd DIR] [--model fable|opus]
        hc-supervisor status | stop | board
        hc-supervisor capacity [--json]
        hc-supervisor resume-worker --from WORKER --cwd WORKTREE --handoff PATH [--name NAME] [--model opus|sonnet] REQUEST
 
 start    監督役（名前 supervisor、ラベル role=supervisor）を起動する。既に監督役がいれば起動しない。
+         モデルは --model で選ぶ（fable か opus。既定は fable）。fable はテンプレート claude-supervisor、
+         opus は claude-supervisor-opus で起動し、ラベル model に残す。
          --cwd の既定は ~/.local/share/hc-supervisor（$HOME はフォルダ信頼が保存されず、
          起動のたびに trust ダイアログが出るため）。
-restart  監督役を作り直す（プロンプトや設定の変更を反映する）。動いている監督役に引き継ぎ
+restart  監督役を作り直す（プロンプトや設定の変更を反映する）。--model を付ければモデルも替える
+         （付けなければ、いまのモデルのまま。terminal を作り直すときはラベル model、無ければ fable）。
+         モデルを選べるようになる前に起動した監督役は、同じ terminal のままではモデルを替えられない
+         （hc-supervisor stop → hc-supervisor start --model ... で起動し直す）。
+         動いている監督役に引き継ぎ
          （~/.local/share/hc-supervisor/handoff.md）を書かせてから、同じ terminal（同じ tN）の中で
          Claude Code だけを起動し直す。監督役が起動したワーカーは、そのまま新しい監督役の子になる。
          入れ替えられないとき（この仕組みより前に起動した監督役など）は、terminal を消して同じ名前・
@@ -102,17 +108,19 @@ launch() {
   # 初回は trust ダイアログで最初の依頼文が届かず、hc run が届くまで待ち続ける（実機 2026-11-14）。
   # --timeout で待ちを切り上げる（terminal は動いたまま）。役割はシステムプロンプトで渡すので、
   # 依頼文が届かなくても監督役は待機状態になる。
+  local model="${supervisor_model:-${supervisor_models[0]}}" template=claude-supervisor
+  [[ "$model" == "${supervisor_models[0]}" ]] || template="claude-supervisor-$model"
   if [[ -n "${HC_CLAUDE_BIN:-}" ]]; then
     # 検証用: hc run は呼び出し元の環境変数を terminal に渡さないので、偽の claude を env で渡す。
     # hc-claude はこの hc-supervisor の隣のもの（worktree で試すときに、本番のリンク先を使わない）。
-    hc run --bg --timeout 20 --no-parent --keep --name "$name" --label role=supervisor --cwd "$cwd" \
-      -- env "${passthrough_env[@]}" "$(dirname "$self_path")/hc-claude" supervisor "$start_request" >/dev/null || true
+    hc run --bg --timeout 20 --no-parent --keep --name "$name" --label role=supervisor --label "model=$model" --cwd "$cwd" \
+      -- env "${passthrough_env[@]}" "$(dirname "$self_path")/hc-claude" supervisor --model "$model" "$start_request" >/dev/null || true
   else
-    hc run --bg --timeout 20 --no-parent --keep --name "$name" --label role=supervisor --cwd "$cwd" \
-      claude-supervisor "$start_request" || true
+    hc run --bg --timeout 20 --no-parent --keep --name "$name" --label role=supervisor --label "model=$model" --cwd "$cwd" \
+      "$template" "$start_request" || true
   fi
   exists "$name" || die "監督役を起動できませんでした（hc ls で確認してください）"
-  printf '起動しました: %s\n' "$name"
+  printf '起動しました: %s（モデル %s）\n' "$name" "$model"
   [[ -n "$space" ]] || return 0
   [[ -n "$tab" ]] || tab="tb$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
   hc label "$name" "herdr.space=$space" "herdr.tab=$tab" "where=supervisor" >/dev/null \
@@ -126,9 +134,10 @@ restart_request='【再起動の準備】hc-supervisor restart からの依頼�
 # claude を起動し直す。入れ替えの仕組みがない（古い hc-claude で起動した、シェルになっている）ときは、
 # 何もせずに 1 を返す。
 swap_in_place() {
-  local address="$1" pid_file restart_file shell_pid old_pid new_pid i
+  local address="$1" pid_file restart_file model_file shell_pid old_pid new_pid i
   pid_file="$claude_state_dir/$address.pid"
   restart_file="$claude_state_dir/$address.restart"
+  model_file="$claude_state_dir/$address.model"
   shell_pid="$(cat "$pid_file" 2>/dev/null || true)"
   [[ "$shell_pid" =~ ^[0-9]+$ ]] || return 1
   tr '\0' ' ' <"/proc/$shell_pid/cmdline" 2>/dev/null | grep -q 'hc-claude supervisor' || return 1
@@ -136,6 +145,8 @@ swap_in_place() {
   [[ -n "$old_pid" ]] || return 1
 
   printf '%s' "$start_request" >"$restart_file"
+  # --model を付けたとき: hc-claude が起動し直す claude のモデルを、この印の名前に替える。
+  [[ -z "$supervisor_model" ]] || printf '%s' "$supervisor_model" >"$model_file"
   kill -TERM "$old_pid" 2>/dev/null || true
   for ((i = 0; i < 30; i++)); do
     [[ -d "/proc/$old_pid" ]] || break
@@ -149,10 +160,14 @@ swap_in_place() {
     sleep 0.5
   done
   if [[ -z "$new_pid" ]]; then
-    rm -f "$restart_file"
+    rm -f "$restart_file" "$model_file"
     die "古い Claude Code は止めましたが、新しい Claude Code が起動しませんでした。hc read $name で確かめ、必要なら hc-supervisor stop → hc-supervisor で起動し直してください。引き継ぎは $handoff にあります。"
   fi
   printf '同じ terminal（%s）のまま、監督役の Claude Code を起動し直しました。ワーカーとの親子関係はそのままです。\n' "$address"
+  if [[ -n "$supervisor_model" ]]; then
+    hc label "$name" "model=$supervisor_model" >/dev/null 2>&1 || true
+    printf 'モデルは %s にしました。\n' "$supervisor_model"
+  fi
 }
 
 restart() {
@@ -172,7 +187,7 @@ restart() {
     [[ -f "$handoff" ]] || die "先に引き継ぎを $handoff に書いてください"
     mkdir -p "$state_dir"
     hc run --bg --no-parent --rm --no-notify --name "$name-restart" -- \
-      env "${passthrough_env[@]}" bash -c '"$0" restart --handoff-ready --cwd "$1" >>"$2" 2>&1' "$self_path" "$cwd" "$restart_log" >/dev/null
+      env "${passthrough_env[@]}" bash -c '"$0" restart --handoff-ready --cwd "$1" ${3:+--model "$3"} >>"$2" 2>&1' "$self_path" "$cwd" "$restart_log" "$supervisor_model" >/dev/null
     printf '別の terminal で作り直します。この監督役はまもなく止まります。結果: %s\n' "$restart_log"
     return
   fi
@@ -209,6 +224,12 @@ restart() {
   hc rm "$name" >/dev/null 2>&1 || true
   ! exists "$name" || die "古い監督役が止まりませんでした（hc ls で確認してください）。引き継ぎは $handoff にあります。"
   printf '古い監督役を止めました。\n'
+  # --model がなければ、前の監督役のラベル model を引き継ぐ（無い・不正なら既定）。
+  if [[ -z "$supervisor_model" ]]; then
+    local previous_model
+    previous_model="$(json_value label "$json" model)"
+    ! is_supervisor_model "$previous_model" || supervisor_model="$previous_model"
+  fi
   launch "$space" "$tab"
 }
 
@@ -507,6 +528,15 @@ done
 self_path="$(readlink -f "${BASH_SOURCE[0]}")"
 cwd="$default_cwd"
 handoff_ready=0
+# 監督役に選べるモデル（hc-claude supervisor の --model と同じ。先頭が既定で、それ以外は
+# claude-supervisor-<モデル> のテンプレートがある）。空なら --model の指定なし。
+supervisor_models=(fable opus)
+supervisor_model=""
+is_supervisor_model() {
+  local m
+  for m in "${supervisor_models[@]}"; do [[ "$1" == "$m" ]] && return 0; done
+  return 1
+}
 # resume-worker・capacity は自分の引数を持つので、ここでは読まずに後で渡す。
 resume_args=()
 if [[ "$command" == resume-worker || "$command" == capacity ]]; then
@@ -518,6 +548,12 @@ while (($#)); do
     --cwd)
       (($# >= 2)) || die '--cwd にディレクトリを指定してください'
       cwd="$2"
+      shift 2
+      ;;
+    --model)
+      (($# >= 2)) || die '--model にモデルを指定してください'
+      is_supervisor_model "$2" || die "--model は ${supervisor_models[*]} のどれかにしてください: $2"
+      supervisor_model="$2"
       shift 2
       ;;
     --handoff-ready)

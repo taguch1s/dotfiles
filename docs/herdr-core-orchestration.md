@@ -72,7 +72,7 @@ supervisor（dev、role=supervisor、親なし）
 
 | ファイル | 内容 |
 | --- | --- |
-| [hc-claude](../.local/bin/hc-claude) | 監督役・ワーカーの起動ラッパー。`/etc/dotfiles-role` が `dev` のときだけ `claude --model <opus|sonnet> --effort <high|medium> --permission-mode bypassPermissions --settings session-settings.json --append-system-prompt-file <role>-prompt.md` を exec し（effort は監督役 high・ワーカー medium。モデルは既定で opus、ワーカーだけ `hc-claude worker --model sonnet` で選べる。下記「ワーカーのモデル」）、それ以外（admin）では起動を拒否する。文脈予算の閾値 `CLAUDE_CTX_GUARD_TOKENS` を役割ごとに渡す（下記「文脈予算とトークン記録」） |
+| [hc-claude](../.local/bin/hc-claude) | 監督役・ワーカーの起動ラッパー。`/etc/dotfiles-role` が `dev` のときだけ `claude --model <fable|opus|sonnet> --effort <high|medium> --permission-mode bypassPermissions --settings session-settings.json --append-system-prompt-file <role>-prompt.md` を exec し（effort は監督役 high・ワーカー medium。モデルは、監督役の既定が fable で `hc-claude supervisor --model opus` で opus、ワーカーの既定が opus で `hc-claude worker --model sonnet` で sonnet を選べる。下記「監督役のモデル」「ワーカーのモデル」）、それ以外（admin）では起動を拒否する。文脈予算の閾値 `CLAUDE_CTX_GUARD_TOKENS` を役割ごとに渡す（下記「文脈予算とトークン記録」） |
 | [hc-supervisor](../.local/bin/hc-supervisor) | 監督役の起動・状態表示・停止と、引き継いだワーカーの起動し直し（`resume-worker`）。dev でだけ起動する |
 | [hc-permission](../.local/bin/hc-permission) | 事故よけの deny リスト（`hook` / `check`） |
 | [templates/claude-supervisor.md](../.config/herdr-core/templates/claude-supervisor.md) / [claude-worker.md](../.config/herdr-core/templates/claude-worker.md) / [claude-worker-sonnet.md](../.config/herdr-core/templates/claude-worker-sonnet.md) | `hc run` のテンプレート（`command: hc-claude supervisor|worker`、Sonnet のワーカーは `hc-claude worker --model sonnet`） |
@@ -202,6 +202,13 @@ hc run --bg --outlive-parent --label role=worker --name small-issue --cwd <workt
 - ワーカーが `【引き継ぎ】<path>` だけを送ってターンを終え、監督役が `resume-worker` で起動し直したワーカーが handoff の next safe action から再開して PR 作成まで進むこと。
 - 前後のワーカーが同じ worktree で同時に動かないこと（`hc ls` で前のワーカーが消えてから新しいワーカーが出る）。
 - `claude-token-metrics report` で、起動し直したワーカーの文脈が開始時の水準（約 50k〜60k）から始まっていること。
+
+### 監督役のモデル
+
+- 監督役のモデルは Fable（既定）か Opus で、起動のときに選びます（ユーザーの判断、2026-11-27。それまでは opus 固定）。
+- `hc-supervisor start --model <fable|opus>` で選びます。fable はテンプレート `claude-supervisor`、opus は `claude-supervisor-opus`（`hc-claude supervisor --model opus`）で起動し、terminal のラベル `model` に残します。`hc-claude` は、許可しない名前を警告して fable で起動します。
+- `hc-supervisor restart --model <fable|opus>` は、同じ terminal のままモデルも替えます（`<状態>/<tN>.model` に名前を書き、`hc-claude` が起動し直す claude に渡す）。`--model` を付けなければ、いまのモデルのままです。terminal を作り直す場合は、ラベル `model`（無い・不正なら fable）で起動します。
+- モデルを選べるようになる前に起動した監督役は、同じ terminal のままではモデルを替えられません（古い `hc-claude` が動いているため）。`hc-supervisor stop` → `hc-supervisor start --model ...` で起動し直します。
 
 ### ワーカーのモデル
 

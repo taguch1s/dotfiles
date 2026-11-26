@@ -62,6 +62,12 @@ target = ".config/herdr-core/templates/claude-supervisor.md"
 mode = "link"
 
 [[config]]
+name = "herdr-core 監督役テンプレート（Opus）"
+source = ".config/herdr-core/templates/claude-supervisor-opus.md"
+target = ".config/herdr-core/templates/claude-supervisor-opus.md"
+mode = "link"
+
+[[config]]
 name = "herdr-core ワーカーテンプレート"
 source = ".config/herdr-core/templates/claude-worker.md"
 target = ".config/herdr-core/templates/claude-worker.md"

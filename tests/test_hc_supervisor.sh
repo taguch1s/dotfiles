@@ -91,7 +91,7 @@ echo dev >"$HC_CLAUDE_ROLE_FILE"
 reset
 "$launcher" >/dev/null 2>"$fixture/err"
 home="$fixture/home/.local/share/hc-supervisor"
-expected_supervisor="run --bg --timeout 20 --no-parent --keep --name supervisor --label role=supervisor --cwd $home claude-supervisor 監督を開始してください。"
+expected_supervisor="run --bg --timeout 20 --no-parent --keep --name supervisor --label role=supervisor --label model=fable --cwd $home claude-supervisor 監督を開始してください。"
 if [[ "$(runs)" == "$expected_supervisor" ]]; then
   ok 'start: 監督役（role=supervisor、親なし、keep）だけを起動する（watcher はない）'
 else
@@ -177,7 +177,7 @@ echo handoff >"$sup_handoff"
 reset
 HC_TERMINAL_ID=t9 "$launcher" restart >/dev/null 2>&1
 run_line="$(runs)"
-[[ "$run_line" == "run --bg --no-parent --rm --no-notify --name supervisor-restart -- env bash -c "*'restart --handoff-ready'*" $home $home/restart.log" ]] \
+[[ "$run_line" == "run --bg --no-parent --rm --no-notify --name supervisor-restart -- env bash -c "*'restart --handoff-ready'*" $home $home/restart.log"* ]] \
   && [[ "$(cmds)" == 'run ' ]] \
   && ok 'restart（監督役自身）: 親のない別の terminal に切り離し、自分では止めない' || ng "監督役自身の restart が違う: $(cmds) / $run_line"
 
@@ -200,6 +200,7 @@ touch "$config/session-settings.json" "$config/supervisor-prompt.md"
 cat >"$fixture/fake-claude" <<'EOF'
 #!/usr/bin/env bash
 printf 'claude %s\n' "${*: -1}" >>"$MOCK_HC_DIR/claude.log"
+printf '%s\n' "$2" >>"$MOCK_HC_DIR/claude-model.log"
 exec sleep 60
 EOF
 chmod +x "$fixture/fake-claude"
@@ -218,6 +219,18 @@ new_claude="$(pgrep -P "$hc_claude_pid" || true)"
 [[ -n "$new_claude" && "$new_claude" != "$old_claude" && "$(tail -n 1 "$fixture/claude.log")" == 'claude 監督を開始してください。' ]] \
   && ok 'restart: 新しい claude を最初の依頼文で起動する' || ng "入れ替え後の claude が違う: $old_claude → $new_claude / $(cat "$fixture/claude.log")"
 [[ ! -e "$fixture/home/.local/state/hc-claude/t9.restart" ]] && ok 'restart: 入れ替えの印は使い終わると消える' || ng '入れ替えの印が残った'
+[[ "$(tail -n 1 "$fixture/claude-model.log")" == fable ]] && ok 'restart: --model がなければ、同じモデル（既定の fable）のまま入れ替える' \
+  || ng "入れ替え後のモデルが違う: $(cat "$fixture/claude-model.log")"
+# restart --model: 同じ terminal のまま、起動し直す claude のモデルだけを替える。
+old_claude="$new_claude"
+reset
+"$launcher" restart --handoff-ready --model opus >"$fixture/out" 2>&1
+new_claude="$(pgrep -P "$hc_claude_pid" || true)"
+[[ -n "$new_claude" && "$new_claude" != "$old_claude" && "$(tail -n 1 "$fixture/claude-model.log")" == opus ]] \
+  && grep -q 'モデルは opus にしました' "$fixture/out" && tr '\037' ' ' <"$fixture/hc.log" | grep -q 'label supervisor model=opus' \
+  && ok 'restart --model opus: 同じ terminal のまま opus で起動し直し、ラベル model を直す' \
+  || ng "restart --model の入れ替えが違う: $(cat "$fixture/claude-model.log") / $(<"$fixture/out") / $(cat "$fixture/hc.log")"
+[[ ! -e "$fixture/home/.local/state/hc-claude/t9.model" ]] && ok 'restart --model: モデルの印は使い終わると消える' || ng 'モデルの印が残った'
 kill "$new_claude" 2>/dev/null || true
 wait "$hc_claude_pid" 2>/dev/null || true
 [[ ! -e "$fixture/home/.local/state/hc-claude/t9.pid" ]] && ok 'hc-claude: claude が自分で終われば終わり、pid の印を消す' || ng 'pid の印が残った'

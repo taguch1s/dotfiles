@@ -16,13 +16,15 @@ die() {
 usage() {
   cat <<'EOF'
 Usage: hc-claude supervisor [claude の引数...]
+       hc-claude supervisor [--model fable|opus] [claude の引数...]
        hc-claude worker [--model opus|sonnet] [claude の引数...]
 
 役割のシステムプロンプトと hc 用の settings を付けて、claude を権限確認なしで起動する。
 dev ディストリ（/etc/dotfiles-role が dev）でだけ動く。
 hc 上の監督役は、hc-supervisor restart で同じ terminal のまま claude を起動し直せる。
-モデルは既定で opus。ワーカーだけ、役割の直後の --model で opus か sonnet を選べる
-（hc のテンプレート claude-worker-sonnet が --model sonnet を渡す）。監督役は opus のまま。
+モデルは役割の直後の --model で選べる。監督役は既定が fable で、fable か opus
+（hc のテンプレート claude-supervisor-opus が --model opus を渡す）。ワーカーは既定が opus で、
+opus か sonnet（hc のテンプレート claude-worker-sonnet が --model sonnet を渡す）。
 EOF
 }
 
@@ -33,11 +35,22 @@ case "$role" in
   *) usage >&2; exit 2 ;;
 esac
 
-# モデル: 既定は opus。ワーカーだけ、役割の直後の --model <名前> で選べる（監督役は判断の質を優先して opus 固定）。
-# 許可しない名前・監督役への指定は、警告して opus で起動する（起動は止めない。迷ったら opus の方針と同じ）。
+# モデル: 役割の直後の --model <名前> で選べる。監督役は fable（既定）か opus、ワーカーは opus（既定）か sonnet
+# （監督役の既定を fable にしたのはユーザーの判断、2026-11-27。それまでは opus 固定）。
+# 許可しない名前は、警告して役割の既定で起動する（起動は止めない）。
 # --model は claude にそのまま渡さずここで消費する（claude に --model を二重に渡さない）。
-allowed_models=(opus sonnet)
-model=opus
+if [[ "$role" == supervisor ]]; then
+  allowed_models=(fable opus)
+else
+  allowed_models=(opus sonnet)
+fi
+default_model="${allowed_models[0]}"
+model="$default_model"
+is_allowed_model() {
+  local allowed
+  for allowed in "${allowed_models[@]}"; do [[ "$1" == "$allowed" ]] && return 0; done
+  return 1
+}
 if [[ "${1:-}" == --model || "${1:-}" == --model=* ]]; then
   if [[ "$1" == --model=* ]]; then
     requested="${1#--model=}"
@@ -47,14 +60,10 @@ if [[ "${1:-}" == --model || "${1:-}" == --model=* ]]; then
     requested="$2"
     shift 2
   fi
-  if [[ "$role" != worker ]]; then
-    printf 'hc-claude: 監督役のモデルは opus 固定です（--model %s は使いません）。\n' "$requested" >&2
+  if is_allowed_model "$requested"; then
+    model="$requested"
   else
-    for allowed in "${allowed_models[@]}"; do
-      [[ "$requested" != "$allowed" ]] || model="$requested"
-    done
-    [[ "$model" == "$requested" ]] \
-      || printf 'hc-claude: --model %s は許可していないモデルなので、opus を使います（許可: %s）。\n' "$requested" "${allowed_models[*]}" >&2
+    printf 'hc-claude: --model %s は許可していないモデルなので、%s を使います（許可: %s）。\n' "$requested" "$default_model" "${allowed_models[*]}" >&2
   fi
 fi
 
@@ -104,11 +113,14 @@ fi
 # ワーカーとの親子関係が切れる。hc-supervisor restart は <状態>/<tN>.pid（この bash の pid）を見て、
 # <状態>/<tN>.restart に新しい claude への最初の依頼文を書いてから claude を SIGTERM で止める。
 # claude が終わったとき .restart があれば、その依頼文で claude を起動し直す。無ければ終わる。
+# <状態>/<tN>.model があれば（hc-supervisor restart --model）、起動し直す claude のモデルをそれに替える
+# （許可しない名前は、警告していまのモデルのまま）。無ければ、いまのモデルのまま。
 state_dir="${HC_CLAUDE_STATE_DIR:-$HOME/.local/state/hc-claude}"
 pid_file="$state_dir/$HC_TERMINAL_ID.pid"
 restart_file="$state_dir/$HC_TERMINAL_ID.restart"
+model_file="$state_dir/$HC_TERMINAL_ID.model"
 mkdir -p "$state_dir"
-rm -f "$restart_file"
+rm -f "$restart_file" "$model_file"
 echo "$$" >"$pid_file"
 trap 'rm -f "$pid_file"' EXIT
 args=("$@")
@@ -118,6 +130,16 @@ while :; do
   [[ -f "$restart_file" ]] || exit "$status"
   request="$(<"$restart_file")"
   rm -f "$restart_file"
+  if [[ -f "$model_file" ]]; then
+    requested="$(<"$model_file")"
+    rm -f "$model_file"
+    if is_allowed_model "$requested"; then
+      model="$requested"
+      claude_args[1]="$model"
+    else
+      printf 'hc-claude: 起動し直すモデル %s は許可していないので、%s のままにします（許可: %s）。\n' "$requested" "$model" "${allowed_models[*]}" >&2
+    fi
+  fi
   args=()
   [[ -z "$request" ]] || args=("$request")
   printf '\nhc-claude: Claude Code を起動し直します（同じ terminal %s のまま）。\n' "$HC_TERMINAL_ID"
