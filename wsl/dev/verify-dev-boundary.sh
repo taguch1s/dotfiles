@@ -93,14 +93,23 @@ else
   ng "$HOME/.claude/settings.json に skipDangerousModePermissionPrompt: true がない（hc の起動が確認ダイアログで止まる）"
 fi
 
-# GCP: dev にはユーザー本人の gcloud の資格情報を置かない。hc-remote は service account の鍵と
-# 専用の設定（CLOUDSDK_CONFIG=~/.config/hc-remote/gcloud）だけを使う（docs/hc-remote-gcp.md）。
+# GCP: dev にはユーザー本人の gcloud の資格情報を置かない。gcloud の設定ごとに、あってよい service account を
+# 1 つに決める（docs/infra-credentials.md）。既定の ~/.config/gcloud は L0 の dev-infra-viewer だけ、
+# hc-remote の専用の設定（CLOUDSDK_CONFIG=~/.config/hc-remote/gcloud）は hc-remote-runner だけ。
+gcp_project="${DEV_GCP_PROJECT:-first-impression-490413}"
+gcloud_allowed() {  # gcloud_allowed <gcloud の設定ディレクトリ>: あってよい SA のメールアドレス
+  case "$1" in
+    "$HOME/.config/gcloud") printf 'dev-infra-viewer@%s.iam.gserviceaccount.com' "$gcp_project" ;;
+    "$HOME/.config/hc-remote/gcloud") printf 'hc-remote-runner@%s.iam.gserviceaccount.com' "$gcp_project" ;;
+  esac
+}
 for gcloud_dir in "$HOME/.config/gcloud" "$HOME/.config/hc-remote/gcloud"; do
   [[ -d "$gcloud_dir" ]] || continue
-  user_accounts="$(python3 - "$gcloud_dir" <<'PY' 2>&1
+  allowed_sa="$(gcloud_allowed "$gcloud_dir")"
+  user_accounts="$(python3 - "$gcloud_dir" "$allowed_sa" <<'PY' 2>&1
 import json, os, sqlite3, sys
 
-root = sys.argv[1]
+root, allowed = sys.argv[1], sys.argv[2]
 found = set()
 for name in ("credentials.db", "access_tokens.db"):
     path = os.path.join(root, name)
@@ -124,16 +133,47 @@ if os.path.exists(adc):
         kind = "unreadable"
     if kind != "service_account":
         found.add(f"application_default_credentials.json（type={kind}）")
-print(" ".join(sorted(a for a in found if not a.endswith(".gserviceaccount.com"))))
+    else:
+        try:
+            found.add(json.load(open(adc)).get("client_email") or "application_default_credentials.json（client_email なし）")
+        except (OSError, ValueError):
+            found.add("application_default_credentials.json（読めない）")
+users = sorted(a for a in found if not a.endswith(".gserviceaccount.com"))
+others = sorted(a for a in found if a.endswith(".gserviceaccount.com") and a != allowed)
+# 1 行目: ユーザー本人の資格情報、2 行目: 決めた SA 以外の SA
+print(" ".join(users))
+print(" ".join(others))
 PY
 )"
+  other_accounts="$(sed -n 2p <<<"$user_accounts")"
+  user_accounts="$(sed -n 1p <<<"$user_accounts")"
   if [[ -n "$user_accounts" ]]; then
     ng "gcloud の資格情報にユーザー本人のもの（service account 以外）がある: ${gcloud_dir}: ${user_accounts}"
+  elif [[ -n "$other_accounts" ]]; then
+    ng "gcloud の資格情報に決めた SA（${allowed_sa}）以外の service account がある: ${gcloud_dir}: ${other_accounts}"
   else
-    ok "gcloud の資格情報は service account だけ: ${gcloud_dir}"
+    ok "gcloud の資格情報は決めた SA（${allowed_sa}）だけか、ない: ${gcloud_dir}"
   fi
 done
 [[ -d "$HOME/.config/gcloud" || -d "$HOME/.config/hc-remote/gcloud" ]] || ok 'gcloud の資格情報がない（~/.config/gcloud・~/.config/hc-remote/gcloud）'
+
+# SA の鍵は組織のポリシーで有効期限を強制できないので、古い鍵を警告する（NG にはしない。終了コードは変えない）。
+# 日数はファイルの更新時刻（admin から渡した日）で数える。作り直しの手順は docs/infra-credentials.md。
+key_max_age_days="${DEV_KEY_MAX_AGE_DAYS:-90}"
+if [[ ! "$key_max_age_days" =~ ^[0-9]+$ ]]; then
+  printf 'WARN  DEV_KEY_MAX_AGE_DAYS が整数ではないので 90 日で確かめる: %s\n' "$key_max_age_days"
+  key_max_age_days=90
+fi
+for key_path in "$HOME/.config/dev-infra/gcp-viewer-key.json" "$HOME/.config/hc-remote/gcp-key.json"; do
+  [[ -f "$key_path" ]] || continue
+  key_age_days=$((($(date +%s) - $(stat -c %Y "$key_path")) / 86400))
+  if ((key_age_days > key_max_age_days)); then
+    printf 'WARN  SA の鍵が %s 日前のもの（%s 日より古い）: %s。docs/infra-credentials.md の「鍵の作り直し」で作り直す\n' \
+      "$key_age_days" "$key_max_age_days" "$key_path"
+  else
+    ok "SA の鍵は ${key_age_days} 日前のもの（${key_max_age_days} 日以内）: ${key_path}"
+  fi
+done
 
 if ((failures)); then
   printf '\n%d 件の NG があります。docs/wsl-dev-distro.md を確認してください。\n' "$failures"

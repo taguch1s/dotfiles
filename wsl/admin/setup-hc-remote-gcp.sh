@@ -59,10 +59,12 @@ done
 [[ "$max_vcpus" =~ ^[0-9]+$ ]] || die "--max-vcpus は整数で指定してください: $max_vcpus"
 [[ "$zone" =~ ^[a-z]+-[a-z]+[0-9]+-[a-z]$ ]] || die "ゾーンの形が不正です: $zone"
 
-# 秘密情報の置き場（admin）でだけ動かす。dev ではユーザーの gcloud の資格情報を使わない方針（docs/wsl-dev-distro.md）。
+# 変更（--apply）は秘密情報の置き場（admin）でだけ行う。dev ではユーザーの gcloud の資格情報を使わない方針
+# （docs/wsl-dev-distro.md）。dev の dry-run は、既定の gcloud（L0 の dev-infra-viewer）で今の状態を読むだけ
+# （docs/infra-credentials.md）。
 role_file="${DOTFILES_ROLE_FILE:-/etc/dotfiles-role}"
-if [[ "$(cat "$role_file" 2>/dev/null)" == dev ]]; then
-  die "dev ディストリでは実行しません。admin（Ubuntu-24.04）で実行してください"
+if ((apply)) && [[ "$(cat "$role_file" 2>/dev/null)" == dev ]]; then
+  die "dev ディストリでは --apply しません。dry-run の表示を確かめたら、admin（Ubuntu-24.04）で --apply してください"
 fi
 command -v gcloud >/dev/null || die "gcloud が見つかりません"
 

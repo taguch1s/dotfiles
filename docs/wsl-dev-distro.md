@@ -72,6 +72,7 @@ wsl -d dev -u root -- tailscale up --ssh --hostname dev
 - Claude Code・gh・Codex の認証は admin から複製されています。Claude Code のログインが切れた場合は dev で `/login` し直してください（同じ認証を 2 つのディストリで更新し合うと、片方が切れることがあります）。
 - Herdr app は dev の WSLg から起動します。hc の監督役は dev で起動します（`hc-supervisor`）。
 - GCP（hc-remote の gcp backend）は、admin で作った専用の service account の鍵だけを dev に置いて使います。ユーザー本人の gcloud の資格情報は dev に置きません。手順は [hc-remote-gcp.md](hc-remote-gcp.md)。実行時に admin は要らないので、admin はセットアップと鍵の作り直しのときだけ起動し、終わったら `wsl --terminate Ubuntu-24.04` で止めます。
+- GCP の構成・状態・ログを読むだけの SA `dev-infra-viewer`（L0）の鍵を `~/.config/dev-infra/gcp-viewer-key.json` に置き、dev の既定の gcloud（`~/.config/gcloud`）に登録します。環境変数なしの `gcloud …` で読み取りだけができ、変更・秘密の値・データの本体は扱えません。鍵の渡し方・登録・無効化の手順と、dev にある資格情報の層の分け方は [infra-credentials.md](infra-credentials.md)。`verify-dev-boundary.sh` は、gcloud の設定ごとに決めた SA（既定は `dev-infra-viewer`、hc-remote は `hc-remote-runner`）以外の資格情報を NG にし、90 日より古い鍵に `WARN` を出します。
 
 ## 運用
 
