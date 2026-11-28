@@ -83,7 +83,7 @@ L0 は既定のロールを使うサービスごとに並べ、既定のロー�
 | --- | --- | --- |
 | `roles/iam.securityReviewer` | `logging.privateLogEntries.list`（データアクセスの監査ログ）を含む（2026-11-29 に公式ドキュメントで確認）。全サービスの list を含み、サービスが増えると広がる | `devInfraViewer` の `resourcemanager.projects.getIamPolicy`・`iam.roles.*`・`iam.serviceAccounts.get/list/getIamPolicy`・`iam.serviceAccountKeys.get/list` |
 | `roles/artifactregistry.reader` | `artifactregistry.repositories.downloadArtifacts`・`artifactregistry.files.download` でイメージ・パッケージの中身（データの本体）を取り出せる | `devInfraViewer` の `artifactregistry.{repositories,dockerimages,packages,versions,tags}.{get,list}` |
-| `roles/compute.viewer` | 公式ドキュメントの一覧に `compute.instances.getSerialPortOutput`（VM のシリアルポートの出力。起動ログに秘密が出ることがある）・`compute.instances.getScreenshot`・`compute.instances.getGuestAttributes` が載っているという読みがあり、確かめた結果が食い違ったので安全側に外した。全 compute の get・list を含み、サービスが増えると広がる | `devInfraViewer` の `compute.*.get`・`compute.*.list`（上の表） |
+| `roles/compute.viewer` | 公式ドキュメントの一覧に `compute.instances.getSerialPortOutput`（VM のシリアルポートの出力。起動ログに秘密が出ることがある）・`compute.instances.getScreenshot`・`compute.instances.getGuestAttributes` が入っているかを、公式ドキュメントで確定できなかった（読み方で結果が分かれた）ので、安全側に外した。全 compute の get・list を含み、サービスが増えると広がる | `devInfraViewer` の `compute.*.get`・`compute.*.list`（上の表） |
 
 ### 付けない権限
 
@@ -125,7 +125,7 @@ bash ~/dotfiles/wsl/admin/setup-dev-infra-viewer-gcp.sh
 - 1〜2 行目のログ: 秘密の値（パスワード・トークン・API キー・接続文字列）が出ていないこと。キーワードに当たった行は、本文を開いて値そのものが出ていないかを見ます。
 - Cloud Run の `env`: 秘密の値が `value:` に直書きされておらず、`valueFrom.secretKeyRef`（Secret Manager の参照）になっていること。
 - Cloud Scheduler の `headers`・`body`、Cloud Build の `substitutions`・`env`: 秘密の値が直書きされていないこと。Cloud Scheduler のジョブが `asia-northeast1` 以外にあるときは、`--location` をその region にして実行します（`gcloud scheduler locations list --project=first-impression-490413` で一覧）。
-- 最後の dry-run: 表示が「付けない権限は入っていない」になっていて、`(dry-run) gcloud …` の行が SA の作成・カスタムロールの作成（または update）・上の表の 10 件の `add-iam-policy-binding`・鍵の作成だけであること。`remove-iam-policy-binding` があれば、外してよい付与かを確かめます。
+- 最後の dry-run: 表示が「付けない権限は入っていない」になっていて、`(dry-run) gcloud …` の行が SA の作成・カスタムロールの作成（または update）・上の表の 9 件の `add-iam-policy-binding`・鍵の作成だけであること。`remove-iam-policy-binding` があれば、外してよい付与かを確かめます。
 - 秘密が混ざっていたら `--apply` せず、混ざっていたロール（多くは `roles/logging.viewer`・`roles/run.viewer`・`roles/cloudscheduler.viewer`・`roles/cloudbuild.builds.viewer`）を `l0_roles` から外す Issue を作ります。VM の metadata（`startup-script`）は既に `hc-remote-runner` から読めます（[hc-remote-gcp.md](hc-remote-gcp.md) の「残る露出」）。
 
 ### 2. `--apply`（admin）
