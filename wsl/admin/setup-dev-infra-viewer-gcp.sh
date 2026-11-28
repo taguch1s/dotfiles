@@ -58,7 +58,6 @@ custom_role="devInfraViewer"
 # L0 に付けるロール（ここが唯一の一覧）。外すときは 1 行を消して --apply すると、その付与も外す。
 # 各ロールの中身を公式ドキュメントで確かめた日付と結果は docs/infra-credentials.md の「L0 のロール」。
 l0_roles=(
-  roles/compute.viewer
   roles/run.viewer
   roles/cloudscheduler.viewer
   roles/cloudbuild.builds.viewer
@@ -70,8 +69,48 @@ l0_roles=(
   "projects/${project}/roles/${custom_role}"
 )
 # 既定のロールでは広すぎるもの（roles/iam.securityReviewer は logging.privateLogEntries.list を含み、
-# roles/artifactregistry.reader はイメージの中身を取り出せる）の代わりに、読み取りだけを並べたカスタムロール。
+# roles/artifactregistry.reader はイメージの中身を取り出せ、roles/compute.viewer は VM のシリアルポートの出力・
+# スクリーンショット・guest attributes を読める）の代わりに、読み取りだけを並べたカスタムロール。
 custom_permissions=(
+  compute.projects.get
+  compute.regions.get
+  compute.regions.list
+  compute.zones.get
+  compute.zones.list
+  compute.machineTypes.get
+  compute.machineTypes.list
+  compute.instances.get
+  compute.instances.list
+  compute.disks.get
+  compute.disks.list
+  compute.snapshots.get
+  compute.snapshots.list
+  compute.images.get
+  compute.images.list
+  compute.instanceTemplates.get
+  compute.instanceTemplates.list
+  compute.instanceGroupManagers.get
+  compute.instanceGroupManagers.list
+  compute.resourcePolicies.get
+  compute.resourcePolicies.list
+  compute.networks.get
+  compute.networks.list
+  compute.subnetworks.get
+  compute.subnetworks.list
+  compute.firewalls.get
+  compute.firewalls.list
+  compute.routes.get
+  compute.routes.list
+  compute.routers.get
+  compute.routers.list
+  compute.addresses.get
+  compute.addresses.list
+  compute.globalOperations.get
+  compute.globalOperations.list
+  compute.regionOperations.get
+  compute.regionOperations.list
+  compute.zoneOperations.get
+  compute.zoneOperations.list
   resourcemanager.projects.get
   resourcemanager.projects.getIamPolicy
   iam.roles.get
@@ -108,8 +147,11 @@ forbidden_permissions=(
   logging.privateLogEntries.list
   artifactregistry.repositories.downloadArtifacts
   artifactregistry.files.download
+  compute.instances.getSerialPortOutput
+  compute.instances.getScreenshot
+  compute.instances.getGuestAttributes
 )
-forbidden_roles=(roles/viewer roles/editor roles/owner roles/iam.securityReviewer roles/artifactregistry.reader)
+forbidden_roles=(roles/viewer roles/editor roles/owner roles/iam.securityReviewer roles/artifactregistry.reader roles/compute.viewer)
 
 # forbidden_permission <permission>: 付けない権限なら 0。変更系（最後の語が create・update・delete・set… で始まる）もすべて含む。
 forbidden_permission() {
@@ -123,6 +165,11 @@ forbidden_permission() {
 self_check() {
   local role f perm bad=0
   for role in "${l0_roles[@]}"; do
+    # 中身を実行時に確かめられるのは既定のロール（roles/…）だけなので、それ以外は自分のカスタムロールに限る。
+    if [[ "$role" != roles/* && "$role" != "projects/${project}/roles/${custom_role}" ]]; then
+      printf 'setup-dev-infra-viewer-gcp: 既定のロールでも devInfraViewer でもないロールが一覧にある: %s\n' "$role" >&2
+      bad=1
+    fi
     for f in "${forbidden_roles[@]}"; do
       if [[ "$role" == "$f" ]]; then
         printf 'setup-dev-infra-viewer-gcp: 付けないロールが一覧にある: %s\n' "$role" >&2
@@ -233,7 +280,7 @@ fi
 
 # --- 3. カスタムロール ---
 custom_title="dev infra viewer"
-custom_description="Read-only IAM, project and Artifact Registry metadata for the dev distro (no downloads)"
+custom_description="Read-only Compute, IAM, project and Artifact Registry metadata for the dev distro (no serial port, screenshots or downloads)"
 custom_list="$(join_by_comma "${custom_permissions[@]}")"
 section "カスタムロール projects/${project}/roles/${custom_role}（${custom_title}）"
 for perm in "${custom_permissions[@]}"; do info "$perm"; done
@@ -259,11 +306,12 @@ for role in "${l0_roles[@]}"; do
 done
 # 一覧にない付与（一覧から消したロール・手で足したロール）は外す。
 section "一覧にない付与（外す）"
+# filter の「:」は部分一致で deleted:serviceAccount:… などにも当たるので、member が完全に同じ行だけを使う。
 if bound="$(read_gcloud projects get-iam-policy "$project" --flatten='bindings[].members' \
-  --filter="bindings.members:${member}" --format='value(bindings.role)')"; then
+  --filter="bindings.members:${member}" --format='value(bindings.role,bindings.members)')"; then
   stale=0
-  while IFS= read -r role; do
-    [[ -n "$role" ]] || continue
+  while IFS=$'\t' read -r role bound_member; do
+    [[ -n "$role" && "$bound_member" == "$member" ]] || continue
     keep=0
     for wanted in "${l0_roles[@]}"; do [[ "$role" == "$wanted" ]] && keep=1; done
     ((keep)) && continue

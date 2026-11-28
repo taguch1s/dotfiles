@@ -67,7 +67,8 @@ run_setup() {
     case "$1" in
       script=*) script="${1#script=}" ;;
       role=dev) printf 'dev\n' >"$role_file" ;;
-      bound=*) printf '%s\n' "${1#bound=}" >>"$state/bound" ;;
+      bound=*,*) local b="${1#bound=}"; printf '%s\t%s\n' "${b%%,*}" "${b#*,}" >>"$state/bound" ;;
+      bound=*) printf '%s\tserviceAccount:%s\n' "${1#bound=}" "$sa" >>"$state/bound" ;;
       bad=*) printf '%s\n' "${1#bad=*:}" >>"$state/bad-$(cut -d: -f1 <<<"${1#bad=}")" ;;
       *) touch "$state/$1" ;;
     esac
@@ -87,12 +88,12 @@ out_has() { grep -qF -- "$1" <<<"$out"; }
 
 project=first-impression-490413
 sa=dev-infra-viewer@$project.iam.gserviceaccount.com
-roles=(roles/compute.viewer roles/run.viewer roles/cloudscheduler.viewer roles/cloudbuild.builds.viewer roles/monitoring.viewer
+roles=(roles/run.viewer roles/cloudscheduler.viewer roles/cloudbuild.builds.viewer roles/monitoring.viewer
   roles/logging.viewer roles/serviceusage.serviceUsageViewer roles/cloudquotas.viewer roles/secretmanager.viewer
   "projects/$project/roles/devInfraViewer")
 
 # 1. dry-run: 変更系を呼ばず、SA・ロール・鍵の場所・外す付与を表示する
-run_setup bound=roles/compute.viewer bound=roles/storage.objectViewer --
+run_setup bound=roles/run.viewer bound=roles/storage.objectViewer "bound=roles/editor,deleted:serviceAccount:$sa?uid=1" --
 check 'dry-run は成功する' test "$status" -eq 0
 check 'dry-run は変更系の gcloud を呼ばない' not_called "$mutating"
 check 'dry-run は鍵を作らない' test ! -e "$home/.config/dev-infra"
@@ -102,23 +103,25 @@ for role in "${roles[@]}"; do
   check "dry-run はロール $role を表示する" out_has "(dry-run) gcloud projects add-iam-policy-binding $project --member=serviceAccount:$sa --role=$role --condition=None --quiet --format=none"
 done
 check 'dry-run はカスタムロールの権限を表示する' out_has 'resourcemanager.projects.getIamPolicy'
-check 'dry-run は既定のロールの中身を確かめる' out_has 'roles/compute.viewer: 2 個の権限。付けない権限は入っていない'
+check 'dry-run は既定のロールの中身を確かめる' out_has 'roles/run.viewer: 2 個の権限。付けない権限は入っていない'
 check 'dry-run は一覧にない付与を外すと表示する' out_has "(dry-run) gcloud projects remove-iam-policy-binding $project --member=serviceAccount:$sa --role=roles/storage.objectViewer --all"
-check 'dry-run は一覧にある付与は外さない' bash -c '! grep -qF -- "remove-iam-policy-binding $2 --member=serviceAccount:$3 --role=roles/compute.viewer " <<<"$1"' _ "$out" "$project" "$sa"
+check 'dry-run は一覧にある付与は外さない' bash -c '! grep -qF -- "remove-iam-policy-binding $2 --member=serviceAccount:$3 --role=roles/run.viewer " <<<"$1"' _ "$out" "$project" "$sa"
+check 'dry-run は member が完全に同じでない付与（deleted:…）を外さない' bash -c '! grep -qF -- "--role=roles/editor" <<<"$1"' _ "$out"
 check 'dry-run は鍵の置き場所を表示する' out_has "$home/.config/dev-infra/gcp-viewer-key.json（0600"
 dry_out="$out"
 
 # 2. --apply（何もない状態）: dry-run で表示したものと同じ引数で呼ぶ
-run_setup binding-fail-once bound=roles/compute.viewer bound=roles/storage.objectViewer -- --apply
+run_setup binding-fail-once bound=roles/run.viewer bound=roles/storage.objectViewer -- --apply
 check '--apply は成功する' test "$status" -eq 0
 check 'SA を作る' called "^iam service-accounts create dev-infra-viewer --project $project "
-check 'カスタムロールを読み取りの権限だけで作る' called "^iam roles create devInfraViewer --project $project .*--permissions=resourcemanager.projects.get,resourcemanager.projects.getIamPolicy,iam.roles.get,"
+check 'カスタムロールを読み取りの権限だけで作る' called "^iam roles create devInfraViewer --project $project .*--permissions=compute.projects.get,compute.regions.get,.*,compute.instances.list,.*,resourcemanager.projects.getIamPolicy,iam.roles.get,"
+check 'カスタムロールにシリアルポート・スクリーンショット・guest attributes を入れない' not_called 'getSerialPortOutput|getScreenshot|getGuestAttributes'
 for role in "${roles[@]}"; do
   check "ロール $role を条件なしで付ける" called "^projects add-iam-policy-binding $project --member=serviceAccount:$sa --role=$role --condition=None --quiet --format=none\$"
 done
-check '付与の失敗（SA の伝わり待ち）をやり直す' test "$(grep -c 'roles/compute.viewer --condition=None' "$log")" -eq 2
+check '付与の失敗（SA の伝わり待ち）をやり直す' test "$(grep -c 'roles/run.viewer --condition=None' "$log")" -eq 2
 check '一覧にない付与を外す' called "^projects remove-iam-policy-binding $project --member=serviceAccount:$sa --role=roles/storage.objectViewer --all --quiet --format=none\$"
-check '一覧にある付与は外さない' not_called 'remove-iam-policy-binding .*--role=roles/compute.viewer '
+check '一覧にある付与は外さない' not_called 'remove-iam-policy-binding .*--role=roles/run.viewer '
 check '鍵を作る' called "^iam service-accounts keys create $home/.config/dev-infra/gcp-viewer-key.json.partial --iam-account=$sa --project $project\$"
 check '鍵は 0600' test "$(stat -c %a "$home/.config/dev-infra/gcp-viewer-key.json")" = 600
 check '鍵のディレクトリは 0700' test "$(stat -c %a "$home/.config/dev-infra")" = 700
@@ -126,7 +129,7 @@ check '鍵のディレクトリは 0700' test "$(stat -c %a "$home/.config/dev-i
 sed -n 's/^  (dry-run) //p' <<<"$dry_out" | sed "s#$fixture/case1/home#HOME#" >"$fixture/dry.txt"
 sed -n 's/^  +   //p' <<<"$out" | sed "s#$fixture/case$case_no/home#HOME#; s#gcp-viewer-key.json.partial#gcp-viewer-key.json#" \
   | awk '!seen[$0]++' >"$fixture/apply.txt"
-check 'dry-run の表示に変更系のコマンドがある（SA・ロール・付与 10 件・外す付与・鍵）' test "$(wc -l <"$fixture/dry.txt")" -eq 14
+check 'dry-run の表示に変更系のコマンドがある（SA・ロール・付与 9 件・外す付与・鍵）' test "$(wc -l <"$fixture/dry.txt")" -eq 13
 check 'dry-run の表示と --apply の呼び出しが同じ' diff "$fixture/dry.txt" "$fixture/apply.txt"
 
 # 3. --apply（すべてある状態）: 作り直さない。ロールの権限だけ定義にそろえる
@@ -134,7 +137,7 @@ run_setup sa role-devInfraViewer -- --apply
 mkdir -p "$home/.config/dev-infra"
 check '2 回目の --apply は成功する' test "$status" -eq 0
 check '既にあるものは作らない' not_called '^(iam service-accounts create|iam roles create)'
-check 'カスタムロールの権限を定義にそろえる' called "^iam roles update devInfraViewer --project $project .*--permissions=resourcemanager.projects.get,"
+check 'カスタムロールの権限を定義にそろえる' called "^iam roles update devInfraViewer --project $project .*--permissions=compute.projects.get,"
 check '外す付与がなければ外さない' not_called 'remove-iam-policy-binding'
 echo '{}' >"$home/.config/dev-infra/gcp-viewer-key.json"
 existing_home="$home"
@@ -149,20 +152,21 @@ check '鍵が既にあれば作らない' not_called '^iam service-accounts keys
 # 4. 既定のロールに付けない権限が入っている（Google がロールを広げた）: 付与せずに止める
 for perm in secretmanager.versions.access storage.objects.get iam.serviceAccountKeys.create iam.serviceAccounts.getAccessToken \
   iam.serviceAccounts.actAs logging.privateLogEntries.list compute.instances.delete compute.instances.create \
-  run.jobs.update compute.instances.setMetadata resourcemanager.projects.setIamPolicy; do
+  run.jobs.update compute.instances.setMetadata resourcemanager.projects.setIamPolicy compute.instances.getSerialPortOutput \
+  compute.instances.getScreenshot compute.instances.getGuestAttributes; do
   run_setup "bad=run.viewer:$perm" -- --apply
   check "既定のロールに $perm があれば --apply は止まる" test "$status" -ne 0
   check "既定のロールに $perm があれば変更系を呼ばない" not_called "$mutating"
   check "既定のロールに $perm があれば理由を表示する" out_has "roles/run.viewer: 付けない権限が入っている: $perm"
 done
-run_setup "bad=compute.viewer:logging.privateLogEntries.list" --
+run_setup "bad=logging.viewer:logging.privateLogEntries.list" --
 check '既定のロールに付けない権限があれば dry-run も止まる' test "$status" -ne 0
 run_setup roles-unreadable -- --apply
 check '既定のロールの中身を読めなければ --apply は止まる' test "$status" -ne 0
 check '既定のロールの中身を読めなければ変更系を呼ばない' not_called "$mutating"
 run_setup roles-unreadable policy-unreadable --
 check '読めなくても dry-run は止まらない' test "$status" -eq 0
-check '読めなければ確かめられないと表示する' out_has 'roles/compute.viewer: 中身を読めなかった（確かめられない）'
+check '読めなければ確かめられないと表示する' out_has 'roles/run.viewer: 中身を読めなかった（確かめられない）'
 check '今の付与を読めなければ確かめられないと表示する' out_has '今の付与を読めなかった（確かめられない）'
 
 # 5. スクリプトの一覧に付けない権限・ロールを入れると、gcloud を呼ぶ前に止まる
@@ -170,8 +174,9 @@ mutate_script() {  # mutate_script <名前> <sed の式>: 一覧を書き換え�
   sed "$2" "$setup" >"$fixture/$1.sh"
   printf '%s' "$fixture/$1.sh"
 }
-for role in roles/viewer roles/editor roles/owner roles/iam.securityReviewer roles/artifactregistry.reader; do
-  copy="$(mutate_script "role-${role//\//-}" "s#^  roles/compute.viewer\$#  roles/compute.viewer\\n  $role#")"
+for role in roles/viewer roles/editor roles/owner roles/iam.securityReviewer roles/artifactregistry.reader roles/compute.viewer \
+  projects/other-project/roles/wide organizations/1/roles/wide; do
+  copy="$(mutate_script "role-${role//\//-}" "s#^  roles/run.viewer\$#  roles/run.viewer\\n  $role#")"
   grep -qx "  $role" "$copy" || ng "写しに $role を入れられなかった"
   run_setup "script=$copy" --
   check "一覧に $role があれば止まる" test "$status" -ne 0
@@ -179,7 +184,8 @@ for role in roles/viewer roles/editor roles/owner roles/iam.securityReviewer rol
 done
 for perm in secretmanager.versions.access storage.objects.get iam.serviceAccountKeys.create iam.serviceAccounts.getAccessToken \
   iam.serviceAccounts.actAs logging.privateLogEntries.list compute.instances.create run.jobs.update compute.disks.delete \
-  compute.instances.setMetadata resourcemanager.projects.setIamPolicy iam.roles.undelete; do
+  compute.instances.setMetadata resourcemanager.projects.setIamPolicy iam.roles.undelete compute.instances.getSerialPortOutput \
+  compute.instances.getScreenshot compute.instances.getGuestAttributes; do
   copy="$(mutate_script "perm-$perm" "s#^  iam.roles.get\$#  iam.roles.get\\n  $perm#")"
   grep -qx "  $perm" "$copy" || ng "写しに $perm を入れられなかった"
   run_setup "script=$copy" --

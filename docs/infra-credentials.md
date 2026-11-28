@@ -33,7 +33,7 @@ dev: 適用後の状態を L0 で確かめる
 
 admin が要るのは `--apply` の 1 回だけです。`wsl/admin/setup-hc-remote-gcp.sh` と `wsl/admin/setup-dev-infra-viewer-gcp.sh` は、dev（`/etc/dotfiles-role` が `dev`）では dry-run だけが動き、`--apply` は gcloud を呼ぶ前に止まります。
 
-admin で `--apply` するスクリプトは dev のエージェントが書いたものです。ユーザーは admin で同じスクリプトの dry-run を実行し、表示された変更系のコマンド（`(dry-run) gcloud …` の行）を読んでから `--apply` します。`--apply` は、dry-run が表示したものと同じ引数で gcloud を呼びます（テストで確かめている）。
+admin で `--apply` するスクリプトは dev のエージェントが書いたものです。ユーザーは admin で同じスクリプトの dry-run を実行し、表示された変更系のコマンド（`(dry-run) gcloud …` の行）を読んでから `--apply` します。`--apply` は、dry-run が表示したものと同じ引数で gcloud を呼びます（`setup-dev-infra-viewer-gcp.sh` は `tests/test_setup_dev_infra_viewer_gcp.sh` で、表示と呼び出しが同じことを確かめている。`setup-hc-remote-gcp.sh` のテストは、dry-run が変更系を呼ばないことと dev で `--apply` が止まることだけを確かめている）。
 
 ## 採らない案
 
@@ -67,16 +67,15 @@ L0 は既定のロールを使うサービスごとに並べ、既定のロー�
 
 | ロール | 読めるもの | 確かめたこと |
 | --- | --- | --- |
-| `roles/compute.viewer` | VM・disk・firewall・network・quota など | 付けない権限なし。シリアルポートの出力（`compute.instances.getSerialPortOutput`）とスクリーンショットは入っていない。get・list 以外は `compute.advice.capacity`・`compute.instances.troubleshoot`・`compute.urlMaps.validate` など読み取りの確認だけ |
 | `roles/run.viewer` | Cloud Run のサービス・ジョブ・実行 | 付けない権限なし。`run.jobs.get`・`run.services.get` は設定の全体（環境変数の値を含む）を返す |
 | `roles/cloudscheduler.viewer` | Cloud Scheduler のジョブ | 付けない権限なし。`cloudscheduler.jobs.fullView` を含むので、ジョブの HTTP のヘッダ・本文まで読めるものとして扱う |
-| `roles/cloudbuild.builds.viewer` | Cloud Build のビルド | 付けない権限なし。ビルドの設定（substitutions・環境変数）を読める |
+| `roles/cloudbuild.builds.viewer` | Cloud Build のビルド | 付けない権限なし。ビルドの設定（substitutions・環境変数）を読める。`remotebuildexecution.blobs.get`（Remote Build Execution の保存物の読み取り）も入る。この project では Remote Build Execution を使っていない前提で残す（使い始めたら外すか見直す） |
 | `roles/monitoring.viewer` | 指標・アラート・ダッシュボード | 付けない権限なし |
 | `roles/logging.viewer` | ログ（データアクセスの監査ログを除く） | `logging.privateLogEntries.list` は入っていない。get・list 以外は `logging.queries.usePrivate`（保存したクエリを使う）だけ |
 | `roles/serviceusage.serviceUsageViewer` | 有効な API | 付けない権限なし |
 | `roles/cloudquotas.viewer` | quota と quota preference | 付けない権限なし |
 | `roles/secretmanager.viewer` | Secret の名前・設定（値は読めない） | `secretmanager.versions.access` は入っていない |
-| `projects/first-impression-490413/roles/devInfraViewer` | project の IAM ポリシー、IAM のロール・SA・鍵の一覧（鍵の中身は無い）、Artifact Registry の一覧（ダウンロードはできない） | 下の外したロールの代わり |
+| `projects/first-impression-490413/roles/devInfraViewer` | Compute Engine の VM・disk・snapshot・image・template・network・subnet・firewall・route・router・address・region（quota を含む）・zone・operation の get・list、project の IAM ポリシー、IAM のロール・SA・鍵の一覧（鍵の中身は無い）、Artifact Registry の一覧（ダウンロードはできない） | 下の外したロールの代わり。`setup-hc-remote-gcp.sh` の dry-run が読む `compute.instances.list`・`compute.firewalls.get`・`compute.regions.get`・`compute.projects.get` を含む |
 
 外したロール:
 
@@ -84,6 +83,7 @@ L0 は既定のロールを使うサービスごとに並べ、既定のロー�
 | --- | --- | --- |
 | `roles/iam.securityReviewer` | `logging.privateLogEntries.list`（データアクセスの監査ログ）を含む（2026-11-29 に公式ドキュメントで確認）。全サービスの list を含み、サービスが増えると広がる | `devInfraViewer` の `resourcemanager.projects.getIamPolicy`・`iam.roles.*`・`iam.serviceAccounts.get/list/getIamPolicy`・`iam.serviceAccountKeys.get/list` |
 | `roles/artifactregistry.reader` | `artifactregistry.repositories.downloadArtifacts`・`artifactregistry.files.download` でイメージ・パッケージの中身（データの本体）を取り出せる | `devInfraViewer` の `artifactregistry.{repositories,dockerimages,packages,versions,tags}.{get,list}` |
+| `roles/compute.viewer` | 公式ドキュメントの一覧に `compute.instances.getSerialPortOutput`（VM のシリアルポートの出力。起動ログに秘密が出ることがある）・`compute.instances.getScreenshot`・`compute.instances.getGuestAttributes` が載っているという読みがあり、確かめた結果が食い違ったので安全側に外した。全 compute の get・list を含み、サービスが増えると広がる | `devInfraViewer` の `compute.*.get`・`compute.*.list`（上の表） |
 
 ### 付けない権限
 
@@ -92,8 +92,10 @@ L0 は既定のロールを使うサービスごとに並べ、既定のロー�
 - 秘密の値・データの本体: `secretmanager.versions.access`、`storage.objects.get`、`artifactregistry.repositories.downloadArtifacts`、`artifactregistry.files.download`
 - 鍵・トークンの発行と SA のなりすまし: `iam.serviceAccountKeys.create`、`iam.serviceAccounts.getAccessToken`、`iam.serviceAccounts.getOpenIdToken`、`iam.serviceAccounts.signBlob`、`iam.serviceAccounts.signJwt`、`iam.serviceAccounts.implicitDelegation`、`iam.serviceAccounts.actAs`
 - データアクセスの監査ログ: `logging.privateLogEntries.list`
+- VM の中の出力: `compute.instances.getSerialPortOutput`、`compute.instances.getScreenshot`、`compute.instances.getGuestAttributes`
 - 変更系すべて: 最後の語が `create`・`update`・`delete`・`undelete`・`set` で始まる権限（`setIamPolicy`・`setMetadata` などを含む）
-- ロール: `roles/viewer`・`roles/editor`・`roles/owner`、上の外したロール
+- ロール: `roles/viewer`・`roles/editor`・`roles/owner`、上の外したロール。`l0_roles` に入れてよいのは既定のロール（`roles/…`、実行時に中身を確かめる）と `devInfraViewer` だけで、それ以外の `projects/…`・`organizations/…` のロールがあれば止まる
+- 一覧にない付与を外すときは、member が `serviceAccount:dev-infra-viewer@…` と完全に同じ付与だけを外す（`deleted:serviceAccount:…` などは触らない）
 
 ### ログを L0 に入れる（D-20261129-0124-2）
 
@@ -210,7 +212,6 @@ gcloud iam service-accounts keys disable "$(python3 -c 'import json,sys; print(j
 ### L0 を全部消す（admin）
 
 ```bash
-gcloud projects remove-iam-policy-binding first-impression-490413 --member=serviceAccount:dev-infra-viewer@first-impression-490413.iam.gserviceaccount.com --role=roles/compute.viewer --all
 gcloud projects remove-iam-policy-binding first-impression-490413 --member=serviceAccount:dev-infra-viewer@first-impression-490413.iam.gserviceaccount.com --role=roles/run.viewer --all
 gcloud projects remove-iam-policy-binding first-impression-490413 --member=serviceAccount:dev-infra-viewer@first-impression-490413.iam.gserviceaccount.com --role=roles/cloudscheduler.viewer --all
 gcloud projects remove-iam-policy-binding first-impression-490413 --member=serviceAccount:dev-infra-viewer@first-impression-490413.iam.gserviceaccount.com --role=roles/cloudbuild.builds.viewer --all
@@ -229,7 +230,7 @@ rm -rf ~/.config/dev-infra
 
 ## 実装時に確かめたこと・dev では確かめられないこと（2026-11-29）
 
-- 候補のロールの中身: 上の「L0 のロール」のとおり公式ドキュメントで確かめた。`roles/iam.securityReviewer` と `roles/artifactregistry.reader` は外した。
+- 候補のロールの中身: 上の「L0 のロール」のとおり公式ドキュメントで確かめた。`roles/iam.securityReviewer`・`roles/artifactregistry.reader`・`roles/compute.viewer` は外し、カスタムロール `devInfraViewer` に置き換えた。
 - L0 で読めるものに秘密が混ざっていないこと: dev には資格情報がなく実状態を読めないので、上の「`--apply` の前に admin で確かめること」に入れた。
 - 課金アカウントの読み取り: L0 は project の権限だけなので、dev での `setup-hc-remote-gcp.sh` の dry-run の budget の節は「確かめられない」になり、止まらない（`tests/test_setup_hc_remote_gcp.sh` で確かめている）。
 - admin での dry-run の表示をユーザーが確かめてから `--apply` する手順: 上の「L0 を用意する」の 1〜2 に書いた。
