@@ -263,14 +263,26 @@ run_setup billing currency=JPY budget-denied -- --apply
 check 'budget の失敗では止まらない' test "$status" -eq 0
 check 'budget を手で作る手順を表示する' out_has 'budget を作れない・確かめられないときは手で作ってください'
 
-# 6. dev では実行しない
+# 6. dev では --apply だけを拒否し、dry-run は動く（L0 の資格情報で今の状態を読む）
 case_no=$((case_no + 1))
 printf 'dev\n' >"$fixture/role-dev"
 log="$fixture/case$case_no.log"; : >"$log"
 status=0
 out="$(PATH="$fixture/bin:$PATH" FAKE_LOG="$log" FAKE_STATE="$fixture" DOTFILES_ROLE_FILE="$fixture/role-dev" bash "$setup" --apply 2>&1)" || status=$?
-check 'dev では止まる' test "$status" -ne 0
-check 'dev では gcloud を呼ばない' test ! -s "$log"
+check 'dev の --apply は止まる' test "$status" -ne 0
+check 'dev の --apply は gcloud を呼ばない' test ! -s "$log"
+check 'dev の --apply は admin で実行するよう表示する' out_has 'dev ディストリでは --apply しません'
+case_no=$((case_no + 1))
+mkdir -p "$fixture/case$case_no/home" "$fixture/case$case_no/state"
+log="$fixture/case$case_no.log"; : >"$log"
+status=0
+out="$(HOME="$fixture/case$case_no/home" PATH="$fixture/bin:$PATH" FAKE_LOG="$log" FAKE_STATE="$fixture/case$case_no/state" \
+  DOTFILES_ROLE_FILE="$fixture/role-dev" bash "$setup" 2>&1)" || status=$?
+check 'dev の dry-run は成功する' test "$status" -eq 0
+check 'dev の dry-run は今の状態を読む' called '^compute instances list'
+check 'dev の dry-run は変更系の gcloud を呼ばない' not_called "$mutating"
+check 'dev の dry-run は鍵を作らない' test ! -e "$fixture/case$case_no/home/.config/hc-remote"
+check 'dev の dry-run は budget を確かめられなくても止まらない' out_has 'budget を作れない・確かめられないときは手で作ってください'
 
 # 7. dev の境界の検査: ~/.config/gcloud にユーザー本人の資格情報があれば NG
 gcloud_lines() {  # gcloud_lines <HOME>: verify-dev-boundary.sh の gcloud の行だけを出す
@@ -308,12 +320,55 @@ printf '{"type": "authorized_user", "refresh_token": "x"}\n' >"$adc_home/.config
 lines="$(gcloud_lines "$adc_home")"
 check 'ユーザーの application default credentials があれば NG' grep -q '^NG .*application_default_credentials' <<<"$lines"
 
+viewer=dev-infra-viewer@$project.iam.gserviceaccount.com
 sa_home="$fixture/verify-sa"
-make_credentials_db "$sa_home/.config/gcloud" "$sa"
+make_credentials_db "$sa_home/.config/gcloud" "$viewer"
 make_credentials_db "$sa_home/.config/hc-remote/gcloud" "$sa"
+printf '{"type": "service_account", "client_email": "%s"}\n' "$viewer" >"$sa_home/.config/gcloud/application_default_credentials.json"
 lines="$(gcloud_lines "$sa_home")"
-check 'service account だけなら OK' grep -q '^OK .*gcloud' <<<"$lines"
-check 'service account だけなら NG を出さない' bash -c '! grep -q "^NG" <<<"$1"' _ "$lines"
+check '決めた SA だけなら OK（既定は dev-infra-viewer、hc-remote は hc-remote-runner）' \
+  test "$(grep -c '^OK .*決めた SA' <<<"$lines")" -eq 2
+check '決めた SA だけなら NG を出さない' bash -c '! grep -q "^NG" <<<"$1"' _ "$lines"
+
+swap_home="$fixture/verify-swap"
+make_credentials_db "$swap_home/.config/gcloud" "$sa"
+make_credentials_db "$swap_home/.config/hc-remote/gcloud" "$viewer"
+lines="$(gcloud_lines "$swap_home")"
+check '既定の gcloud に hc-remote-runner があれば NG' grep -q "^NG .*/.config/gcloud: $sa" <<<"$lines"
+check 'hc-remote の gcloud に dev-infra-viewer があれば NG' grep -q "^NG .*hc-remote/gcloud: $viewer" <<<"$lines"
+
+other_home="$fixture/verify-other-sa"
+make_credentials_db "$other_home/.config/gcloud" "$viewer" "deployer@$project.iam.gserviceaccount.com"
+lines="$(gcloud_lines "$other_home")"
+check '決めた SA 以外の SA があれば NG' grep -q "^NG .*決めた SA.*以外.*deployer@$project" <<<"$lines"
+
+other_adc_home="$fixture/verify-other-adc"
+mkdir -p "$other_adc_home/.config/gcloud"
+printf '{"type": "service_account", "client_email": "deployer@%s.iam.gserviceaccount.com"}\n' "$project" \
+  >"$other_adc_home/.config/gcloud/application_default_credentials.json"
+lines="$(gcloud_lines "$other_adc_home")"
+check '決めた SA 以外の SA の application default credentials があれば NG' grep -q "^NG .*deployer@$project" <<<"$lines"
+
+# 鍵の古さ: 90 日（DEV_KEY_MAX_AGE_DAYS で変えられる）より古ければ WARN。NG にはしない
+key_lines() {  # key_lines <HOME> [DEV_KEY_MAX_AGE_DAYS]: 鍵の行と NG の件数の行だけを出す
+  HOME="$1" DEV_KEY_MAX_AGE_DAYS="${2:-90}" bash "$verify" 2>&1 | grep -E '鍵|件の NG' || true
+}
+key_home="$fixture/verify-keys"
+mkdir -p "$key_home/.config/dev-infra" "$key_home/.config/hc-remote"
+echo '{}' >"$key_home/.config/dev-infra/gcp-viewer-key.json"
+echo '{}' >"$key_home/.config/hc-remote/gcp-key.json"
+touch -d '100 days ago' "$key_home/.config/dev-infra/gcp-viewer-key.json"
+touch -d '10 days ago' "$key_home/.config/hc-remote/gcp-key.json"
+lines="$(key_lines "$key_home")"
+check '90 日より古い鍵は WARN' grep -q '^WARN .*100 日前.*dev-infra/gcp-viewer-key.json' <<<"$lines"
+check '90 日以内の鍵は OK' grep -q '^OK .*10 日前.*hc-remote/gcp-key.json' <<<"$lines"
+check '古い鍵は NG にしない' bash -c '! grep -q "^NG.*鍵" <<<"$1"' _ "$lines"
+lines="$(key_lines "$key_home" 5)"
+check 'DEV_KEY_MAX_AGE_DAYS で日数を変えられる' grep -q '^WARN .*10 日前のもの（5 日より古い）.*hc-remote/gcp-key.json' <<<"$lines"
+# 終了コードは鍵の古さで変わらない: 鍵の有無だけが違う 2 つの HOME で同じ終了コードになる
+plain_status=0; HOME="$empty_home" bash "$verify" >/dev/null 2>&1 || plain_status=$?
+old_key_status=0; HOME="$key_home" DEV_KEY_MAX_AGE_DAYS=5 bash "$verify" >/dev/null 2>&1 || old_key_status=$?
+check '古い鍵で終了コードが変わらない' test "$plain_status" -eq "$old_key_status"
 
 hc_user_home="$fixture/verify-hc-user"
 make_credentials_db "$hc_user_home/.config/hc-remote/gcloud" user@example.com

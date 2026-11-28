@@ -269,6 +269,13 @@ mode = "manual"
 reason = "admin で SA と鍵を作り、dev へ渡す。手順は docs/hc-remote-gcp.md"
 
 [[config]]
+name = "dev の GCP 読み取り専用 service account の鍵（L0）"
+source = "wsl/admin/setup-dev-infra-viewer-gcp.sh"
+target = ".config/dev-infra/gcp-viewer-key.json"
+mode = "manual"
+reason = "admin で SA と鍵を作り、dev へ渡して既定の gcloud に登録する。手順は docs/infra-credentials.md"
+
+[[config]]
 name = "WSL (Windows)"
 source = "windows/.wslconfig"
 target = "%UserProfile%\\.wslconfig"

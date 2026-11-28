@@ -39,7 +39,7 @@ bash ~/dotfiles/wsl/admin/setup-hc-remote-gcp.sh --apply    # 実際に作る（
 - 何度実行しても同じ状態になります。既にあるものは作り直しません。カスタムロールの権限だけは、毎回スクリプトの定義にそろえます（`gcloud iam roles update`）。
 - 引数: `--project`・`--zone`・`--network`（既定 `default`）・`--key-dir`（既定 `~/.config/hc-remote`）・`--max-vcpus N`（既定 16）・`--budget-amount N`・`--no-budget`。
 - 順番: API → SA → ロール → 付与 → firewall → quota → 鍵 → budget。quota を下げられなかったときは、鍵を作らずに止まります（被害の上限がない鍵を作らない）。
-- dev（`/etc/dotfiles-role` が `dev`）では実行しません。
+- dev（`/etc/dotfiles-role` が `dev`）では `--apply` を拒否します（gcloud を呼ぶ前に止まる）。dry-run は dev でも動き、dev の既定の gcloud（L0 の読み取り専用 SA `dev-infra-viewer`）で今の状態を読みます。budget の節は課金アカウントを読めないので「確かめられない」になり、そのまま先へ進みます。dev に置く資格情報の層の考え方は [infra-credentials.md](infra-credentials.md)。
 
 ### 作るもの
 
@@ -210,7 +210,7 @@ gcloud config set compute/zone asia-northeast1-a
 gcloud config set core/disable_usage_reporting true
 ```
 
-hc-remote（#56）は、この `CLOUDSDK_CONFIG` を自分で指定して gcloud を呼びます。シェルの既定の `~/.config/gcloud` には何も入れません。
+hc-remote（#56）は、この `CLOUDSDK_CONFIG` を自分で指定して gcloud を呼びます。シェルの既定の `~/.config/gcloud` には `hc-remote-runner` を入れません。既定の設定は L0 の読み取り専用 SA `dev-infra-viewer` だけに使います（[infra-credentials.md](infra-credentials.md) の「L0 を用意する」）。
 
 ### 3. dev の `~/.config/gcloud` からユーザー本人の資格情報を消す（dev）
 
@@ -220,7 +220,7 @@ dev は admin の複製なので、admin のユーザー本人の gcloud の資�
 rm -rf ~/.config/gcloud
 ```
 
-`wsl/dev/verify-dev-boundary.sh` は、`~/.config/gcloud` と `~/.config/hc-remote/gcloud` に service account 以外のアカウントの資格情報（`credentials.db`・`access_tokens.db`・`legacy_credentials/`・ユーザーの `application_default_credentials.json`）があれば NG にします。
+`wsl/dev/verify-dev-boundary.sh` は、`~/.config/gcloud` と `~/.config/hc-remote/gcloud` に service account 以外のアカウントの資格情報（`credentials.db`・`access_tokens.db`・`legacy_credentials/`・ユーザーの `application_default_credentials.json`）があれば NG にします。service account も設定ごとに 1 つに決めていて、`~/.config/gcloud` は `dev-infra-viewer`、`~/.config/hc-remote/gcloud` は `hc-remote-runner` 以外があれば NG にします。鍵（`~/.config/hc-remote/gcp-key.json`）が 90 日より古ければ `WARN` を出します（NG にはしない。[infra-credentials.md](infra-credentials.md) の「鍵の作り直し・無効化」）。
 
 ### 4. 疎通を確かめる（dev）
 
