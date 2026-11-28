@@ -1,34 +1,54 @@
-# dev に置く資格情報を被害の上限で層に分ける（Issue #63）
+# dev の資格情報は、権限を絞った service account を認証しておく（Issue #63・#65）
 
-dev ディストリ（エージェントの境界、[wsl-dev-distro.md](wsl-dev-distro.md)）の中から、インフラ（まず GCP）の実際の状態を確かめながら実装できるようにするための決まりです。ユーザー本人の資格情報を dev に置かない方針は変えず、dev に置く資格情報を「漏れた・悪用されたときの被害の上限」で層に分け、層ごとに置き場所と使い方を決めます。
+dev ディストリ（エージェントの境界、[wsl-dev-distro.md](wsl-dev-distro.md)）の中から、インフラ（まず GCP）の実際の状態を確かめながら実装できるようにするための決まりです。
 
-## 原則
+## 決まり
 
-1. dev にあるものは、エージェントが使え、外へ持ち出せる前提で扱う（dev の egress は無制限。#26）。dev に置いてよいのは、被害の上限を事前に固定できる資格情報だけ。
-2. ユーザー本人の資格情報と、権限を広げられる操作（IAM、SA の鍵、firewall、quota、課金、秘密の値）は admin から出さない。
-3. 確認は dev で、変更の実行だけを admin で行う。admin で動かすのは、dry-run が変更系のコマンドをすべて表示するスクリプトだけにする。
+> dev にはユーザー本人の資格情報を置かない。dev で使う認証は、権限を絞った service account（SA）を先に認証しておく。SA の権限が、そのまま被害の上限になる。
 
-## 4 つの層
+理由: dev にあるものは、エージェントが使え、外へ持ち出せます（dev の egress は無制限。#26）。だから、鍵を隠すかどうかではなく、その主体に何の権限があるかだけが効きます。dev に置いてよいのは、被害の上限を事前に固定できる資格情報だけです。例外は、下の「dev にある資格情報の棚卸し」で「受け入れたリスク」としたものです。
 
-| 層 | できること | 主体 | 置き場所 | 被害の上限 |
-| --- | --- | --- | --- | --- |
-| L0 読み取り | 構成・状態・ログの読み取り。秘密の値とデータの本体は含めない | 専用の SA `dev-infra-viewer` | dev の既定の gcloud（`~/.config/gcloud`）。鍵は `~/.config/dev-infra/gcp-viewer-key.json` | 読めるもの = 漏れてよいもの、に絞る。変更は一切できない |
-| L1 限定された書き込み | 名前・ラベルで絞った資源の作成・削除 | 用途ごとの SA（今は `hc-remote-runner` だけ） | dev の用途専用の `CLOUDSDK_CONFIG`（例: `~/.config/hc-remote/gcloud`） | IAM 条件 + quota + budget（[hc-remote-gcp.md](hc-remote-gcp.md) の形） |
-| L2 開発用の資源への広い書き込み | 種類を問わない作成・削除 | 開発用の project に閉じた SA | dev | project の境界 + budget + quota |
-| L3 本番・共有の変更 | IAM、SA の鍵、firewall、quota、課金、秘密の値、本番のデプロイ | ユーザー本人 | admin だけ | dev に置かない |
+### dev で使える主体
 
-- **L0** が「読むだけのために admin が要る」不便をなくす層です。作り方は下の「L0 のロール」と「L0 を用意する」。
-- **L1** の SA は資源 1 つごとではなく用途ごとに 1 つ作ります（例: hc-remote の VM・disk の操作に `hc-remote-runner`）。1 つの用途は、名前・ラベルの条件で絞れる資源のまとまりと、その被害の上限（IAM 条件 + quota + budget）の組です。新しい用途が出たら、その用途の SA・条件・専用の `CLOUDSDK_CONFIG` を足します。
-- **L2** は今は無い。開発用の project が無いため使わない。必要になったら別の Issue で決める（2026-11-29 のユーザーの決定、D-20261129-0124）。
-- **L3** は admin（`Ubuntu-24.04`）のユーザー本人の gcloud だけです。
+GCP の主体です。ほかのサービスは下の「dev にある資格情報の棚卸し」にあります。
+
+| 主体 | 置き場所 | できること |
+| --- | --- | --- |
+| `dev-infra-viewer` | dev の既定の gcloud（`~/.config/gcloud`）。鍵は `~/.config/dev-infra/gcp-viewer-key.json` | 構成・状態・ログの読み取り。秘密の値とデータの本体は含めず、変更は一切できない |
+| `hc-remote-runner` | `~/.config/hc-remote/gcloud`（鍵は `~/.config/hc-remote/gcp-key.json`） | `hc-remote-*` の VM・disk の操作。IAM 条件 + quota + budget で上限を固定する（[hc-remote-gcp.md](hc-remote-gcp.md)） |
+| ユーザー本人 | admin（`Ubuntu-24.04`）だけ | IAM、SA の鍵、firewall、quota、課金、秘密の値、本番のデプロイ |
+
+### git の認証は dev に通しているのに、なぜ GCP の本人の資格情報は置かないのか
+
+違いは原則ではなく、被害の大きさです。`gh` のトークンがないと、エージェントは push・PR ができません。被害は履歴から戻せて、ruleset と hook で歯止めがあります。GCP の本人の資格情報は project の所有者の権限で、課金・秘密の値・IAM に歯止めがありません。
+
+## 権限を足すとき
+
+読み取りと書き込みで手順が違います。どちらも、足す前に「漏れたときに何が起こせるか」をこの文書に書きます。
+
+### 読み取りを足す
+
+1. 漏れたときに何が起こせるか（何が読めるようになるか）を、下の「読み取り専用 SA のロール」の表に書く。
+2. `wsl/admin/setup-dev-infra-viewer-gcp.sh` のロールの一覧 `viewer_roles` に 1 行を足す。既定のロールが広すぎるときは、カスタムロールの一覧 `custom_permissions` に読み取りの権限を足す。
+3. 下の「実装の流れ」のとおり、admin で `--apply` して dev で確かめる。
+
+### 書き込みを足す
+
+`dev-infra-viewer` には書き込みを足しません。名前・ラベルで絞れる用途ごとに SA を分けます（`hc-remote-runner` の形）。1 つの用途は、名前・ラベルの条件で絞れる資源のまとまりと、その被害の上限の組です。
+
+1. 漏れたときに何が起こせるかと、その上限（IAM 条件 + quota + budget）を文書に書く。
+2. その用途の SA・IAM 条件・quota・budget を、dry-run が変更系のコマンドをすべて表示するスクリプトで作る（「実装の流れ」のとおり admin で `--apply`）。
+3. dev には用途専用の `CLOUDSDK_CONFIG` に認証し、`wsl/dev/verify-dev-boundary.sh` の「設定ごとにあってよい SA」に足す。
 
 ## 実装の流れ
 
+確認は dev で、変更の実行だけを admin で行います。admin で動かすのは、dry-run が変更系のコマンドをすべて表示するスクリプトだけにします。
+
 ```
 dev: スクリプトを書く
-dev: dry-run（L0 で今の状態を読み、作るもの・変わるものを表示）
+dev: dry-run（読み取り専用 SA で今の状態を読み、作るもの・変わるものを表示）
 admin: ユーザーが dry-run の表示を確かめて --apply（終わったら admin を止める）
-dev: 適用後の状態を L0 で確かめる
+dev: 適用後の状態を読み取り専用 SA で確かめる
 ```
 
 admin が要るのは `--apply` の 1 回だけです。`wsl/admin/setup-hc-remote-gcp.sh` と `wsl/admin/setup-dev-infra-viewer-gcp.sh` は、dev（`/etc/dotfiles-role` が `dev`）では dry-run だけが動き、`--apply` は gcloud を呼ぶ前に止まります。
@@ -40,28 +60,30 @@ admin で `--apply` するスクリプトは dev のエージェントが書い�
 | 案 | 採らない理由 |
 | --- | --- |
 | ユーザー本人の資格情報を dev に置く | 被害の上限がなくなる（project の所有者の権限、課金、秘密の値） |
+| 鍵のファイルは読ませず、CLI だけ使わせる | dev では成り立たない。hc のエージェントは sandbox なしで同じユーザーとして動くので、CLI が読めるファイルは読める。隠せたとしても、エージェントは CLI を通してその権限をすべて使える |
 | admin に常駐の中継サービスを置く | admin を起動し続けるためメモリを食う。dev から届く localhost のサービスに独自の認可が要り、作るものが大きい。「中継」は、ユーザーが admin で `--apply` することで足りる |
 | admin が短命のトークン（1 時間）を作って dev に渡す | 1 時間ごとに admin の起動と手作業が要る。組織がないので有効時間も延ばせない |
 | `hc-remote-runner` に読み取りを足して兼用する | 用途の違う権限が 1 つの鍵に混ざり、鍵の無効化も監査も分けられなくなる |
 | `roles/viewer` を付ける | 全サービスの読み取りが入り、サービスが増えるたびに勝手に広がるので、上限を固定できない |
+| 開発用の project に閉じた SA に、広い書き込みを持たせる | 開発用の project は作らない。必要になったら別の Issue で決める（2026-11-29 のユーザーの決定、D-20261129-0124） |
 
 ## dev にある資格情報の棚卸し（2026-11-29）
 
-| 資格情報 | 置き場所（dev） | 層 | 被害の上限 | 無効化 |
+| 資格情報 | 置き場所（dev） | 扱い | 被害の上限 | 無効化 |
 | --- | --- | --- | --- | --- |
-| GCP `dev-infra-viewer` | `~/.config/dev-infra/gcp-viewer-key.json`、既定の `~/.config/gcloud` | L0 | 下の「L0 のロール」の読み取りだけ。秘密の値・Cloud Storage のデータ・データアクセスの監査ログは読めない | 下の「鍵の作り直し・無効化」 |
-| GCP `hc-remote-runner` | `~/.config/hc-remote/gcp-key.json`、`~/.config/hc-remote/gcloud` | L1 | `hc-remote-*` の VM・disk だけ、quota・budget（[hc-remote-gcp.md](hc-remote-gcp.md) の「被害の上限」） | [hc-remote-gcp.md](hc-remote-gcp.md) の「鍵の作り直し・無効化」 |
-| GCP のユーザー本人 | 置かない（admin だけ） | L3 | — | `verify-dev-boundary.sh` が見つけたら NG |
-| GitHub（`gh` のトークン） | `~/.config/gh` | 層の外（#26 で受け入れたリスク。スコープは限定していない） | トークンのスコープ（ユーザーのリポジトリへの書き込みを含む） | GitHub の Settings の「Applications」→「Authorized OAuth Apps」で GitHub CLI を取り消し、dev で `gh auth logout` |
-| Modal のトークン | `~/.modal.toml` | 層の外（ワークスペース全体。L1 のように資源を絞れない） | Modal のワークスペースの使用額（無料枠と hc-remote の記録上の予算。[hc-remote.md](hc-remote.md)）。Modal の Secret を関数に渡して読める | Modal の Settings の「API Tokens」で取り消す |
-| Claude の認証 | `~/.claude` | 層の外（エージェントそのものの認証） | アカウントの使用量 | claude.ai の設定でセッションを取り消し、dev で `/login` し直す |
-| AWS | なし（`~/.aws` に資格情報はない） | — | — | — |
+| GCP `dev-infra-viewer` | `~/.config/dev-infra/gcp-viewer-key.json`、既定の `~/.config/gcloud` | 権限を絞った SA | 下の「読み取り専用 SA のロール」の読み取りだけ。秘密の値・Cloud Storage のデータ・データアクセスの監査ログは読めない | 下の「鍵の作り直し・無効化」 |
+| GCP `hc-remote-runner` | `~/.config/hc-remote/gcp-key.json`、`~/.config/hc-remote/gcloud` | 権限を絞った SA | `hc-remote-*` の VM・disk だけ、quota・budget（[hc-remote-gcp.md](hc-remote-gcp.md) の「被害の上限」） | [hc-remote-gcp.md](hc-remote-gcp.md) の「鍵の作り直し・無効化」 |
+| GCP のユーザー本人 | 置かない（admin だけ） | 置かない | — | `verify-dev-boundary.sh` が見つけたら NG |
+| GitHub（`gh` のトークン） | `~/.config/gh` | 受け入れたリスク（#26。スコープは限定していない） | トークンのスコープ（ユーザーのリポジトリへの書き込みを含む） | GitHub の Settings の「Applications」→「Authorized OAuth Apps」で GitHub CLI を取り消し、dev で `gh auth logout` |
+| Modal のトークン | `~/.modal.toml` | 受け入れたリスク（ワークスペース全体で、資源を絞れない） | Modal のワークスペースの使用額（無料枠と hc-remote の記録上の予算。[hc-remote.md](hc-remote.md)）。Modal の Secret を関数に渡して読める | Modal の Settings の「API Tokens」で取り消す |
+| Claude の認証 | `~/.claude` | 受け入れたリスク（エージェントそのものの認証） | アカウントの使用量 | claude.ai の設定でセッションを取り消し、dev で `/login` し直す |
+| AWS | なし（`~/.aws` に資格情報はない） | 置かない | — | — |
 
-この Issue では GCP の L0 を足すだけで、GitHub・Modal・Claude・AWS の資格情報やスコープは変えません。
+#63 で足したのは GCP の `dev-infra-viewer` だけで、GitHub・Modal・Claude・AWS の資格情報やスコープは変えていません。
 
-## L0 のロール
+## 読み取り専用 SA のロール
 
-L0 は既定のロールを使うサービスごとに並べ、既定のロールが広すぎるものはカスタムロール `devInfraViewer` に読み取りだけを並べます。一覧は `wsl/admin/setup-dev-infra-viewer-gcp.sh` の `l0_roles` の 1 か所だけです。ロールを外すときは、その 1 行を消して admin で `--apply` します。`--apply` は、一覧にない付与（消したロール・手で足したロール）を `gcloud projects remove-iam-policy-binding … --all` で外します（dry-run にも表示される）。
+`dev-infra-viewer` には、既定のロールを使うサービスごとに並べ、既定のロールが広すぎるものはカスタムロール `devInfraViewer` に読み取りだけを並べます。一覧は `wsl/admin/setup-dev-infra-viewer-gcp.sh` の `viewer_roles` の 1 か所だけです。ロールを外すときは、その 1 行を消して admin で `--apply` します。`--apply` は、一覧にない付与（消したロール・手で足したロール）を `gcloud projects remove-iam-policy-binding … --all` で外します（dry-run にも表示される）。
 
 各ロールの中身は、2026-11-29 に公式ドキュメント（`https://docs.cloud.google.com/iam/docs/roles-permissions/<サービス>`、例: `…/roles-permissions/compute`）のロールの一覧で確かめました。スクリプトは毎回、既定のロールの中身を `gcloud iam roles describe` で読み、付けない権限が入っていれば付与せずに止まります（Google がロールを広げたときに気づくため）。
 
@@ -94,18 +116,18 @@ L0 は既定のロールを使うサービスごとに並べ、既定のロー�
 - データアクセスの監査ログ: `logging.privateLogEntries.list`
 - VM の中の出力: `compute.instances.getSerialPortOutput`、`compute.instances.getScreenshot`、`compute.instances.getGuestAttributes`
 - 変更系すべて: 最後の語が `create`・`update`・`delete`・`undelete`・`set` で始まる権限（`setIamPolicy`・`setMetadata` などを含む）
-- ロール: `roles/viewer`・`roles/editor`・`roles/owner`、上の外したロール。`l0_roles` に入れてよいのは既定のロール（`roles/…`、実行時に中身を確かめる）と `devInfraViewer` だけで、それ以外の `projects/…`・`organizations/…` のロールがあれば止まる
+- ロール: `roles/viewer`・`roles/editor`・`roles/owner`、上の外したロール。`viewer_roles` に入れてよいのは既定のロール（`roles/…`、実行時に中身を確かめる）と `devInfraViewer` だけで、それ以外の `projects/…`・`organizations/…` のロールがあれば止まる
 - 一覧にない付与を外すときは、member が `serviceAccount:dev-infra-viewer@…` と完全に同じ付与だけを外す（`deleted:serviceAccount:…` などは触らない）
 
-### ログを L0 に入れる（D-20261129-0124-2）
+### ログを読み取り専用 SA に含める（D-20261129-0124-2）
 
-`roles/logging.viewer` は L0 に入れます。確認の役に最も立つためです。そのかわり、ログの本文は dev から持ち出せるようになるので、`--apply` の前に、本番の処理が秘密の値をログに出していないことを admin で確かめます（下の「`--apply` の前に admin で確かめること」）。出していたら、`l0_roles` から `roles/logging.viewer` の 1 行を消してから `--apply` します。
+`roles/logging.viewer` は読み取り専用 SA に含めます。確認の役に最も立つためです。そのかわり、ログの本文は dev から持ち出せるようになるので、`--apply` の前に、本番の処理が秘密の値をログに出していないことを admin で確かめます（下の「`--apply` の前に admin で確かめること」）。出していたら、`viewer_roles` から `roles/logging.viewer` の 1 行を消してから `--apply` します。
 
 ### Cloud Storage のデータ（D-20261129-0124-3）
 
-未決。必要になったら別の Issue で、秘密でないデータのバケットに限って決める。L0 には `storage.objects.get` を入れないので、dev から `gcloud storage cp`・`rsync` でデータを取り込めません。
+未決。必要になったら別の Issue で、秘密でないデータのバケットに限って決める。読み取り専用 SA には `storage.objects.get` を入れないので、dev から `gcloud storage cp`・`rsync` でデータを取り込めません。
 
-## L0 を用意する（ユーザーが行う）
+## dev の読み取り専用 SA を用意する（ユーザーが行う）
 
 Issue #63 の実装の後、main に入ってから行います。admin のコマンドは admin（`Ubuntu-24.04`）の端末で、dev のコマンドは dev の端末で、上から 1 行ずつ実行します。
 
@@ -126,7 +148,7 @@ bash ~/dotfiles/wsl/admin/setup-dev-infra-viewer-gcp.sh
 - Cloud Run の `env`: 秘密の値が `value:` に直書きされておらず、`valueFrom.secretKeyRef`（Secret Manager の参照）になっていること。
 - Cloud Scheduler の `headers`・`body`、Cloud Build の `substitutions`・`env`: 秘密の値が直書きされていないこと。Cloud Scheduler のジョブが `asia-northeast1` 以外にあるときは、`--location` をその region にして実行します（`gcloud scheduler locations list --project=first-impression-490413` で一覧）。
 - 最後の dry-run: 表示が「付けない権限は入っていない」になっていて、`(dry-run) gcloud …` の行が SA の作成・カスタムロールの作成（または update）・上の表の 9 件の `add-iam-policy-binding`・鍵の作成だけであること。`remove-iam-policy-binding` があれば、外してよい付与かを確かめます。
-- 秘密が混ざっていたら `--apply` せず、混ざっていたロール（多くは `roles/logging.viewer`・`roles/run.viewer`・`roles/cloudscheduler.viewer`・`roles/cloudbuild.builds.viewer`）を `l0_roles` から外す Issue を作ります。VM の metadata（`startup-script`）は既に `hc-remote-runner` から読めます（[hc-remote-gcp.md](hc-remote-gcp.md) の「残る露出」）。
+- 秘密が混ざっていたら `--apply` せず、混ざっていたロール（多くは `roles/logging.viewer`・`roles/run.viewer`・`roles/cloudscheduler.viewer`・`roles/cloudbuild.builds.viewer`）を `viewer_roles` から外す Issue を作ります。VM の metadata（`startup-script`）は既に `hc-remote-runner` から読めます（[hc-remote-gcp.md](hc-remote-gcp.md) の「残る露出」）。
 
 ### 2. `--apply`（admin）
 
@@ -152,7 +174,7 @@ gcloud config set core/disable_usage_reporting true
 bash /home/issei/dotfiles-main/wsl/dev/verify-dev-boundary.sh
 ```
 
-環境変数を付けない `gcloud …` が L0 で動きます。hc-remote は自分の `CLOUDSDK_CONFIG=~/.config/hc-remote/gcloud` を指定して gcloud を呼ぶので、影響を受けません。
+環境変数を付けない `gcloud …` が読み取り専用 SA で動きます。hc-remote は自分の `CLOUDSDK_CONFIG=~/.config/hc-remote/gcloud` を指定して gcloud を呼ぶので、影響を受けません。
 
 ### 5. dev で確かめる（dev）
 
@@ -167,7 +189,7 @@ bash /home/issei/dotfiles-main/wsl/admin/setup-dev-infra-viewer-gcp.sh
 
 - 1〜4 行目が成功すること。`gcloud run jobs list` が region を聞いてきたら、`gcloud run jobs list --region=asia-northeast1` で実行し直します。`gcloud scheduler jobs list` の `--location` は上の 1. と同じ region にします。
 - 5 行目（hc-remote の dry-run）が、今ある SA・ロール・firewall・quota の状態を表示すること。budget の節は課金アカウントを読めないため「確かめられない」になり、それで止まらないのが期待どおりです。
-- 6 行目（L0 の dry-run）が「付けない権限は入っていない」と表示し、`(dry-run) gcloud …` の行に `add-iam-policy-binding`（付与は既にあっても毎回表示する）とカスタムロールの `update` だけが出ること。
+- 6 行目（読み取り専用 SA の dry-run）が「付けない権限は入っていない」と表示し、`(dry-run) gcloud …` の行に `add-iam-policy-binding`（付与は既にあっても毎回表示する）とカスタムロールの `update` だけが出ること。
 - 秘密の値の読み取り（`gcloud secrets versions access` など）を dev で試さないでください。権限が誤って通っていたときに、値が dev に出てしまいます。「できないこと」は次の 6. で admin から確かめます。
 
 ### 6. できないことを確かめる（admin、Policy Troubleshooter）
@@ -181,13 +203,13 @@ gcloud policy-intelligence troubleshoot-policy iam //cloudresourcemanager.google
 gcloud policy-intelligence troubleshoot-policy iam //cloudresourcemanager.googleapis.com/projects/first-impression-490413 --principal-email=dev-infra-viewer@first-impression-490413.iam.gserviceaccount.com --permission=compute.instances.list
 ```
 
-2〜5 行目が許可されず（`NOT_GRANTED`・`access: DENIED` など）、6 行目（比べるための読み取り）が許可されれば期待どおりです。L0 の付与はすべて project に対するものなので、project で確かめれば足ります（個別の Secret・VM に付与を足した場合は、その資源の名前で確かめ直します）。終わったら PowerShell で `wsl --terminate Ubuntu-24.04` で admin を止めます。
+2〜5 行目が許可されず（`NOT_GRANTED`・`access: DENIED` など）、6 行目（比べるための読み取り）が許可されれば期待どおりです。読み取り専用 SA の付与はすべて project に対するものなので、project で確かめれば足ります（個別の Secret・VM に付与を足した場合は、その資源の名前で確かめ直します）。終わったら PowerShell で `wsl --terminate Ubuntu-24.04` で admin を止めます。
 
 ## 鍵の作り直し・無効化
 
 組織に属さない project なので、SA の鍵の有効期限は強制できません。`verify-dev-boundary.sh` は、dev の `~/.config/dev-infra/gcp-viewer-key.json` と `~/.config/hc-remote/gcp-key.json` が 90 日より古いと `WARN` を出します（NG ではなく、終了コードも変わらない。D-20261129-0124-4）。日数はファイルの更新時刻（admin から渡した日）で数え、環境変数 `DEV_KEY_MAX_AGE_DAYS` で変えられます。
 
-### 作り直す（L0。admin で新しい鍵を作り、古い鍵を消す）
+### 作り直す（読み取り専用 SA。admin で新しい鍵を作り、古い鍵を消す）
 
 admin で上から実行します。
 
@@ -199,7 +221,7 @@ rm ~/.config/dev-infra/gcp-viewer-key.old.json
 gcloud iam service-accounts keys list --iam-account=dev-infra-viewer@first-impression-490413.iam.gserviceaccount.com --managed-by=user
 ```
 
-最後の行で、ユーザーが作った鍵が 1 つだけになっていることを確かめます。そのあと「L0 を用意する」の 3（PowerShell で鍵を渡し、admin を止める）と 4（dev で `activate-service-account`）をやり直します。hc-remote の鍵は [hc-remote-gcp.md](hc-remote-gcp.md) の「鍵の作り直し・無効化」です。
+最後の行で、ユーザーが作った鍵が 1 つだけになっていることを確かめます。そのあと「dev の読み取り専用 SA を用意する」の 3（PowerShell で鍵を渡し、admin を止める）と 4（dev で `activate-service-account`）をやり直します。hc-remote の鍵は [hc-remote-gcp.md](hc-remote-gcp.md) の「鍵の作り直し・無効化」です。
 
 ### すぐ止める（漏れたと思われるとき、admin）
 
@@ -209,7 +231,7 @@ gcloud iam service-accounts keys disable "$(python3 -c 'import json,sys; print(j
 
 `gcloud iam service-accounts keys enable` で戻せます。戻さないなら、上の「作り直す」を行います。
 
-### L0 を全部消す（admin）
+### 読み取り専用 SA を全部消す（admin）
 
 ```bash
 gcloud projects remove-iam-policy-binding first-impression-490413 --member=serviceAccount:dev-infra-viewer@first-impression-490413.iam.gserviceaccount.com --role=roles/run.viewer --all
@@ -230,7 +252,7 @@ rm -rf ~/.config/dev-infra
 
 ## 実装時に確かめたこと・dev では確かめられないこと（2026-11-29）
 
-- 候補のロールの中身: 上の「L0 のロール」のとおり公式ドキュメントで確かめた。`roles/iam.securityReviewer`・`roles/artifactregistry.reader`・`roles/compute.viewer` は外し、カスタムロール `devInfraViewer` に置き換えた。
-- L0 で読めるものに秘密が混ざっていないこと: dev には資格情報がなく実状態を読めないので、上の「`--apply` の前に admin で確かめること」に入れた。
-- 課金アカウントの読み取り: L0 は project の権限だけなので、dev での `setup-hc-remote-gcp.sh` の dry-run の budget の節は「確かめられない」になり、止まらない（`tests/test_setup_hc_remote_gcp.sh` で確かめている）。
-- admin での dry-run の表示をユーザーが確かめてから `--apply` する手順: 上の「L0 を用意する」の 1〜2 に書いた。
+- 候補のロールの中身: 上の「読み取り専用 SA のロール」のとおり公式ドキュメントで確かめた。`roles/iam.securityReviewer`・`roles/artifactregistry.reader`・`roles/compute.viewer` は外し、カスタムロール `devInfraViewer` に置き換えた。
+- 読み取り専用 SA で読めるものに秘密が混ざっていないこと: dev には資格情報がなく実状態を読めないので、上の「`--apply` の前に admin で確かめること」に入れた。
+- 課金アカウントの読み取り: 読み取り専用 SA は project の権限だけなので、dev での `setup-hc-remote-gcp.sh` の dry-run の budget の節は「確かめられない」になり、止まらない（`tests/test_setup_hc_remote_gcp.sh` で確かめている）。
+- admin での dry-run の表示をユーザーが確かめてから `--apply` する手順: 上の「dev の読み取り専用 SA を用意する」の 1〜2 に書いた。

@@ -73,3 +73,7 @@ handoff = "issue-61.md"
 [[issue_branch]]
 branch = "feature/issue-63-infra-credentials"
 handoff = "issue-63.md"
+
+[[issue_branch]]
+branch = "feature/issue-65-credentials-one-rule"
+handoff = "issue-65.md"

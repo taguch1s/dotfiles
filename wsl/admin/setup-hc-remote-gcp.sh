@@ -60,7 +60,7 @@ done
 [[ "$zone" =~ ^[a-z]+-[a-z]+[0-9]+-[a-z]$ ]] || die "ゾーンの形が不正です: $zone"
 
 # 変更（--apply）は秘密情報の置き場（admin）でだけ行う。dev ではユーザーの gcloud の資格情報を使わない方針
-# （docs/wsl-dev-distro.md）。dev の dry-run は、既定の gcloud（L0 の dev-infra-viewer）で今の状態を読むだけ
+# （docs/wsl-dev-distro.md）。dev の dry-run は、既定の gcloud（読み取り専用の dev-infra-viewer）で今の状態を読むだけ
 # （docs/infra-credentials.md）。
 role_file="${DOTFILES_ROLE_FILE:-/etc/dotfiles-role}"
 if ((apply)) && [[ "$(cat "$role_file" 2>/dev/null)" == dev ]]; then
