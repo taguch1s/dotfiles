@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Claude Code hook: 直近リクエストの文脈が閾値を超えたら handoff を促す。
+"""Claude Code hook: 直近リクエストの文脈が閾値・上限を超えたら、区切り方を知らせる。
 
 UserPromptSubmit / PostToolUse で呼ばれ、stdin の JSON から transcript_path を読む。
 文脈サイズは、トランスクリプトの最後の assistant 行の usage の
 input + cache 作成 + cache 読み込み とする。
 
-- 閾値: 環境変数 CLAUDE_CTX_GUARD_TOKENS（既定 150000）を超えたら警告する
-- 再警告: 最後に警告した値から CLAUDE_CTX_GUARD_INTERVAL（既定 50000）増えるまで黙る
+- 閾値: 環境変数 CLAUDE_CTX_GUARD_TOKENS（既定 200000）を超えたら、進行中の作業単位を終え、
+  関連作業が続くときだけ handoff するよう警告する
+- 上限: 環境変数 CLAUDE_CTX_GUARD_LIMIT_TOKENS（既定 225000）を超えたら、残りの作業量に
+  かかわらず安全な区切りで handoff するよう警告する（閾値より小さい上限は、上限を閾値として扱う）
+- 再警告: 最後に警告した値から CLAUDE_CTX_GUARD_INTERVAL（既定 50000）増えるまで黙る。
+  ただし上限を初めて超えたときは、間隔を待たずに上限の警告を出す
 - 状態: CLAUDE_CTX_GUARD_STATE_DIR（既定 ${XDG_STATE_HOME:-~/.local/state}/claude-context-guard）
   にセッションごとのファイルで最後に警告した値を置く
 - 失敗しても exit 0 で何も出さない（hook がセッションを止めないように）
@@ -19,8 +23,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-DEFAULT_THRESHOLD = 150_000
+DEFAULT_THRESHOLD = 200_000
+DEFAULT_LIMIT = 225_000
 DEFAULT_INTERVAL = 50_000
+# 「関連作業が続く」の目安（Issue #61 の試算）。数える義務はない。
+CONTINUE_REQUESTS = 25
 SUPPORTED_EVENTS = {"UserPromptSubmit", "PostToolUse"}
 USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -115,21 +122,34 @@ def write_state(path, value):
         raise
 
 
-def decide(current, threshold, interval, last_warned):
-    """(警告するか, 保存する値) を返す。保存する値が None なら状態を消す。"""
-    if current <= threshold:
-        return False, None
-    if last_warned is None or current >= last_warned + interval:
-        return True, current
+def decide(current, threshold, interval, last_warned, limit=DEFAULT_LIMIT):
+    """(警告の種類, 保存する値) を返す。
+
+    警告の種類は "limit"（上限超え）、"threshold"（閾値超え）、None（警告しない）。
+    保存する値が None なら状態を消す。
+    """
+    if current <= min(threshold, limit):
+        return None, None
+    over_limit = current > limit
+    first_over_limit = over_limit and (last_warned is None or last_warned <= limit)
+    if last_warned is None or current >= last_warned + interval or first_over_limit:
+        return ("limit" if over_limit else "threshold"), current
     # /compact などで文脈が減ったら、その値から interval 増えたときに知らせる。
-    return False, min(current, last_warned)
+    return None, min(current, last_warned)
 
 
-def warning_text(current, threshold):
-    return (
-        f"[claude-context-guard] 直近リクエストの文脈が {current:,} トークンで、"
-        f"閾値 {threshold:,} を超えました。新しい作業単位を始めず、"
-        "進行中の操作を安全な区切りまで終えたら `/session-handoff` で handoff を保存してください。"
+def warning_text(current, threshold, limit=DEFAULT_LIMIT, level="threshold"):
+    head = f"[claude-context-guard] 直近リクエストの文脈が {current:,} トークンです（閾値 {threshold:,}、上限 {limit:,}）。"
+    if level == "limit":
+        return head + (
+            f"上限 {limit:,} を超えました。新しい作業単位を始めず、残りの作業量にかかわらず、"
+            "進行中の操作を安全な区切りまで終えたら `/session-handoff` で handoff を保存してください。"
+        )
+    return head + (
+        f"閾値 {threshold:,} を超えました。新しい作業単位を始めず、進行中の作業単位を終えてください。"
+        "終えた時点で関連作業が続くときだけ `/session-handoff` で handoff を保存し、"
+        "続かないなら handoff を書かずにそのまま終えてください"
+        f"（目安: 残りがおよそ {CONTINUE_REQUESTS} リクエスト以上続く見込みなら handoff。数える必要はありません）。"
     )
 
 
@@ -152,10 +172,11 @@ def run(stdin_text, env):
     if current is None:
         return ""
     threshold = positive_int(env, "CLAUDE_CTX_GUARD_TOKENS", DEFAULT_THRESHOLD)
+    limit = positive_int(env, "CLAUDE_CTX_GUARD_LIMIT_TOKENS", DEFAULT_LIMIT)
     interval = positive_int(env, "CLAUDE_CTX_GUARD_INTERVAL", DEFAULT_INTERVAL)
     path = state_dir(env) / session_id
     last_warned = read_state(path)
-    warn, new_state = decide(current, threshold, interval, last_warned)
+    level, new_state = decide(current, threshold, interval, last_warned, limit)
 
     if new_state is None:
         if last_warned is not None:
@@ -163,9 +184,10 @@ def run(stdin_text, env):
     elif new_state != last_warned:
         # 保存できないと毎回警告してしまうので、保存に失敗したら警告しない（例外で抜ける）。
         write_state(path, new_state)
-    if not warn:
+    if level is None:
         return ""
-    output = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": warning_text(current, threshold)}}
+    text = warning_text(current, threshold, limit, level)
+    output = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
     return json.dumps(output, ensure_ascii=False)
 
 

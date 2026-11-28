@@ -84,76 +84,124 @@ class GuardProcessTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
 
-    def assert_warning(self, result, event, tokens):
+    def assert_warning(self, result, event, tokens, level="threshold"):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stderr, "")
         output = json.loads(result.stdout)
         specific = output["hookSpecificOutput"]
         self.assertEqual(specific["hookEventName"], event)
-        self.assertIn(f"{tokens:,}", specific["additionalContext"])
-        self.assertIn("/session-handoff", specific["additionalContext"])
+        text = specific["additionalContext"]
+        self.assertIn(f"{tokens:,}", text)
+        self.assertIn("/session-handoff", text)
+        if level == "limit":
+            self.assertIn("残りの作業量にかかわらず", text)
+        else:
+            self.assertIn("進行中の作業単位を終え", text)
+            self.assertIn("関連作業が続くときだけ `/session-handoff`", text)
+            self.assertNotIn("残りの作業量にかかわらず", text)
+        return text
+
+    def test_defaults(self):
+        self.assertEqual(GUARD.DEFAULT_THRESHOLD, 200_000)
+        self.assertEqual(GUARD.DEFAULT_LIMIT, 225_000)
+        self.assertEqual(GUARD.DEFAULT_INTERVAL, 50_000)
 
     def test_below_threshold_is_silent(self):
-        self.write_context(149_999)
+        self.write_context(199_999)
         self.assert_silent(self.run_hook())
 
     def test_exactly_threshold_is_silent(self):
-        self.write_context(150_000)
+        self.write_context(200_000)
         self.assert_silent(self.run_hook())
 
     def test_over_threshold_warns_once(self):
-        self.write_context(150_001)
-        self.assert_warning(self.run_hook(), "UserPromptSubmit", 150_001)
+        self.write_context(200_001)
+        text = self.assert_warning(self.run_hook(), "UserPromptSubmit", 200_001)
+        self.assertIn("閾値 200,000", text)
+        self.assertIn("上限 225,000", text)
         self.assert_silent(self.run_hook())
 
     def test_rewarns_only_after_interval(self):
-        self.write_context(150_001)
-        self.assert_warning(self.run_hook(), "UserPromptSubmit", 150_001)
-        self.write_context(160_000)
-        self.assert_silent(self.run_hook(event="PostToolUse"))
-        self.write_context(200_000)
-        self.assert_silent(self.run_hook(event="PostToolUse"))
+        env = {"CLAUDE_CTX_GUARD_LIMIT_TOKENS": "900000"}
         self.write_context(200_001)
-        self.assert_warning(self.run_hook(event="PostToolUse"), "PostToolUse", 200_001)
+        self.assert_warning(self.run_hook(env=env), "UserPromptSubmit", 200_001)
+        self.write_context(210_000)
+        self.assert_silent(self.run_hook(event="PostToolUse", env=env))
+        self.write_context(250_000)
+        self.assert_silent(self.run_hook(event="PostToolUse", env=env))
+        self.write_context(250_001)
+        self.assert_warning(self.run_hook(event="PostToolUse", env=env), "PostToolUse", 250_001)
+        self.assert_silent(self.run_hook(event="PostToolUse", env=env))
+
+    def test_limit_warns_on_first_crossing_regardless_of_interval(self):
+        # 閾値の警告から 50k 増えていなくても、上限を超えた最初の 1 回は必ず上限の警告を出す。
+        self.write_context(220_000)
+        self.assert_warning(self.run_hook(), "UserPromptSubmit", 220_000)
+        self.write_context(225_000)
         self.assert_silent(self.run_hook(event="PostToolUse"))
+        self.write_context(225_001)
+        self.assert_warning(self.run_hook(event="PostToolUse"), "PostToolUse", 225_001, level="limit")
+        self.write_context(230_000)
+        self.assert_silent(self.run_hook(event="PostToolUse"))
+        self.write_context(275_001)
+        self.assert_warning(self.run_hook(event="PostToolUse"), "PostToolUse", 275_001, level="limit")
+
+    def test_first_warning_over_limit_is_limit_warning(self):
+        self.write_context(240_000)
+        self.assert_warning(self.run_hook(), "UserPromptSubmit", 240_000, level="limit")
+        self.assert_silent(self.run_hook())
+
+    def test_limit_below_threshold_acts_as_threshold(self):
+        env = {"CLAUDE_CTX_GUARD_TOKENS": "200000", "CLAUDE_CTX_GUARD_LIMIT_TOKENS": "150000"}
+        self.write_context(150_000)
+        self.assert_silent(self.run_hook(env=env))
+        self.write_context(150_001)
+        self.assert_warning(self.run_hook(env=env), "UserPromptSubmit", 150_001, level="limit")
 
     def test_sessions_are_tracked_separately(self):
-        self.write_context(150_001)
-        self.assert_warning(self.run_hook(session_id="session-a"), "UserPromptSubmit", 150_001)
-        self.assert_warning(self.run_hook(session_id="session-b"), "UserPromptSubmit", 150_001)
+        self.write_context(200_001)
+        self.assert_warning(self.run_hook(session_id="session-a"), "UserPromptSubmit", 200_001)
+        self.assert_warning(self.run_hook(session_id="session-b"), "UserPromptSubmit", 200_001)
 
     def test_drop_below_threshold_resets_state(self):
         # /compact などで文脈が閾値を下回ったら、次に超えたときにまた知らせる。
-        self.write_context(150_001)
-        self.assert_warning(self.run_hook(), "UserPromptSubmit", 150_001)
+        self.write_context(200_001)
+        self.assert_warning(self.run_hook(), "UserPromptSubmit", 200_001)
         self.write_context(40_000)
         self.assert_silent(self.run_hook())
-        self.write_context(150_002)
-        self.assert_warning(self.run_hook(), "UserPromptSubmit", 150_002)
+        self.write_context(200_002)
+        self.assert_warning(self.run_hook(), "UserPromptSubmit", 200_002)
 
     def test_drop_above_threshold_lowers_baseline(self):
-        self.write_context(300_000)
-        self.assert_warning(self.run_hook(), "UserPromptSubmit", 300_000)
-        self.write_context(180_000)
-        self.assert_silent(self.run_hook())
+        env = {"CLAUDE_CTX_GUARD_LIMIT_TOKENS": "900000"}
+        self.write_context(350_000)
+        self.assert_warning(self.run_hook(env=env), "UserPromptSubmit", 350_000)
         self.write_context(230_000)
-        self.assert_warning(self.run_hook(), "UserPromptSubmit", 230_000)
+        self.assert_silent(self.run_hook(env=env))
+        self.write_context(280_000)
+        self.assert_warning(self.run_hook(env=env), "UserPromptSubmit", 280_000)
 
-    def test_threshold_and_interval_can_be_overridden(self):
-        env = {"CLAUDE_CTX_GUARD_TOKENS": "1000", "CLAUDE_CTX_GUARD_INTERVAL": "10"}
+    def test_threshold_limit_and_interval_can_be_overridden(self):
+        env = {"CLAUDE_CTX_GUARD_TOKENS": "1000", "CLAUDE_CTX_GUARD_LIMIT_TOKENS": "2000",
+               "CLAUDE_CTX_GUARD_INTERVAL": "10"}
         self.write_context(1_001)
         self.assert_warning(self.run_hook(env=env), "UserPromptSubmit", 1_001)
         self.write_context(1_011)
         self.assert_warning(self.run_hook(env=env), "UserPromptSubmit", 1_011)
+        self.write_context(2_001)
+        self.assert_warning(self.run_hook(env=env), "UserPromptSubmit", 2_001, level="limit")
 
-    def test_invalid_threshold_falls_back_to_default(self):
-        self.write_context(149_999)
+    def test_invalid_threshold_and_limit_fall_back_to_default(self):
+        self.write_context(199_999)
         self.assert_silent(self.run_hook(env={"CLAUDE_CTX_GUARD_TOKENS": "abc"}))
         self.assert_silent(self.run_hook(env={"CLAUDE_CTX_GUARD_TOKENS": "-5"}))
+        self.assert_silent(self.run_hook(env={"CLAUDE_CTX_GUARD_LIMIT_TOKENS": "abc"}))
+        self.write_context(220_000)
+        self.assert_warning(self.run_hook(env={"CLAUDE_CTX_GUARD_LIMIT_TOKENS": "0"}), "UserPromptSubmit", 220_000)
 
     def test_uses_last_assistant_usage(self):
         self.write_transcript(
-            assistant_line(200_000),
+            assistant_line(300_000),
             json.dumps({"type": "user", "message": {"role": "user", "content": "tool result"}}),
             assistant_line(10, 0, 100_000),
             json.dumps({"type": "system", "content": "note"}),
@@ -162,21 +210,21 @@ class GuardProcessTest(unittest.TestCase):
 
     def test_skips_sidechain_and_zero_usage_entries(self):
         self.write_transcript(
-            assistant_line(1, 0, 170_000),
+            assistant_line(1, 0, 210_000),
             assistant_line(1, 0, 900_000, isSidechain=True),
             assistant_line(0, 0, 0),
         )
-        self.assert_warning(self.run_hook(), "UserPromptSubmit", 170_001)
+        self.assert_warning(self.run_hook(), "UserPromptSubmit", 210_001)
 
     def test_ignores_truncated_last_line(self):
-        self.transcript.write_text(assistant_line(1, 0, 170_000) + "\n" + '{"type": "assist', encoding="utf-8")
-        self.assert_warning(self.run_hook(), "UserPromptSubmit", 170_001)
+        self.transcript.write_text(assistant_line(1, 0, 210_000) + "\n" + '{"type": "assist', encoding="utf-8")
+        self.assert_warning(self.run_hook(), "UserPromptSubmit", 210_001)
 
     def test_reads_large_transcript_from_the_end(self):
         filler = json.dumps({"type": "user", "message": {"content": "x" * 1000}})
-        lines = [assistant_line(1, 0, 10)] + [filler] * 2000 + [assistant_line(1, 0, 170_000)]
+        lines = [assistant_line(1, 0, 10)] + [filler] * 2000 + [assistant_line(1, 0, 210_000)]
         self.write_transcript(*lines)
-        self.assert_warning(self.run_hook(), "UserPromptSubmit", 170_001)
+        self.assert_warning(self.run_hook(), "UserPromptSubmit", 210_001)
 
     def test_missing_transcript_is_silent(self):
         self.assert_silent(self.run_hook())
@@ -199,12 +247,12 @@ class GuardProcessTest(unittest.TestCase):
         self.assert_silent(self.run_hook(payload={"hook_event_name": "UserPromptSubmit"}))
 
     def test_unsupported_event_is_silent(self):
-        self.write_context(170_000)
+        self.write_context(210_000)
         self.assert_silent(self.run_hook(event="Stop"))
 
     def test_subagent_hook_is_silent(self):
         # サブエージェント内の PostToolUse では、親セッションの handoff を促さない。
-        self.write_context(170_000)
+        self.write_context(210_000)
         payload = {
             "session_id": "session-1",
             "transcript_path": str(self.transcript),
@@ -214,7 +262,7 @@ class GuardProcessTest(unittest.TestCase):
         self.assert_silent(self.run_hook(payload=payload))
 
     def test_unsafe_session_id_is_silent(self):
-        self.write_context(170_000)
+        self.write_context(210_000)
         self.assert_silent(self.run_hook(session_id="../escape"))
         self.assertFalse((self.state_dir.parent / "escape").exists())
 
@@ -222,7 +270,7 @@ class GuardProcessTest(unittest.TestCase):
         # 状態を保存できないと毎回警告してしまうので、警告しない。
         blocker = Path(self.directory.name) / "blocker"
         blocker.write_text("file", encoding="utf-8")
-        self.write_context(170_000)
+        self.write_context(210_000)
         self.assert_silent(self.run_hook(env={"CLAUDE_CTX_GUARD_STATE_DIR": str(blocker / "state")}))
 
 

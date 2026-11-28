@@ -639,6 +639,10 @@ class WasteCasesTest(unittest.TestCase):
 
 
 class WasteHelpersTest(unittest.TestCase):
+    def test_context_budget_default_matches_context_guard(self):
+        # hc の外（対話）の閾値と同じ値（claude-context-guard の既定、CLAUDE.md の「セッションの引き継ぎ」）。
+        self.assertEqual(METRICS.DEFAULT_WASTE["context_budget"], 200000)
+
     def test_overlap_uses_union_of_ranges(self):
         self.assertEqual(METRICS._overlap(1, 10, [(3, 5), (4, 8)]), 6)
         self.assertEqual(METRICS._overlap(1, 10, [(11, 20)]), 0)
@@ -917,11 +921,11 @@ class TaskRecordTest(FixtureCase):
                  "commit", "-q", "--allow-empty", "-m", "init")
         self.git("-C", str(repo), "worktree", "add", "-q", "-b", "feature/issue-9-x", str(worktree))
         record = self.record(str(worktree), HC_TERMINAL_ID="t7", HC_CLAUDE_ROLE="worker",
-                             CLAUDE_CTX_GUARD_TOKENS="120000")
+                             CLAUDE_CTX_GUARD_TOKENS="180000")
         self.assertEqual(record["git"], {"repo": "myrepo", "branch": "feature/issue-9-x", "branch_source": "git"})
         self.assertEqual(record["hc"], {"terminal": "t7", "role": "worker"})
-        self.assertEqual(record["ctx_budget"], 120000)
-        self.assertEqual(record["waste"]["rules"]["context_bloat"]["budget"], 120000)
+        self.assertEqual(record["ctx_budget"], 180000)
+        self.assertEqual(record["waste"]["rules"]["context_bloat"]["budget"], 180000)
         self.assertEqual(METRICS.task_key(record, PATTERN), "myrepo#9")
 
     def test_record_without_git_falls_back_to_transcript(self):

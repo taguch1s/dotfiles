@@ -7,7 +7,9 @@ description: 作業状態を Git 管理外のhandoffへ圧縮し、別セッシ�
 
 handoff は要求・設計の正本ではない。親 Issue、Accepted design artifact、PR、Git diff、remote state を優先し、矛盾は `Open questions / blockers` に記録する。
 
-## 100,000 input-token 運用閾値
+## 100,000 input-token 運用閾値（Codex）
+
+この節の閾値は Codex（Herdr status の `input_tokens`）向けである。Claude Code では、閾値・上限・超過時の分岐は `CLAUDE.md` の「セッションの引き継ぎ」（`claude-context-guard` hook）に従い、この節の 100k は使わない。
 
 これはプラットフォームの自動 compact 閾値を変更する設定ではない。Herdr status が報告する最新の `input_tokens` に基づく安全な handoff 規約である。
 
@@ -56,7 +58,7 @@ Each passing required Unit review has `kind=light`, `outcome=pass`, `reviewed_he
 
 For `delivery.intent=pr`, pre-PR `state=in_progress` is valid so the local review gate can run before creation. Terminal states are exactly `pr_read_back_pass|blocked|paused`, and every terminal state requires an empty `current_unit.next_action`. Only `pr_read_back_pass` requires a nonempty `pr_url` and exactly one `read_back_evidence` item resolving to a same-handoff `kind=delivery` marker immediately followed by `### PR read-back evidence: …`; `paused` requires `pause_reason=user_instruction`. These delivery fields record evidence and do not authorize a new review, pane, tab, or agent.
 
-`continuation=manual` is the default except PR delivery: `delivery.intent=pr` records `continuation=auto`, and the validator rejects another value. At `input_tokens >= 100_000`, start no new Unit; finish only the current atomic operation and update this handoff. Auto-continuation is permitted only for PR delivery with `continuation=auto` and no external manual/human gate, unresolved specification decision, or safety blocker. It never grants DB, Scheduler, Cloud Run, Bluesky, Issue/PR merge, or other external authority. Run the existing Herdr preflight, then invoke only `env -u HERDR_CODEX_ORCHESTRATED herdr-codex-orchestrate --new-top-level --cwd <worktree> <handoff prompt>`; retain all other required Herdr context. Read back the new tab and main `agent_session.value`, confirm it is nonempty and differs from the old session, and only then may the parent conditionally reclaim the old tab. Never mark an intermediate state `done`: retain it until PR URL/read-back evidence or actual blocker evidence is recorded. If the user prohibits pane/tab/agent creation, record the handoff and wait rather than invoke continuation.
+`continuation=manual` is the default except PR delivery: `delivery.intent=pr` records `continuation=auto`, and the validator rejects another value. At the context threshold (Codex: `input_tokens >= 100_000`; Claude Code: `CLAUDE.md` "セッションの引き継ぎ"), start no new Unit; finish only the current atomic operation and update this handoff. Auto-continuation is permitted only for PR delivery with `continuation=auto` and no external manual/human gate, unresolved specification decision, or safety blocker. It never grants DB, Scheduler, Cloud Run, Bluesky, Issue/PR merge, or other external authority. Run the existing Herdr preflight, then invoke only `env -u HERDR_CODEX_ORCHESTRATED herdr-codex-orchestrate --new-top-level --cwd <worktree> <handoff prompt>`; retain all other required Herdr context. Read back the new tab and main `agent_session.value`, confirm it is nonempty and differs from the old session, and only then may the parent conditionally reclaim the old tab. Never mark an intermediate state `done`: retain it until PR URL/read-back evidence or actual blocker evidence is recorded. If the user prohibits pane/tab/agent creation, record the handoff and wait rather than invoke continuation.
 
 ````markdown
 <!-- workflow-review-section/v1 id="workflow-review-unit-U1" unit="U1" kind="light" reviewed_head="<40-lowercase-hex-sha>" -->

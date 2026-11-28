@@ -122,19 +122,37 @@ hc 上の監督役・ワーカーでは、`session-settings.json` の hook で�
 
 | 何を | hook | 結果 |
 | --- | --- | --- |
-| 文脈予算の警告 | `UserPromptSubmit`・`PostToolUse` → [claude-context-guard](../.local/bin/claude-context-guard) | 直近リクエストの文脈（input + cache 作成 + cache 読み込み）が閾値を超えると、handoff を促す警告が `additionalContext` としてセッションに入る。以後は前回の警告から `CLAUDE_CTX_GUARD_INTERVAL`（既定 50000）増えるたびに再警告する |
+| 文脈予算の警告 | `UserPromptSubmit`・`PostToolUse` → [claude-context-guard](../.local/bin/claude-context-guard) | 直近リクエストの文脈（input + cache 作成 + cache 読み込み）が閾値を超えると「進行中の作業単位を終え、関連作業が続くときだけ handoff」、上限を超えると「残りの作業量にかかわらず安全な区切りで handoff」の警告が `additionalContext` としてセッションに入る。以後は前回の警告から `CLAUDE_CTX_GUARD_INTERVAL`（既定 50000）増えるたびに再警告し、上限を初めて超えたときは間隔に関係なく上限の警告を出す |
 | トークン記録 | `SessionEnd` → [claude-token-metrics](../.local/bin/claude-token-metrics) `record` | セッションの終了時に `~/.local/share/claude-token-metrics/sessions.jsonl` へ 1 行追記する（`cwd` はそのセッションの作業ディレクトリ。`git.repo`・`git.branch`・`hc.terminal`・`hc.role`（`hc-claude` が export する `HC_CLAUDE_ROLE`）も入る）。`claude-token-metrics report` で一覧、`report --by task` で Issue ごとにまとめて見られる。詳しくは [claude-token-metrics.md](claude-token-metrics.md) |
 
-閾値は `hc-claude` が役割ごとに `CLAUDE_CTX_GUARD_TOKENS` として渡します。
+閾値と上限は `hc-claude` が役割ごとに `CLAUDE_CTX_GUARD_TOKENS`（閾値）と `CLAUDE_CTX_GUARD_LIMIT_TOKENS`（上限）として渡します。hc の外（対話）では hook の既定（閾値 200000、上限 225000）が効きます。
 
-| 役割 | 既定 | 上書きする環境変数 | 警告を受けたら |
-| --- | --- | --- | --- |
-| 監督役 | 150000 | `HC_CLAUDE_SUPERVISOR_CTX_GUARD_TOKENS` | handoff を書いて `hc-supervisor restart`（[supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) の「コンテキストの予算と作り直し」） |
-| ワーカー | 120000 | `HC_CLAUDE_WORKER_CTX_GUARD_TOKENS` | handoff を更新して `【引き継ぎ】<path>` を監督役に送り、ターンを終える。監督役が同じ worktree で新しいワーカーを起動して続けさせる（下記「ワーカーの引き継ぎ」） |
+| 役割 | 閾値 | 上限 | 上書きする環境変数 | 警告を受けたら |
+| --- | --- | --- | --- | --- |
+| 監督役 | 200000 | 225000 | `HC_CLAUDE_SUPERVISOR_CTX_GUARD_TOKENS`・`HC_CLAUDE_SUPERVISOR_CTX_GUARD_LIMIT_TOKENS` | 閾値: いまの対応を終えて関連作業が続くなら、上限: 残りにかかわらず、handoff を書いて `hc-supervisor restart`（[supervisor-prompt.md](../.config/herdr-core/claude/supervisor-prompt.md) の「コンテキストの予算と作り直し」） |
+| ワーカー | 180000 | 225000 | `HC_CLAUDE_WORKER_CTX_GUARD_TOKENS`・`HC_CLAUDE_WORKER_CTX_GUARD_LIMIT_TOKENS` | 閾値: 進行中の Unit を終えて関連作業が続くなら（最後の Unit の commit・push・PR・完了報告だけなら完了する）、上限: 残りにかかわらず、handoff を更新して `【引き継ぎ】<path>` を監督役に送り、ターンを終える。監督役が同じ worktree で新しいワーカーを起動して続けさせる（下記「ワーカーの引き継ぎ」） |
 
 - 上書き値は `hc-claude` を起動する環境に置きます。正の整数でなければ警告を出して既定を使います（起動は止めません）。
-- 呼び出し元の `CLAUDE_CTX_GUARD_TOKENS` は使わず、必ず役割の値で上書きします。監督役の環境がワーカーに引き継がれても、ワーカーの閾値は監督役の値になりません。
-- ワーカーを 120k にしているのは、実測（2026-11-22）でワーカーの文脈が開始時 51k から約 15 リクエストで 120k に達し、150k を超えた後も数十リクエスト続いていたためです。
+- 呼び出し元の `CLAUDE_CTX_GUARD_TOKENS`・`CLAUDE_CTX_GUARD_LIMIT_TOKENS` は使わず、必ず役割の値で上書きします。監督役の環境がワーカーに引き継がれても、ワーカーの値は監督役の値になりません。
+- 「関連作業が続く」の目安は、残りがおよそ 25 リクエスト以上続く見込みかどうかです（下の試算の合算で、200k のとき handoff が得になる残りが 22〜26 リクエスト）。目安であり、数える義務はありません。
+
+#### 閾値と上限の根拠（Issue #61、2026-11-28 の実測）
+
+2026-11-15 以降の 264 セッション（メインの会話のみ）の usage を、API 単価比（入力 1、1 時間 cache 作成 2、output 5、cache 読み込みは Opus 5.5 が 0.05・Fable 5.2 が 0.025）で重み付けして集計しました。
+
+| 項目（中央値） | 対話（59） | ワーカー（130） | 監督役（6） |
+| --- | --- | --- | --- |
+| 開始時の文脈 | 49k | 55k | 51k |
+| 1 リクエストあたりの文脈増加（平均） | 1.7k | 1.7k | 2.2k |
+| 旧閾値（150k / 120k / 150k）を超えたセッション | 26 | 63 | 4 |
+| 超過後に実行したリクエスト数 | 4 | 7 | 3 |
+| handoff 1 回の固定費 F（書き出し＋再開後の状況把握＋新セッション） | 約 27〜31 万 | 約 15〜20 万 | データなし |
+
+- 長い作業を閾値 T ごとに区切り続けると、1 リクエストあたりの余分なコストは `F / n + r · g · n / 2`（n: 1 セッションのリクエスト数、r: cache 読み込みの単価比、g: 1 リクエストの文脈増加）で、最小になるのは `n* = sqrt(2F / (r·g))`、`T* = 再開直後の文脈 + g·n*` です。最適な T* は対話で約 208〜218k、ワーカーで約 181〜197k、全役割の合算で約 174〜206k でした。余分なコストは 150k〜250k でほぼ平ら（100k で最適比 +74%）です。
+- 閾値は対話・監督役 200k、ワーカー 180k にしました（監督役はデータが 6 セッションしかないので対話にそろえた）。旧閾値のワーカー（120k）は約 24 リクエストごとに handoff の固定費を払い、余分なコストが最適より 3〜4 割多かった。対話の超過後に残っていた作業は中央値 4 リクエストで、handoff が得になる残り（69〜80）に届かないため、閾値を超えても作業単位を終えて関連作業が続くときだけ handoff します。
+- 上限は役割共通の 225k です。Issue の proposal（対話・監督役 300k、ワーカー 250k）から外し、自動 compact の手前に置きました。Claude Code 2.1.329〜2.1.331 の自動 compact は全 3 件が文脈約 243〜246k で起きており（Opus 5.5 のワーカー 2 件、Fable 5.2 の対話 1 件）、300k / 250k では警告より先に compact が起きます。225k なら compact まで約 18k（8〜10 リクエスト）の余裕で handoff を書けます。Claude Code の版が変わって compact の位置が動いたら、上限を見直してください。
+- #31 の「1 つの Issue を大きな文脈のまま最後まで進めない」方針は緩めました。#31 は cache 読み込みを入力の 0.1 倍で見積もっていた時点の判断で、Opus 5.5 の 0.05 倍では文脈を持ち越すコストが半分になり、handoff の固定費の方が重くなるためです。
+- 限界: 重みは API 単価比で、サブスクリプションの使用率の重み付けは未確定（#20）。再開後の状況把握は最初の Edit/Write までのコストで近似し、対話（n=7）と監督役（記録なし）は精度が低い。旧閾値で打ち切られたデータなので、引き上げ後の分布は実測していない。長い文脈での応答品質の低下は計算に入れていない。
 - hook は失敗してもセッションを止めません（guard は常に exit 0、record は `|| true`）。
 
 #### ユーザー設定と同じ hook を置いている理由
@@ -160,7 +178,7 @@ claude-token-metrics report --since "$(date +%F)"   # ctx-check のセッショ�
 ```bash
 # ワーカーの SessionEnd の後（監督役がワーカーの terminal を閉じた後）
 tail -n 1 ~/.local/share/claude-token-metrics/sessions.jsonl | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["git"], r["hc"], r["ctx_budget"])'
-# git.repo・git.branch（feature/issue-<n>-…）、hc.role = worker、hc.terminal（tN）、ctx_budget 120000 が入る
+# git.repo・git.branch（feature/issue-<n>-…）、hc.role = worker、hc.terminal（tN）、ctx_budget 180000 が入る
 claude-token-metrics report --by task --since "$(date +%F)"   # <repo>#<n> の行が出る（監督役は supervisor の行）
 ```
 
@@ -168,7 +186,7 @@ claude-token-metrics report --by task --since "$(date +%F)"   # <repo>#<n> の�
 
 ### ワーカーの引き継ぎ（文脈の区切り）
 
-セッションは自分で `/clear` できず、ワーカーは他のエージェントを起動できません。そこで、文脈が閾値を超えたワーカーは handoff を残して止まり、監督役が同じ worktree で新しいワーカーを起動して続きから再開させます（Issue #31）。1 つの Issue を大きな文脈のまま最後まで進めず、毎リクエストの cache 読み込み（≒ リクエスト数 × 平均文脈）を下げるためです。新しいワーカーは開始時の約 51k を cache 作成として払い直します。
+セッションは自分で `/clear` できず、ワーカーは他のエージェントを起動できません。そこで、文脈が閾値を超えて作業単位を終えた時点で関連作業が続くワーカー（または上限を超えたワーカー）は handoff を残して止まり、監督役が同じ worktree で新しいワーカーを起動して続きから再開させます（Issue #31、#61）。毎リクエストの cache 読み込み（≒ リクエスト数 × 平均文脈）を下げるためですが、新しいワーカーは開始時の約 55k を cache 作成として払い直し、状況把握にもコストがかかるので、残りが短いときは handoff せずに終えます（上の「閾値と上限の根拠」）。
 
 ```
 ワーカー A ── guard の警告 → 進行中の操作を区切る → handoff を更新
@@ -186,7 +204,7 @@ claude-token-metrics report --by task --since "$(date +%F)"   # <repo>#<n> の�
 - 同じ worktree を 2 つのワーカーが同時に編集しないよう、`resume-worker` は前のワーカーを止めて消えたことを確かめてから起動します。前のワーカーがまだ `working`、`role=worker` でない、見つからない（回数が分からない）ときは、何も止めず起動もしません。
 - `resume-worker` は handoff が `--cwd` の `codex-handoffs` の下にある既存ファイルの絶対 path であることを確かめます。中身（branch・HEAD・next safe action）が今の worktree と合うかは、新しいワーカーが確かめ、合わなければ推測で再開せず監督役に相談します。
 - 引き継ぎ回数は新しいワーカーのラベル `handoffs` に残り、監督役が進捗ボードの「進行中」にも書きます。3 回を超える（4 回目の）引き継ぎは起動せず、監督役がユーザーに報告します。上限は `HC_SUPERVISOR_MAX_WORKER_HANDOFFS`（監督役の環境）で変えられます。
-- 起動し直したワーカーの閾値は、テンプレート（`claude-worker` / `claude-worker-sonnet`）どおり既定の 120000 です。
+- 起動し直したワーカーの閾値は、テンプレート（`claude-worker` / `claude-worker-sonnet`）どおり既定（閾値 180000、上限 225000）です。
 - 起動し直したワーカーのモデルは、前のワーカーのラベル `model` と同じです（下記「ワーカーのモデル」）。
 
 #### 実機で確かめる（dev、未実施）
