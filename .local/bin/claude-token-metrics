@@ -456,7 +456,7 @@ DEFAULT_WASTE = {
     "failure_streak": 3,
     "cache_miss_ratio": 0.5,
     "cache_ttl_seconds": None,  # None なら 1h cache を書いていれば 3600 秒、なければ 300 秒
-    "context_budget": 150000,
+    "context_budget": 200000,  # claude-context-guard の既定の閾値（対話）と同じ
     "findings_limit": 50,
     "bytes_per_token": 2.2,  # 根拠は docs/claude-token-metrics.md
     # 委譲（over_delegation、hints.under_delegation）

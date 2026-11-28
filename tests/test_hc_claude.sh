@@ -14,10 +14,12 @@ touch "$config/worker-prompt.md" "$config/supervisor-prompt.md"
 export XDG_CONFIG_HOME="$fixture/config" HC_CLAUDE_ROLE_FILE="$fixture/dotfiles-role" HC_CLAUDE_BIN="$fixture/bin/claude"
 export HC_CLAUDE_STATE_DIR="$fixture/state" HOME="$fixture/home"
 unset HC_TERMINAL_ID CLAUDE_CTX_GUARD_TOKENS HC_CLAUDE_SUPERVISOR_CTX_GUARD_TOKENS HC_CLAUDE_WORKER_CTX_GUARD_TOKENS
+unset CLAUDE_CTX_GUARD_LIMIT_TOKENS HC_CLAUDE_SUPERVISOR_CTX_GUARD_LIMIT_TOKENS HC_CLAUDE_WORKER_CTX_GUARD_LIMIT_TOKENS
 cat >"$HC_CLAUDE_BIN" <<'EOF'
 #!/usr/bin/env bash
 (IFS=$'\x1f'; printf '%s\n' "$*") >"$(dirname "$0")/args"
 printf '%s\n' "${CLAUDE_CTX_GUARD_TOKENS-unset}" >"$(dirname "$0")/ctx"
+printf '%s\n' "${CLAUDE_CTX_GUARD_LIMIT_TOKENS-unset}" >"$(dirname "$0")/limit"
 printf '%s\n' "${HC_CLAUDE_ROLE-unset}" >"$(dirname "$0")/role"
 EOF
 chmod +x "$HC_CLAUDE_BIN"
@@ -94,13 +96,23 @@ EOF
 
 # 文脈予算の閾値（claude-context-guard が読む CLAUDE_CTX_GUARD_TOKENS）を役割ごとに渡す。
 ctx() { cat "$fixture/bin/ctx"; }
+limit() { cat "$fixture/bin/limit"; }
 "$launcher" supervisor
-[[ "$(ctx)" == 150000 ]] && ok '閾値: 監督役は既定 150000' || ng "監督役の閾値が違う: $(ctx)"
+[[ "$(ctx)" == 200000 ]] && ok '閾値: 監督役は既定 200000' || ng "監督役の閾値が違う: $(ctx)"
+[[ "$(limit)" == 225000 ]] && ok '上限: 監督役は既定 225000' || ng "監督役の上限が違う: $(limit)"
 "$launcher" worker x
-[[ "$(ctx)" == 120000 ]] && ok '閾値: ワーカーは既定 120000' || ng "ワーカーの閾値が違う: $(ctx)"
-CLAUDE_CTX_GUARD_TOKENS=150000 "$launcher" worker x
-[[ "$(ctx)" == 120000 ]] && ok '閾値: 呼び出し元の CLAUDE_CTX_GUARD_TOKENS（監督役の値など）はワーカーに持ち込まない' \
-  || ng "呼び出し元の閾値を持ち込んだ: $(ctx)"
+[[ "$(ctx)" == 180000 ]] && ok '閾値: ワーカーは既定 180000' || ng "ワーカーの閾値が違う: $(ctx)"
+[[ "$(limit)" == 225000 ]] && ok '上限: ワーカーは既定 225000' || ng "ワーカーの上限が違う: $(limit)"
+CLAUDE_CTX_GUARD_TOKENS=200000 CLAUDE_CTX_GUARD_LIMIT_TOKENS=300000 "$launcher" worker x
+[[ "$(ctx)" == 180000 && "$(limit)" == 225000 ]] \
+  && ok '閾値・上限: 呼び出し元の CLAUDE_CTX_GUARD_TOKENS・CLAUDE_CTX_GUARD_LIMIT_TOKENS（監督役の値など）はワーカーに持ち込まない' \
+  || ng "呼び出し元の閾値・上限を持ち込んだ: $(ctx) $(limit)"
+HC_CLAUDE_WORKER_CTX_GUARD_LIMIT_TOKENS=6000 HC_CLAUDE_SUPERVISOR_CTX_GUARD_LIMIT_TOKENS=8000 "$launcher" worker x
+[[ "$(limit)" == 6000 ]] && ok '上限: HC_CLAUDE_WORKER_CTX_GUARD_LIMIT_TOKENS でワーカーの上限を上書きできる' || ng "ワーカーの上限の上書きが違う: $(limit)"
+HC_CLAUDE_WORKER_CTX_GUARD_LIMIT_TOKENS=6000 HC_CLAUDE_SUPERVISOR_CTX_GUARD_LIMIT_TOKENS=8000 "$launcher" supervisor
+[[ "$(limit)" == 8000 ]] && ok '上限: HC_CLAUDE_SUPERVISOR_CTX_GUARD_LIMIT_TOKENS で監督役の上限を上書きできる' || ng "監督役の上限の上書きが違う: $(limit)"
+HC_CLAUDE_WORKER_CTX_GUARD_LIMIT_TOKENS=abc "$launcher" worker x 2>"$fixture/err"
+[[ "$(limit)" == 225000 && -s "$fixture/err" ]] && ok '上限: 正の整数でない上書き値は警告して既定に戻す' || ng "不正な上限の上書きで既定に戻らない: $(limit)"
 HC_CLAUDE_WORKER_CTX_GUARD_TOKENS=5000 HC_CLAUDE_SUPERVISOR_CTX_GUARD_TOKENS=7000 "$launcher" worker x
 [[ "$(ctx)" == 5000 ]] && ok '閾値: HC_CLAUDE_WORKER_CTX_GUARD_TOKENS でワーカーの閾値を上書きできる' || ng "ワーカーの上書きが違う: $(ctx)"
 HC_CLAUDE_WORKER_CTX_GUARD_TOKENS=5000 HC_CLAUDE_SUPERVISOR_CTX_GUARD_TOKENS=7000 "$launcher" supervisor
@@ -108,7 +120,7 @@ HC_CLAUDE_WORKER_CTX_GUARD_TOKENS=5000 HC_CLAUDE_SUPERVISOR_CTX_GUARD_TOKENS=700
 bad_ok=1
 for bad in abc 0 -1 1e5 ''; do
   HC_CLAUDE_WORKER_CTX_GUARD_TOKENS="$bad" "$launcher" worker x 2>"$fixture/err"
-  [[ "$(ctx)" == 120000 ]] || { ng "不正な上書き値 '$bad' で既定に戻らない: $(ctx)"; bad_ok=0; }
+  [[ "$(ctx)" == 180000 ]] || { ng "不正な上書き値 '$bad' で既定に戻らない: $(ctx)"; bad_ok=0; }
   [[ -z "$bad" || -s "$fixture/err" ]] || { ng "不正な上書き値 '$bad' を黙って捨てた"; bad_ok=0; }
 done
 [[ "$bad_ok" == 1 ]] && ok '閾値: 正の整数でない上書き値は警告して既定に戻す（起動は止めない）'

@@ -129,7 +129,7 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 - `hints.failure_streaks`：同じ `command_key` の結果が、成功を挟まず `failure_streak` 回以上続けて `is_error` だったもの（他のツールの結果は挟んでよい）。hints 自体はトークンを数えず、`key`、`count`、最初と最後の `tool_use_id` を出す（streak の中の失敗も、`repeated_failure` の条件に当たればそちらで数える）。
 - `duplicate_result` は、同じ path への連続した `Edit` の成功メッセージ（同じ本文で 200 バイトを超えることがある）も数える。避けられない出力なので、`exempt_keys` の既定に編集系ツール（`Edit`・`MultiEdit`・`Write`・`NotebookEdit`）を入れてあり、数えない（数えたいときは `exempt_keys` を上書きして外す）。
 - `cache_rewrite` の `cause`：間隔（両リクエストの最初の行の `timestamp` の差）が TTL を超え、R_j の直前が人の発言なら `idle`、ツール結果なら `tool_wait`。間隔が TTL 以下か取れなければ `break`（system prompt やツール定義の変化など）。TTL は、そのストリームでそれまでに 1h cache を書いていれば 3600 秒、なければ 300 秒（`cache_ttl_seconds` で固定できる）。
-- `context_bloat` の予算は、`record` のときは環境変数 `CLAUDE_CTX_GUARD_TOKENS`（hc の監督役 150000、ワーカー 120000）、無ければ `context_budget`。`session` / `waste` は常に `context_budget` を使う。`hints.requests_after_budget` は最初に予算を超えたリクエストより後の本体のリクエスト数。
+- `context_bloat` の予算は、`record` のときは環境変数 `CLAUDE_CTX_GUARD_TOKENS`（hc の監督役 200000、ワーカー 180000。上限の `CLAUDE_CTX_GUARD_LIMIT_TOKENS` は使わない）、無ければ `context_budget`。`session` / `waste` は常に `context_budget` を使う。`hints.requests_after_budget` は最初に予算を超えたリクエストより後の本体のリクエスト数。
 
 ### 設定（`waste.json`）
 
@@ -137,7 +137,7 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 
 ```json
 {"waste": {"oversized_bytes": 20000, "min_bytes": 200, "exempt_keys": ["Edit", "MultiEdit", "NotebookEdit", "Write"], "failure_streak": 3,
-           "cache_miss_ratio": 0.5, "cache_ttl_seconds": null, "context_budget": 150000,
+           "cache_miss_ratio": 0.5, "cache_ttl_seconds": null, "context_budget": 200000,
            "findings_limit": 50, "bytes_per_token": 2.2}}
 ```
 
@@ -149,7 +149,7 @@ claude-token-metrics waste --waste-config ./waste.json --weights cache_read=0.1 
 | `failure_streak` | 3 | 2 以上の整数 |
 | `cache_miss_ratio` | 0.5 | 0 より大きく 1 以下 |
 | `cache_ttl_seconds` | `null` | `null`（自動）か 0 より大きい数値 |
-| `context_budget` | 150000 | 1 以上の整数 |
+| `context_budget` | 200000（`claude-context-guard` の既定の閾値と同じ） | 1 以上の整数 |
 | `findings_limit` | 50 | 0 以上の整数 |
 | `bytes_per_token` | 2.2 | 0 より大きい数値 |
 | `trivial_requests` | 3 | 0 以上の整数（`over_delegation.trivial`、下の「委譲と作り直し」） |
