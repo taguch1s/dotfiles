@@ -8,6 +8,8 @@ BUSY_TTL=${BUSY_TTL:-30}   # 分。Esc 中断では Stop hook が走らずマー
 INTERVAL=${INTERVAL:-30}   # 秒
 HC_BIN=${HC_BIN:-$HOME/.local/bin/hc}   # systemd user service の PATH には ~/.local/bin がない
 HC_TIMEOUT=${HC_TIMEOUT:-5}   # 秒。hc や core が応答しなくてもループを止めない
+# herdr-core のソケット。繋がらないときは hc を呼ばない (hc_states のコメント)
+HC_CORE_SOCK=${HC_CORE_SOCK:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/herdr-core/default.sock}
 HEAVY_LOCK=${HEAVY_LOCK:-$HOME/.local/share/hc-supervisor/heavy.lock}
 PROC_LOCKS=${PROC_LOCKS:-/proc/locks}
 
@@ -45,12 +47,24 @@ ssh_tmux() {
 # hc の端末の状態を 1 行に 1 つ出す: working (エージェントが作業中) / job (シェル以外、またはスクリプトを実行中のシェルが前面にいる)
 # 待機中のエージェント (status が idle・done など) と、プロンプトで待つ対話シェルは出さない。
 # 各 hc 呼び出しに timeout を付け、失敗した端末は数えない。
+# core が動いていなければ hc を呼ばない: hc は core に繋がらないと (ls でも server status でも) core を起動し、
+# core はこの service の環境 (PATH に ~/.local/bin がない) を引き継ぐ。その core が起動する terminal は
+# hc-claude・claude・uv を見つけられず、監督役もワーカーも起動できなくなる (実機 2026-11-28、PC の再起動直後)。
 hc_states() {
   [ -x "$HC_BIN" ] || return 0
-  timeout 20 python3 - "$HC_BIN" "$HC_TIMEOUT" <<'EOF' 2>/dev/null
-import json, os, subprocess, sys
-hc, timeout = sys.argv[1], float(sys.argv[2])
+  timeout 20 python3 - "$HC_BIN" "$HC_TIMEOUT" "$HC_CORE_SOCK" <<'EOF' 2>/dev/null
+import json, os, socket, subprocess, sys
+hc, timeout, core_sock = sys.argv[1], float(sys.argv[2]), sys.argv[3]
 SHELLS = {"sh", "bash", "zsh", "dash", "fish"}
+
+def core_up():
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(timeout)
+            s.connect(core_sock)
+        return True
+    except OSError:
+        return False
 
 def hc_json(*args):
     out = subprocess.run([hc, *args, "--json"], capture_output=True, text=True, timeout=timeout, check=True).stdout
@@ -64,6 +78,8 @@ def running_job(fg):
     args = (fg.get("argv") or [])[1:]
     return "-c" in args or any(not a.startswith("-") for a in args)
 
+if not core_up():
+    sys.exit(0)
 try:
     terminals = hc_json("ls").get("terminals", [])
 except Exception:

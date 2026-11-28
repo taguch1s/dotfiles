@@ -311,6 +311,7 @@ Herdr app の端末での貼り付けは **Ctrl+Shift+V**（または右クリ�
   3. 新しい監督役は handoff を読み、`role=worker` の terminal の画面を確かめて、入れ替わりの間に届かなかった報告・相談を拾う。ワーカーは `--outlive-parent` なので動き続け、報告先は名前の `supervisor` なので新しい監督役に届く。入れ替わりの数秒に `hc send supervisor` が失敗したワーカーは、報告を画面に書いてターンを終える。
   文脈が大きくなったときも、監督役が同じ手順で自分を作り直します。
 - `hc-supervisor` は監督役を `--keep` で起動します。herdr-core の再起動後、監督役の terminal はシェルになります。`hc-supervisor stop` の後に `hc-supervisor` で起動し直してください（シェルに引き継ぎの依頼を打ち込まないよう、`restart` は使いません）。
+- herdr-core は、最初に `hc` を呼んだプロセスの環境変数で起動し、terminal はその環境を引き継ぎます。`hc-supervisor` が `first message NOT sent: it exited before it was ready` で失敗し、その terminal の画面（`hc read <tN>`）が `sh: 1: hc-claude: not found` なら、core の PATH に `~/.local/bin` がありません（実機 2026-11-28。PC の再起動直後に systemd の `awake-keeper` が `hc ls` で core を起動していた。いまの `awake-keeper` は core が動いていなければ `hc` を呼ばない）。対話シェルで `hc server stop` の後に `hc server start` を実行して core を起動し直してから、`hc-supervisor` を実行してください。動いている terminal のプログラムは止まります（`--keep` の terminal はシェルになります）。
 
 ## 進捗ボード
 
