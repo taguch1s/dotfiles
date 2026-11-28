@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# wsl/admin/setup-dev-infra-viewer-gcp.sh（L0 の読み取り専用 SA）を偽の gcloud で検証する。
+# wsl/admin/setup-dev-infra-viewer-gcp.sh（読み取り専用 SA）を偽の gcloud で検証する。
 # dry-run は変更系の gcloud を呼ばず、--apply は表示したものと同じ引数で呼ぶこと、
 # 付けない権限・ロールが一覧や既定のロールに入ると止まること、dev では --apply を拒否することを確かめる。
 set -euo pipefail

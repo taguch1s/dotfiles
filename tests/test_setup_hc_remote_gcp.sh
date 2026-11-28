@@ -263,7 +263,7 @@ run_setup billing currency=JPY budget-denied -- --apply
 check 'budget の失敗では止まらない' test "$status" -eq 0
 check 'budget を手で作る手順を表示する' out_has 'budget を作れない・確かめられないときは手で作ってください'
 
-# 6. dev では --apply だけを拒否し、dry-run は動く（L0 の資格情報で今の状態を読む）
+# 6. dev では --apply だけを拒否し、dry-run は動く（読み取り専用 SA の資格情報で今の状態を読む）
 case_no=$((case_no + 1))
 printf 'dev\n' >"$fixture/role-dev"
 log="$fixture/case$case_no.log"; : >"$log"

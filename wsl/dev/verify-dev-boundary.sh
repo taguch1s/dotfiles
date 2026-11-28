@@ -94,7 +94,7 @@ else
 fi
 
 # GCP: dev にはユーザー本人の gcloud の資格情報を置かない。gcloud の設定ごとに、あってよい service account を
-# 1 つに決める（docs/infra-credentials.md）。既定の ~/.config/gcloud は L0 の dev-infra-viewer だけ、
+# 1 つに決める（docs/infra-credentials.md）。既定の ~/.config/gcloud は読み取り専用の dev-infra-viewer だけ、
 # hc-remote の専用の設定（CLOUDSDK_CONFIG=~/.config/hc-remote/gcloud）は hc-remote-runner だけ。
 gcp_project="${DEV_GCP_PROJECT:-first-impression-490413}"
 gcloud_allowed() {  # gcloud_allowed <gcloud の設定ディレクトリ>: あってよい SA のメールアドレス

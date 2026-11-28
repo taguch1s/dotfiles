@@ -39,7 +39,7 @@ bash ~/dotfiles/wsl/admin/setup-hc-remote-gcp.sh --apply    # 実際に作る（
 - 何度実行しても同じ状態になります。既にあるものは作り直しません。カスタムロールの権限だけは、毎回スクリプトの定義にそろえます（`gcloud iam roles update`）。
 - 引数: `--project`・`--zone`・`--network`（既定 `default`）・`--key-dir`（既定 `~/.config/hc-remote`）・`--max-vcpus N`（既定 16）・`--budget-amount N`・`--no-budget`。
 - 順番: API → SA → ロール → 付与 → firewall → quota → 鍵 → budget。quota を下げられなかったときは、鍵を作らずに止まります（被害の上限がない鍵を作らない）。
-- dev（`/etc/dotfiles-role` が `dev`）では `--apply` を拒否します（gcloud を呼ぶ前に止まる）。dry-run は dev でも動き、dev の既定の gcloud（L0 の読み取り専用 SA `dev-infra-viewer`）で今の状態を読みます。budget の節は課金アカウントを読めないので「確かめられない」になり、そのまま先へ進みます。dev に置く資格情報の層の考え方は [infra-credentials.md](infra-credentials.md)。
+- dev（`/etc/dotfiles-role` が `dev`）では `--apply` を拒否します（gcloud を呼ぶ前に止まる）。dry-run は dev でも動き、dev の既定の gcloud（読み取り専用 SA `dev-infra-viewer`）で今の状態を読みます。budget の節は課金アカウントを読めないので「確かめられない」になり、そのまま先へ進みます。dev に置く資格情報の決まりは [infra-credentials.md](infra-credentials.md)。
 
 ### 作るもの
 
@@ -210,7 +210,7 @@ gcloud config set compute/zone asia-northeast1-a
 gcloud config set core/disable_usage_reporting true
 ```
 
-hc-remote（#56）は、この `CLOUDSDK_CONFIG` を自分で指定して gcloud を呼びます。シェルの既定の `~/.config/gcloud` には `hc-remote-runner` を入れません。既定の設定は L0 の読み取り専用 SA `dev-infra-viewer` だけに使います（[infra-credentials.md](infra-credentials.md) の「L0 を用意する」）。
+hc-remote（#56）は、この `CLOUDSDK_CONFIG` を自分で指定して gcloud を呼びます。シェルの既定の `~/.config/gcloud` には `hc-remote-runner` を入れません。既定の設定は読み取り専用 SA `dev-infra-viewer` だけに使います（[infra-credentials.md](infra-credentials.md) の「dev の読み取り専用 SA を用意する」）。
 
 ### 3. dev の `~/.config/gcloud` からユーザー本人の資格情報を消す（dev）
 

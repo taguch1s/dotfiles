@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# dev ディストリで GCP の構成・状態・ログを読むだけの service account（L0、dev-infra-viewer）を admin で用意する。
+# dev ディストリで GCP の構成・状態・ログを読むだけの service account（dev-infra-viewer）を admin で用意する。
 # 既定は dry-run（作る SA・付けるロール・外す付与・鍵の場所を表示し、GCP は読み取りしかしない）。
 # --apply のときだけ、service account・カスタムロール・IAM の付与・鍵を作る。何度実行しても同じ状態になる。
-# 層の考え方は docs/infra-credentials.md、手順は同じ文書の「L0 を用意する」。
+# 資格情報の決まりは docs/infra-credentials.md、手順は同じ文書の「dev の読み取り専用 SA を用意する」。
 set -euo pipefail
 
 usage() {
@@ -40,7 +40,7 @@ while (($#)); do
 done
 
 # dev では dry-run（読み取り）だけを動かす。変更（--apply）はユーザー本人の資格情報がある admin でだけ行う
-# （docs/infra-credentials.md の原則 3）。dev の gcloud は L0 の SA なので、--apply しても権限で失敗するが、
+# （docs/infra-credentials.md の「実装の流れ」）。dev の gcloud は読み取り専用の SA なので、--apply しても権限で失敗するが、
 # gcloud を呼ぶ前に止める。
 role_file="${DOTFILES_ROLE_FILE:-/etc/dotfiles-role}"
 if ((apply)) && [[ "$(cat "$role_file" 2>/dev/null)" == dev ]]; then
@@ -55,9 +55,9 @@ member="serviceAccount:${sa_email}"
 key_file="${key_dir}/gcp-viewer-key.json"
 custom_role="devInfraViewer"
 
-# L0 に付けるロール（ここが唯一の一覧）。外すときは 1 行を消して --apply すると、その付与も外す。
-# 各ロールの中身を公式ドキュメントで確かめた日付と結果は docs/infra-credentials.md の「L0 のロール」。
-l0_roles=(
+# 読み取り専用 SA に付けるロール（ここが唯一の一覧）。外すときは 1 行を消して --apply すると、その付与も外す。
+# 各ロールの中身を公式ドキュメントで確かめた日付と結果は docs/infra-credentials.md の「読み取り専用 SA のロール」。
+viewer_roles=(
   roles/run.viewer
   roles/cloudscheduler.viewer
   roles/cloudbuild.builds.viewer
@@ -164,7 +164,7 @@ forbidden_permission() {
 # 定義そのものを先に確かめる（一覧に付けない権限・ロールが入っていたら、何もせずに止める）。
 self_check() {
   local role f perm bad=0
-  for role in "${l0_roles[@]}"; do
+  for role in "${viewer_roles[@]}"; do
     # 中身を実行時に確かめられるのは既定のロール（roles/…）だけなので、それ以外は自分のカスタムロールに限る。
     if [[ "$role" != roles/* && "$role" != "projects/${project}/roles/${custom_role}" ]]; then
       printf 'setup-dev-infra-viewer-gcp: 既定のロールでも devInfraViewer でもないロールが一覧にある: %s\n' "$role" >&2
@@ -245,7 +245,7 @@ printf '  project: %s\n' "$project"
 # --- 1. 既定のロールの中身を確かめる（ロールは Google が増やすことがあるので毎回見る） ---
 section "既定のロールの中身（付けない権限が入っていないか）"
 roles_checked=1
-for role in "${l0_roles[@]}"; do
+for role in "${viewer_roles[@]}"; do
   [[ "$role" == roles/* ]] || continue
   if ! perms="$(read_gcloud iam roles describe "$role" --flatten=includedPermissions --format='value(includedPermissions)')" || [[ -z "$perms" ]]; then
     info "${role}: 中身を読めなかった（確かめられない）"
@@ -298,10 +298,10 @@ fi
 
 # --- 4. IAM の付与（条件なし。読み取りだけなので名前で絞らない） ---
 section "IAM の付与（project ${project}、member ${member}）"
-for role in "${l0_roles[@]}"; do
+for role in "${viewer_roles[@]}"; do
   info "$role"
 done
-for role in "${l0_roles[@]}"; do
+for role in "${viewer_roles[@]}"; do
   change_retry projects add-iam-policy-binding "$project" --member="$member" --role="$role" --condition=None --quiet --format=none
 done
 # 一覧にない付与（一覧から消したロール・手で足したロール）は外す。
@@ -313,7 +313,7 @@ if bound="$(read_gcloud projects get-iam-policy "$project" --flatten='bindings[]
   while IFS=$'\t' read -r role bound_member; do
     [[ -n "$role" && "$bound_member" == "$member" ]] || continue
     keep=0
-    for wanted in "${l0_roles[@]}"; do [[ "$role" == "$wanted" ]] && keep=1; done
+    for wanted in "${viewer_roles[@]}"; do [[ "$role" == "$wanted" ]] && keep=1; done
     ((keep)) && continue
     stale=1
     change projects remove-iam-policy-binding "$project" --member="$member" --role="$role" --all --quiet --format=none
@@ -347,7 +347,7 @@ fi
 
 section "このあと"
 if ((apply)); then
-  info "鍵を dev に渡し、dev の既定の gcloud に登録する: docs/infra-credentials.md の「L0 を用意する」"
+  info "鍵を dev に渡し、dev の既定の gcloud に登録する: docs/infra-credentials.md の「dev の読み取り専用 SA を用意する」"
   info "admin の作業が終わったら PowerShell で wsl --terminate Ubuntu-24.04"
 else
   info "内容を確かめたら admin で --apply する。手順と消し方は docs/infra-credentials.md"
